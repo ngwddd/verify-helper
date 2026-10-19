@@ -42,11 +42,45 @@ python verify_core.py /path/to/project --sarif out.sarif
 
 ### 作为 MCP 服务器
 
+零依赖、纯 stdio，**只要 Python 3.11+，不用装任何包**：
+
 ```bash
-python server.py     # stdio JSON-RPC 2.0，无第三方依赖
+git clone https://github.com/ngwddd/verify-helper.git
+cd verify-helper
+python server.py          # 前台起一个 stdio 服务器（客户端会自己拉起，一般不用手跑）
 ```
 
-注册到支持 MCP 的客户端（以 DSH 为例）：
+> macOS / Linux 上多半叫 `python3`，Windows 上叫 `python`。填配置时用**绝对路径**最稳。
+
+#### 通用客户端配置（Claude Desktop / Cursor / VS Code / Windsurf 等）
+
+```json
+{
+  "mcpServers": {
+    "verify-helper": {
+      "command": "python",
+      "args": ["/绝对路径/verify-helper/server.py"],
+      "env": { "PYTHONIOENCODING": "utf-8" }
+    }
+  }
+}
+```
+
+Windows 示例：
+
+```json
+{
+  "mcpServers": {
+    "verify-helper": {
+      "command": "C:\\Program Files\\Python314\\python.exe",
+      "args": ["C:\\Users\\you\\verify-helper\\server.py"],
+      "env": { "PYTHONIOENCODING": "utf-8" }
+    }
+  }
+}
+```
+
+#### DeepSeek Harness（DSH）配置
 
 ```yaml
 - insert:
@@ -55,15 +89,21 @@ python server.py     # stdio JSON-RPC 2.0，无第三方依赖
       config:
         serverName: verify-helper
         transport: stdio
-        command: 'C:\Program Files\Python314\python.exe'
-        args: ['C:\path\to\verify-helper\server.py']
+        command: 'python'
+        args: ['/绝对路径/verify-helper/server.py']
         env:
           PYTHONIOENCODING: utf-8
         toolCallTimeoutMs: 600000
         failOnStartupError: false
 ```
 
-工具：
+#### 装好了怎么确认
+
+```bash
+python verify_core.py --list-checks     # 应列出 16 项检查
+```
+
+客户端里应该出现三个工具：
 
 | 工具 | 作用 |
 |---|---|
@@ -72,6 +112,14 @@ python server.py     # stdio JSON-RPC 2.0，无第三方依赖
 | `verify_checks()` | 列出全部检查项、风险等级、修复建议 |
 
 FAIL 时返回 `isError: true` —— 调用方不会被「静默通过」骗过去。
+
+**第一次跑建议**：先让它检查它自己。
+
+```
+用 verify-helper 检查 /绝对路径/verify-helper，fast=true
+```
+
+能返回一屏 PASS/FAIL 表格，就说明接对了。
 
 ---
 

@@ -172,23 +172,35 @@ HANDLERS = {
 # 比一下 mtime，变了就 reload —— 开发循环从此不用碰进程。
 # ──────────────────────────────────────────────────────────────────────
 _CORE_MTIME = 0
+_DEPS = ("check_specs.py", "sarif.py", "verify_core.py")
 
 
 def _maybe_reload_core():
+    """任一依赖文件变了就整组重新加载。
+
+    只 reload verify_core 是不够的：它 `import check_specs as S`，而 sys.modules
+    里那份 check_specs 还是旧的 —— 新加的常量会报 has no attribute。
+    """
     global _CORE_MTIME
-    f = HERE / "verify_core.py"
-    try:
-        mt = f.stat().st_mtime_ns
-    except OSError:
-        return
-    if _CORE_MTIME and mt != _CORE_MTIME:
-        import importlib
+    stamps = []
+    for name in _DEPS:
         try:
-            importlib.reload(verify_core)
-            log(f"[reload] verify_core 已刷新（{len(verify_core.CHECKS)} 项检查）")
-        except Exception:
-            log("[reload] 失败：", traceback.format_exc())
-    _CORE_MTIME = mt
+            stamps.append((name, (HERE / name).stat().st_mtime_ns))
+        except OSError:
+            stamps.append((name, 0))
+    cur = hash(tuple(stamps))
+    if _CORE_MTIME and cur != _CORE_MTIME:
+        import importlib
+        # 依赖在前，使用者在后
+        for name in _DEPS:
+            mod = name[:-3]
+            try:
+                if mod in sys.modules:
+                    importlib.reload(sys.modules[mod])
+            except Exception:
+                log(f"[reload] {mod} 失败：", traceback.format_exc())
+        log(f"[reload] 已刷新（{len(verify_core.CHECKS)} 项检查，v{verify_core.VERSION}）")
+    _CORE_MTIME = cur
 
 
 # ──────────────────────────────────────────────────────────────────────
