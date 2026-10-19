@@ -39,7 +39,7 @@ from pathlib import Path
 
 import check_specs as S
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Windows 控制台默认 GBK，印 ✓ / ✗ 会直接 UnicodeEncodeError（本项目踩过多次）。
 for _s in (sys.stdout, sys.stderr):
@@ -766,6 +766,141 @@ def check_bom(root: Path, files: list[Path], ctx: "Ctx") -> Check:
                "没有文件带 BOM", "{n} 个文件带 BOM", blocking=False)
 
 
+# ──────────────────────────────────────────────────────────────────────
+# 9b. 浏览器运行时（Playwright）
+#
+# runtime-web 只证明「文件取得到」，证明不了「页面跑起来是对的」。
+# 这一层真的把页面跑起来，抓 JS 异常、console.error、资源 404。
+# 没有 playwright 就老实记 UNKNOWN —— 不假装验过。
+# ──────────────────────────────────────────────────────────────────────
+def _find_playwright(root: Path) -> Path | None:
+    """找一个 node 能 require 到 playwright 的目录。"""
+    here = Path(__file__).resolve().parent
+    home = Path.home()
+    for d in (root, here, home / "AppData/Roaming/npm", home / ".npm-global",
+              Path.home() / "node_modules"):
+        try:
+            if (d / "node_modules" / "playwright").is_dir():
+                return d
+        except OSError:
+            continue
+    return None
+
+
+def check_browser(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+    c = Check("browser", "浏览器运行时：页面跑起来有没有报错")
+    t0 = time.time()
+    if ctx.fast:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "fast 模式跳过浏览器"
+        return c
+    htmls = [p for p in files if p.suffix.lower() in HTML_EXT]
+    if not htmls:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "项目里没有 HTML，跳过"
+        return c
+    site_root = _find_site_root(root, htmls)
+    if site_root is None:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "没有 index.html，无法确定站点根"
+        return c
+    pw_dir = _find_playwright(root)
+    if pw_dir is None:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "没找到 playwright（npm i -D playwright && npx playwright install chromium）"
+        return c
+    node = shutil.which("node")
+    if not node:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "这台机器上没有 node"
+        return c
+
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix="vh-browser-"))
+    pages_file = tmp / "pages.json"
+    out_file = tmp / "out.json"
+    shots = tmp / "shots"
+    entries = []
+    for p in htmls[:30]:
+        try:
+            rel = p.relative_to(site_root).as_posix()
+        except ValueError:
+            continue
+        entries.append({"rel": rel, "url": f"http://127.0.0.1:0/{rel}"})
+    if not entries:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "页面都不在站点根之下"
+        return c
+
+    port = _free_port()
+    base = _detect_base(htmls)
+    for e in entries:
+        e["url"] = f"http://127.0.0.1:0{base}/{e['rel']}"
+    pages_file.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+
+    httpd = None
+    try:
+        httpd, port = _serve(site_root, base)
+        for e in entries:
+            e["url"] = f"http://127.0.0.1:{port}{base}/{e['rel']}"
+        pages_file.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+
+        probe = Path(__file__).resolve().parent / "browser_probe.mjs"
+        cmd = [node, str(probe), "--module", str(pw_dir),
+               "--base", f"http://127.0.0.1:{port}",
+               "--pages", str(pages_file), "--out", str(out_file),
+               "--shots", str(shots)]
+        code, out = _run(cmd, root, ctx.browser_timeout)
+        if code != 0 or not out_file.exists():
+            c.state = "UNKNOWN"
+            c.detail = f"探针没跑成（退出码 {code}）：{_tail(out, 200)}"
+        else:
+            data = json.loads(out_file.read_text(encoding="utf-8"))
+            findings = []
+            for pg in data.get("pages", []):
+                rel = pg.get("rel", "?")
+                if pg.get("error"):
+                    findings.append({"file": rel, "line": 0,
+                                     "message": f"页面加载失败：{pg['error']}",
+                                     "severity": "high"})
+                if pg.get("status") and pg["status"] != 200:
+                    findings.append({"file": rel, "line": 0,
+                                     "message": f"HTTP {pg['status']}",
+                                     "severity": "high"})
+                for err in pg.get("pageerrors", []):
+                    findings.append({"file": rel, "line": 0,
+                                     "message": f"未捕获异常：{err}"[:300],
+                                     "severity": "high"})
+                for msg in pg.get("console", []):
+                    if msg.get("type") == "error":
+                        findings.append({"file": rel, "line": 0,
+                                         "message": f"console.error：{msg.get('text')}"[:300],
+                                         "severity": "medium"})
+                for f in pg.get("failed", []):
+                    findings.append({"file": rel, "line": 0,
+                                     "message": f"资源失败 {f.get('reason')}：{f.get('url')}"[:300],
+                                     "severity": "high"})
+            c.findings = findings
+            c.state = "FAIL" if findings else "PASS"
+            shots_n = len(data.get("shots", []))
+            c.detail = (f"站点根 {_rel(root, site_root) or '.'}"
+                        + (f"（部署前缀 {base}）" if base else "")
+                        + f"，真跑 {len(data.get('pages', []))} 页，"
+                        f"问题 {len(findings)} 处" + (f"，截图 {shots_n} 张" if shots_n else ""))
+            c.command = f"playwright(chromium) + http.server:{port}"
+            c.exit_code = 0 if not findings else 1
+    except Exception as e:
+        c.state = "UNKNOWN"
+        c.detail = f"浏览器层出错：{type(e).__name__}: {e}"
+    finally:
+        if httpd:
+            httpd.shutdown()
+            httpd.server_close()
+        shutil.rmtree(tmp, ignore_errors=True)
+    c.seconds = time.time() - t0
+    return c
+
+
 def check_todos(root: Path, files: list[Path], ctx: "Ctx") -> Check:
     return _mk("todos", "TODO / FIXME 数量（只报告）", ctx, root, files, "todos",
                "正则 TODO|FIXME|XXX|HACK",
@@ -897,6 +1032,54 @@ def check_imports(root: Path, files: list[Path], ctx: "Ctx") -> Check:
 # ──────────────────────────────────────────────────────────────────────
 # 9. 运行时（HTTP）
 # ──────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
+# 本地静态服务 + 部署前缀
+#
+# 站点常被部署在子路径下（GitHub Pages 的 /repo/），页面里就写
+# `/ausmat-guide/assets/x.css`。直接在根上起服务，这种链接必然 404 ——
+# 那是本地环境的假阳性，不是 bug。所以先推断前缀，再把它挂到前缀下。
+# ──────────────────────────────────────────────────────────────────────
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402
+from functools import partial  # noqa: E402
+
+
+def _detect_base(htmls: list[Path]) -> str:
+    """从站点根绝对路径里推断部署前缀，如 `/ausmat-guide`。样本不足就不猜。"""
+    counts: dict[str, int] = {}
+    for p in htmls[:60]:
+        t = _read(p) or ""
+        for m in re.finditer(r'(?:href|src)\s*=\s*"(/[^/"]+/[^"]*)"', t):
+            seg = m.group(1).split("/")[1]
+            counts[seg] = counts.get(seg, 0) + 1
+    if not counts:
+        return ""
+    seg, n = max(counts.items(), key=lambda kv: kv[1])
+    return f"/{seg}" if n >= 3 else ""
+
+
+class _PrefixHandler(SimpleHTTPRequestHandler):
+    prefix = ""
+
+    def translate_path(self, path: str) -> str:
+        if self.prefix:
+            if path == self.prefix:
+                path = "/"
+            elif path.startswith(self.prefix + "/"):
+                path = path[len(self.prefix):]
+        return super().translate_path(path)
+
+    def log_message(self, *args):
+        pass
+
+
+def _serve(directory: Path, prefix: str = "") -> tuple[ThreadingHTTPServer, int]:
+    _PrefixHandler.prefix = prefix
+    handler = partial(_PrefixHandler, directory=str(directory))
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, httpd.server_address[1]
+
+
 def _find_site_root(root: Path, htmls: list[Path]) -> Path | None:
     """找静态站点根：优先项目根的 index.html，其次任意含 index.html 的目录
     （取收录页面最多的那个）。找不到就说明这不是一个可服务的站点。"""
@@ -931,21 +1114,12 @@ def check_runtime_web(root: Path, files: list[Path], ctx: "Ctx") -> Check:
         c.detail = "没有 index.html，无法确定站点根（不是可服务的静态站）"
         return c
     port = _free_port()
-    proc = None
+    base = _detect_base(htmls)
+    httpd = None
     try:
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1",
-             "--directory", str(site_root)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        httpd, port = _serve(site_root, base)
         import urllib.request
         import urllib.error
-        deadline = time.time() + 8
-        while time.time() < deadline:
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.3):
-                    break
-            except OSError:
-                time.sleep(0.05)
         bad = []
         served = 0
         for p in htmls[:200]:
@@ -954,7 +1128,7 @@ def check_runtime_web(root: Path, files: list[Path], ctx: "Ctx") -> Check:
             except ValueError:
                 continue
             served += 1
-            url = f"http://127.0.0.1:{port}/{rel}"
+            url = f"http://127.0.0.1:{port}{base}/{rel}"
             try:
                 with urllib.request.urlopen(url, timeout=5) as r:
                     if r.status != 200:
@@ -965,20 +1139,18 @@ def check_runtime_web(root: Path, files: list[Path], ctx: "Ctx") -> Check:
                 bad.append({"file": rel, "line": 0, "message": f"{type(e).__name__}"})
         c.findings = bad
         c.state = "FAIL" if bad else "PASS"
-        c.detail = (f"站点根 {_rel(root, site_root) or '.'}，起 http.server:{port}，"
-                    f"GET {served} 个页面，失败 {len(bad)}")
-        c.command = f"python -m http.server {port} + urllib GET"
+        c.detail = (f"站点根 {_rel(root, site_root) or '.'}"
+                    + (f"（部署前缀 {base}）" if base else "")
+                    + f"，起 http.server:{port}，GET {served} 个页面，失败 {len(bad)}")
+        c.command = f"内置 http.server:{port} + urllib GET"
         c.exit_code = 0 if not bad else 1
     except Exception as e:
         c.state = "UNKNOWN"
         c.detail = f"起不来静态服务器：{type(e).__name__}: {e}"
     finally:
-        if proc:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                proc.kill()
+        if httpd:
+            httpd.shutdown()
+            httpd.server_close()
     c.seconds = time.time() - t0
     return c
 
@@ -1097,6 +1269,7 @@ class Ctx:
     workers: int = 8
     fast: bool = False
     test_timeout: int = 300
+    browser_timeout: int = 180
     bundle: dict | None = None       # 一次扫描的结果，五个检查共用
     bundle_lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -1110,6 +1283,7 @@ CHECKS: dict[str, object] = {
     "encoding": check_encoding,
     "tests": check_tests,
     "runtime-web": check_runtime_web,
+    "browser": check_browser,
     "a11y": check_a11y,
     "bom": check_bom,
     "paths": check_paths,
@@ -1271,6 +1445,20 @@ def render(report: dict) -> str:
     return "\n".join(lines)
 
 
+def worst_risk(report: dict) -> str | None:
+    """报告里最严重的那条问题的等级；没有问题返回 None。"""
+    worst = None
+    for c in report.get("checks", []):
+        if c.get("state") != "FAIL" or not c.get("applicable", True):
+            continue
+        findings = c.get("findings") or [{}]
+        for f in findings:
+            sev = f.get("severity") or c.get("risk") or "medium"
+            if worst is None or S.RISK_ORDER.get(sev, 9) < S.RISK_ORDER.get(worst, 9):
+                worst = sev
+    return worst
+
+
 def list_checks_text() -> str:
     lines = [f"{'id':<13}{'风险':<5}{'阻断':<5}判定什么"]
     lines.append("-" * 78)
@@ -1292,6 +1480,9 @@ def main_cli(argv=None):
     ap.add_argument("--workers", type=int, default=8, help="并行度，默认 8")
     ap.add_argument("--json", action="store_true", help="输出完整 JSON 报告")
     ap.add_argument("--sarif", metavar="FILE", help="写出 SARIF 2.1.0（给 GitHub Code Scanning 用）")
+    ap.add_argument("--fail-on", default="high",
+                    choices=["critical", "high", "medium", "low"],
+                    help="退出码阈值：该等级及以上的问题会让退出码为 1（默认 high）")
     ap.add_argument("--list-checks", action="store_true", help="列出全部检查项")
     a = ap.parse_args(argv)
 
@@ -1311,6 +1502,11 @@ def main_cli(argv=None):
         print(f"SARIF 已写入：{a.sarif}")
 
     print(json.dumps(rep, ensure_ascii=False, indent=1) if a.json else render(rep))
+
+    worst = worst_risk(rep)
+    order = S.RISK_ORDER
+    if worst is not None and order.get(worst, 9) <= order.get(a.fail_on, 1):
+        return 1
     return 0 if rep.get("verdict") == "PASS" else 1
 
 

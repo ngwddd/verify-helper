@@ -78,6 +78,12 @@ SPECS: tuple[CheckSpec, ...] = (
         "核对文件实际路径与链接大小写；确认站点根目录正确。",
     ),
     CheckSpec(
+        "browser", "浏览器运行时", "high", "运行时",
+        "用真实浏览器打开每个页面，抓 JS 未捕获异常、console.error 与资源 404（需要本机装有 playwright）。",
+        "按报错栈修脚本；资源 404 通常是路径或大小写写错。",
+        ("Playwright",),
+    ),
+    CheckSpec(
         "a11y", "HTML 规范性", "low", "结构",
         "img 有 alt、单页一个 h1、有 title 与 lang、target=_blank 带 rel=noopener。",
         "补 alt / 调整标题层级 / 加 lang；外链加 rel=\"noopener\"。",

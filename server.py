@@ -43,9 +43,10 @@ TOOLS = [
         "name": "verify_start",
         "description": (
             "对一个项目目录跑一遍验证，返回三态结论（PASS / FAIL / UNKNOWN）与每条检查的证据。"
-            "14 项检查并行跑，每项带风险等级（严重/高/中/低）与修复建议。"
+            "15 项检查并行跑，每项带风险等级（严重/高/中/低）与修复建议。"
             "没有 oracle 的检查一律记 UNKNOWN，绝不谎报 PASS。"
-            "支持 verify.toml 自定义规则与 .verifyignore 排除。"
+            "支持 verify.toml 自定义规则、.verifyignore 排除、SARIF 输出。"
+            "browser 检查会用真实浏览器抓 JS 报错（需要本机装有 playwright）。"
         ),
         "inputSchema": {
             "type": "object",
@@ -55,8 +56,8 @@ TOOLS = [
                     "type": "array",
                     "items": {"type": "string",
                               "enum": ["syntax", "links", "html", "secrets", "encoding",
-                                       "tests", "runtime-web", "a11y", "bom", "paths",
-                                       "imports", "todos", "custom", "git"]},
+                                       "tests", "runtime-web", "browser", "a11y", "bom",
+                                       "paths", "imports", "todos", "custom", "git"]},
                     "description": "只跑指定的检查；省略表示跑默认全部（不含 git）",
                 },
                 "include_git": {"type": "boolean",
