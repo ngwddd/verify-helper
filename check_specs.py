@@ -107,7 +107,7 @@ SPECS: tuple[CheckSpec, ...] = (
     ),
     CheckSpec(
         "todos", "TODO 统计", "low", "卫生",
-        "代码里 TODO / FIXME / XXX / HACK 的数量（只报告，不判定对错）。",
+        "代码里 TODO / FIXME 的数量（只报告，不判定对错）。",
         "要么做完，要么改成 issue 编号。",
     ),
     CheckSpec(
