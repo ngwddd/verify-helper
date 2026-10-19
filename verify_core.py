@@ -39,7 +39,7 @@ from pathlib import Path
 
 import check_specs as S
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 # Windows 控制台默认 GBK，印 ✓ / ✗ 会直接 UnicodeEncodeError（本项目踩过多次）。
 for _s in (sys.stdout, sys.stderr):
@@ -83,6 +83,27 @@ LOCAL_PATH_PATTERNS = [
     ("Windows 用户绝对路径", re.compile(r"[A-Za-z]:\\Users\\[^\\\s\"']+")),
     ("POSIX home 绝对路径", re.compile(r"/(?:home|Users)/[^/\s\"']+/")),
 ]
+
+# 当前这台机器的主人是谁 —— 用来把「你的路径」和「别人资料里的路径」分开。
+# 注意：Windows 账号名不一定等于用户目录名（这台机器账号 ngwddd、目录 ggg），
+# 所以两个都收，任一命中就算本人。
+_CURRENT_USERS = {
+    x.lower() for x in (
+        os.environ.get("USERNAME", ""),
+        os.environ.get("USER", ""),
+        Path.home().name,
+    ) if x
+}
+
+
+def _is_own_path(matched: str) -> bool:
+    """`C:\\Users\\ggg` 是本人；`C:\\Users\\jonathans` 是别人资料里的，不算泄漏。"""
+    m = re.match(r"(?i)^[A-Za-z]:\\Users\\([^\\]+)", matched)
+    if not m:
+        m = re.match(r"(?i)^/(?:home|Users)/([^/]+)/", matched)
+    if not m:
+        return True                      # 认不出来就当自己的，宁可多报
+    return _CURRENT_USERS and m.group(1).lower() in _CURRENT_USERS
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -156,14 +177,7 @@ def _glob_match(rel: str, name: str, pattern: str) -> bool:
     return False
 
 
-def _load_ignores(root: Path) -> list[str]:
-    """`.verifyignore`：项目自己声明「这些文件别检查」。
-
-    格式同 .gitignore 的最小子集：一行一个 glob，`#` 开头是注释，相对项目根。
-    存在的理由：模板片段、页面快照、示例代码会被结构和链接检查误报，
-    与其在工具里猜哪些是模板，不如让项目自己说清楚。
-    """
-    f = root / ".verifyignore"
+def _ignore_patterns(f: Path) -> list[str]:
     if not f.exists():
         return []
     try:
@@ -175,18 +189,53 @@ def _load_ignores(root: Path) -> list[str]:
 
 def scan_files(root: Path, limit: int = 200_000,
                ignores: list[str] | None = None) -> tuple[list[Path], dict, int, int]:
+    """遍历项目。`.verifyignore` 按**目录**生效（像 .gitignore）。
+
+    只在根读 ignore 是不够的：对工作区跑的时候，子项目自己的 .verifyignore
+    全被忽略，于是子项目里排掉的模板又会冒出来。
+    """
     out: list[Path] = []
     by_ext: dict[str, int] = {}
     skipped = 0
     ignored = 0
-    ig = ignores or []
+    root_ig = list(ignores or [])
+    # 目录 → 该目录自己的 ignore 规则
+    dir_ig: dict[Path, list[str]] = {}
+
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d.lower() not in SKIP_DIRS]
+        d = Path(dirpath)
+        dirnames[:] = [x for x in dirnames if x.lower() not in SKIP_DIRS]
+        if d not in dir_ig:
+            dir_ig[d] = _ignore_patterns(d / ".verifyignore")
+        # 该目录所有祖先（含自身）生效的规则
+        chain: list[tuple[Path, list[str]]] = []
+        cur = d
+        while True:
+            if cur in dir_ig:
+                pats = dir_ig[cur]
+            elif cur == root:
+                pats = root_ig
+            else:
+                pats = []
+            if pats:
+                chain.append((cur, pats))
+            if cur == root or cur.parent == cur:
+                break
+            cur = cur.parent
+
         for name in filenames:
-            p = Path(dirpath) / name
-            if ig:
-                rel = _rel(root, p)
-                if any(_glob_match(rel, name, pat) for pat in ig):
+            p = d / name
+            if chain:
+                hit = False
+                for base, pats in chain:
+                    try:
+                        rel = p.relative_to(base).as_posix()
+                    except ValueError:
+                        continue
+                    if any(_glob_match(rel, name, pat) for pat in pats):
+                        hit = True
+                        break
+                if hit:
                     ignored += 1
                     continue
             try:
@@ -643,6 +692,7 @@ BIG_SKIP = 2 * 1024 * 1024      # 超过 2MB 的文件只验编码，不做逐�
 
 def scan_text_once(root: Path, files: list[Path]) -> dict:
     secrets_hits, path_hits, todo_hits = [], [], []
+    path_other: list[dict] = []
     enc_bad, bom_hits = [], []
     n_files = 0
     for p in files:
@@ -705,14 +755,21 @@ def scan_text_once(root: Path, files: list[Path]) -> dict:
             for label, rx in LOCAL_PATH_PATTERNS:
                 m = rx.search(line)
                 if m:
-                    path_hits.append({"file": rel, "line": i,
-                                      "message": f"{label}：{m.group(0)[:60]}"})
+                    item = {"file": rel, "line": i,
+                            "message": f"{label}：{m.group(0)[:60]}"}
+                    # 只把「你自己的用户目录」当成问题；别人的（课程资料、
+                    # 别人写的示例）是提示。否则一份课程资料能刷出几百条噪声。
+                    if _is_own_path(m.group(0)):
+                        path_hits.append(item)
+                    else:
+                        path_other.append(item)
                     break
             if TODO_RE.search(line):
                 # 只在代码里数 TODO：文档里提到「TODO 这个词」不该算一处待办
                 if ext in CODE_EXT or ext in HTML_EXT or ext == ".css":
                     todo_hits.append({"file": rel, "line": i, "message": line.strip()[:100]})
     return {"files": n_files, "secrets": secrets_hits, "paths": path_hits,
+            "paths_other": path_other,
             "todos": todo_hits, "encoding": enc_bad, "bom": bom_hits}
 
 
@@ -753,10 +810,20 @@ def check_secrets(root: Path, files: list[Path], ctx: "Ctx") -> Check:
 
 
 def check_paths(root: Path, files: list[Path], ctx: "Ctx") -> Check:
-    """本机绝对路径：默认不参与总判定（本地脚本写死路径很常见，发布前才要紧）。"""
-    return _mk("paths", "本机绝对路径（默认不阻断）", ctx, root, files, "paths",
-               "内置正则（Windows / POSIX 家目录）",
-               "{n} 个文本文件里没命中", "命中 {n} 处", blocking=False)
+    """本机绝对路径：默认不参与总判定（本地脚本写死路径很常见，发布前才要紧）。
+
+    只把**当前用户**的路径算问题；课程资料、别人写的示例里的 `/Users/xxx`
+    进 hints —— 那不是你的泄漏。
+    """
+    c = _mk("paths", "本机绝对路径（默认不阻断）", ctx, root, files, "paths",
+            "内置正则（Windows / POSIX 家目录）",
+            "{n} 个文本文件里没命中", "命中 {n} 处", blocking=False)
+    if ctx.bundle:
+        others = ctx.bundle.get("paths_other") or []
+        c.hints = others[:50]
+        if others:
+            c.detail += f"（另有 {len(others)} 处是别人的路径，见提示）"
+    return c
 
 
 def check_encoding(root: Path, files: list[Path], ctx: "Ctx") -> Check:
@@ -1060,8 +1127,8 @@ def _detect_test_command(root: Path) -> tuple[list[str] | None, str, int]:
         return [sys.executable, "-m", "unittest", "discover", "-s", "test"], \
             "test/ 下的 unittest", 300
 
-    # 散落的测试文件：不靠 scripts.test 也能认出来。
-    # 之前只认 tests/ 目录，结果一个装了 15 个测试文件的项目被判「没有测试入口」。
+    # 散落的测试文件：只在本项目和它的 tests/ 里找 ——
+    # 去子目录里翻会把「工作区」当成有测试的项目，然后在错误的根上跑。
     def _has(patterns: list[str], dirs: list[Path]) -> bool:
         for d in dirs:
             if not d.is_dir():
@@ -1074,7 +1141,8 @@ def _detect_test_command(root: Path) -> tuple[list[str] | None, str, int]:
                     continue
         return False
 
-    dirs = [root] + [d for d in root.iterdir() if d.is_dir() and d.name not in SKIP_DIRS][:40]
+    dirs = [root] + [root / x for x in ("tests", "test", "src", "__tests__")
+                     if (root / x).is_dir()]
     if _has(["*.test.js", "*.test.mjs", "*.test.cjs", "*.spec.js", "*.spec.mjs"], dirs):
         return ["node", "--test"], "node --test 自动发现 *.test.*", 300
     if _has(["*.test.ts", "*.spec.ts"], dirs):
@@ -1451,7 +1519,7 @@ def verify(project: str, checks: list[str] | None = None,
 
     t_all = time.time()
     global _READER
-    ignores = _load_ignores(root)
+    ignores = _ignore_patterns(root / ".verifyignore")
     files, by_ext, skipped_big, ignored = scan_files(root, ignores=ignores)
     _READER = _Reader()
 
@@ -1517,6 +1585,11 @@ def verify(project: str, checks: list[str] | None = None,
         git_info["dirty"] = len([x for x in out.splitlines() if x.strip()]) if code == 0 else None
 
     notes = []
+    ws = _count_subprojects(root)
+    if ws >= 3:
+        notes.append(
+            f"这看起来是**工作区**（识别到 {ws} 个子项目）。工具不会替你挑项目，"
+            "草稿、备份、资料都会被算进来。建议对单个项目跑，或先写 .verifyignore。")
     if not any(c.applicable for c in results):
         notes.append("这个目录里没有识别出任何可检查的源文件 —— 结论是 UNKNOWN，不是 PASS。")
     elif not (passed or blocking_fail or unknown_blocking) and results:
@@ -1675,6 +1748,22 @@ def render_baseline(b: dict) -> list[str]:
     if not (b["new"] or b["fixed"] or b["regressed"]):
         lines.append("  与基线相比：没有变化")
     return lines
+
+
+def _count_subprojects(root: Path) -> int:
+    """数一下子目录里有几个像「独立项目」——用来看这是不是工作区。"""
+    markers = ("package.json", "pyproject.toml", "index.html", "Cargo.toml",
+               "go.mod", "setup.py", ".git")
+    n = 0
+    try:
+        for d in root.iterdir():
+            if not d.is_dir() or d.name.lower() in SKIP_DIRS or d.name.startswith("."):
+                continue
+            if any((d / m).exists() for m in markers):
+                n += 1
+    except OSError:
+        return 0
+    return n
 
 
 def worst_risk(report: dict) -> str | None:
