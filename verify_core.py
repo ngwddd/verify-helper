@@ -39,7 +39,7 @@ from pathlib import Path
 
 import check_specs as S
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 
 # Windows 控制台默认 GBK，印 ✓ / ✗ 会直接 UnicodeEncodeError（本项目踩过多次）。
 for _s in (sys.stdout, sys.stderr):
@@ -104,6 +104,16 @@ def _is_own_path(matched: str) -> bool:
     if not m:
         return True                      # 认不出来就当自己的，宁可多报
     return _CURRENT_USERS and m.group(1).lower() in _CURRENT_USERS
+
+
+# 文档里的占位符不是路径：C:\Users\<you>、/Users/yourname/、C:\Users\%USERNAME%
+_PLACEHOLDER = re.compile(
+    r"(?i)([<>%]|\\Users\\(you|your|yourname|username|user|name|me)\b"
+    r"|/(?:Users|home)/(you|your|yourname|username|user|name|me)/)")
+
+
+def _is_placeholder_path(matched: str) -> bool:
+    return bool(_PLACEHOLDER.search(matched))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -184,7 +194,13 @@ def _ignore_patterns(f: Path) -> list[str]:
         lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return []
-    return [ln.strip() for ln in lines if ln.strip() and not ln.lstrip().startswith("#")]
+    out = []
+    for ln in lines:
+        s = ln.strip()
+        if not s or s.lstrip().startswith("#"):
+            continue
+        out.append(s.rstrip("/"))          # `_sp/` 与 `_sp` 等价
+    return out
 
 
 def scan_files(root: Path, limit: int = 200_000,
@@ -204,7 +220,6 @@ def scan_files(root: Path, limit: int = 200_000,
 
     for dirpath, dirnames, filenames in os.walk(root):
         d = Path(dirpath)
-        dirnames[:] = [x for x in dirnames if x.lower() not in SKIP_DIRS]
         if d not in dir_ig:
             dir_ig[d] = _ignore_patterns(d / ".verifyignore")
         # 该目录所有祖先（含自身）生效的规则
@@ -223,21 +238,32 @@ def scan_files(root: Path, limit: int = 200_000,
                 break
             cur = cur.parent
 
+        def hit(path: Path, name: str) -> bool:
+            for base, pats in chain:
+                try:
+                    rel = path.relative_to(base).as_posix()
+                except ValueError:
+                    continue
+                if any(_glob_match(rel, name, pat) for pat in pats):
+                    return True
+            return False
+
+        # 目录也要过滤：`_sp/` 这种规则是要整棵子树都不扫的
+        keep = []
+        for name in dirnames:
+            if name.lower() in SKIP_DIRS:
+                continue
+            if chain and hit(d / name, name):
+                ignored += 1
+                continue
+            keep.append(name)
+        dirnames[:] = keep
+
         for name in filenames:
             p = d / name
-            if chain:
-                hit = False
-                for base, pats in chain:
-                    try:
-                        rel = p.relative_to(base).as_posix()
-                    except ValueError:
-                        continue
-                    if any(_glob_match(rel, name, pat) for pat in pats):
-                        hit = True
-                        break
-                if hit:
-                    ignored += 1
-                    continue
+            if chain and hit(p, name):
+                ignored += 1
+                continue
             try:
                 if p.stat().st_size > MAX_FILE_BYTES:
                     skipped += 1
@@ -755,6 +781,9 @@ def scan_text_once(root: Path, files: list[Path]) -> dict:
             for label, rx in LOCAL_PATH_PATTERNS:
                 m = rx.search(line)
                 if m:
+                    # 文档占位符（C:\Users\<you>）既不是泄漏也不是别人的路径，直接跳过
+                    if _is_placeholder_path(m.group(0)):
+                        break
                     item = {"file": rel, "line": i,
                             "message": f"{label}：{m.group(0)[:60]}"}
                     # 只把「你自己的用户目录」当成问题；别人的（课程资料、
@@ -1090,7 +1119,7 @@ def check_mutation(root: Path, files: list[Path], ctx: "Ctx") -> Check:
 
 def check_todos(root: Path, files: list[Path], ctx: "Ctx") -> Check:
     return _mk("todos", "TODO / FIXME 数量（只报告）", ctx, root, files, "todos",
-               "正则 TODO|FIXME|XXX|HACK",
+               "正则 TODO|FIXME",
                "没有 TODO", "{n} 处", blocking=False, cap=200)
 
 

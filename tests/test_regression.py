@@ -125,6 +125,40 @@ class TestSubprojectIgnore(unittest.TestCase):
         self.assertTrue(any("verifyignore" in n for n in self.rep["notes"]), self.rep["notes"])
 
 
+class TestDirectoryIgnore(unittest.TestCase):
+    """③b 目录级 ignore：`_sp/` 要整棵子树都不扫。
+
+    这条曾经挂过：之前的实现只过滤文件、不过滤目录，
+    于是根目录写 `_sp/` 完全没用，草稿里的语法错照样让整个工作区 FAIL。
+    """
+
+    def test_directory_pattern_prunes_subtree(self):
+        d = mkproj({
+            "good.py": "x = 1\n",
+            "_sp/broken.py": "def f(:\n",
+            ".verifyignore": "_sp/\n",
+        })
+        try:
+            rep = V.verify(str(d), checks=["syntax"], use_cache=False)
+            c = by_id(rep)["syntax"]
+            self.assertEqual(c["state"], "PASS", f"{c['detail']} {c['findings']}")
+            self.assertEqual(rep["verdict"], "PASS")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_trailing_slash_equivalent(self):
+        for pat in ("_sp", "_sp/"):
+            d = mkproj({"ok.py": "x = 1\n",
+                        "_sp/broken.py": "def f(:\n",
+                        ".verifyignore": pat + "\n"})
+            try:
+                c = by_id(V.verify(str(d), checks=["syntax"], use_cache=False))["syntax"]
+                self.assertEqual(c["state"], "PASS", f"pattern={pat!r} {c['detail']}")
+                self.assertEqual(c["findings"], [])
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+
+
 class TestScatteredTests(unittest.TestCase):
     """④ 没有 scripts.test，但有 *.test.js —— 要能认出来。"""
 
@@ -175,6 +209,17 @@ class TestOwnVsOtherPaths(unittest.TestCase):
             c = by_id(rep)["paths"]
             self.assertEqual(c["state"], "FAIL", c["detail"])
             self.assertTrue(any(me in f["message"] for f in c["findings"]))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_doc_placeholders_are_ignored(self):
+        """`C:\\Users\\<you>` 这种文档占位符，既不是泄漏也不是别人的路径。"""
+        d = mkproj({"README.md": "示例：C:\\Users\\<you>\\proj 与 /Users/<you>/proj\n"})
+        try:
+            rep = V.verify(str(d), checks=["paths"], use_cache=False)
+            c = by_id(rep)["paths"]
+            self.assertEqual(c["findings"], [])
+            self.assertEqual(c["hints"], [], "占位符连提示都不该有")
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
