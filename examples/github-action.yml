@@ -1,0 +1,37 @@
+# 示例：在 GitHub Actions 里跑验证助手，并把结果上传到 PR 的代码扫描
+
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  security-events: write      # 上传 SARIF 需要
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 1) 生成 SARIF。让这一步不因 FAIL 中断，否则后面上传不到
+      - name: 生成 SARIF
+        run: python path/to/verify_core.py . --sarif verify.sarif || true
+
+      # 2) 上传，告警会出现在 PR 的 diff 行内
+      - name: 上传到 GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: verify.sarif
+          category: verify-helper
+
+      # 3) 真正卡构建的是退出码（可选：只要严重/高风险才卡）
+      - name: 按退出码把关
+        run: python path/to/verify_core.py . --fast

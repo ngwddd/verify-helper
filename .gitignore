@@ -1,0 +1,17 @@
+# 开发产物，不进仓库
+.dev/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 本地验证产物
+*.sarif
+!examples/*.sarif
+.verify-cache.json
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store

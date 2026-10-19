@@ -1,0 +1,22 @@
+# 示例：项目自定义规则。复制到项目根目录，改名 verify.toml
+
+[[rules]]
+id = "no-console-log"
+pattern = 'console\.log\('
+paths = ["**/*.js", "**/*.mjs"]
+message = "生产代码里不要留 console.log"
+risk = "medium"
+
+[[rules]]
+id = "no-http-assets"
+pattern = 'src="http://'
+paths = ["**/*.html"]
+message = "站内资源不要用 http://，会触发混合内容拦截"
+risk = "high"
+
+[[rules]]
+id = "no-todo-comment"
+pattern = '(?i)\b(FIXME|HACK)\b'
+paths = ["**/*.py", "**/*.js"]
+message = "FIXME/HACK 要转成 issue 编号"
+risk = "low"

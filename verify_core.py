@@ -1,0 +1,1312 @@
+# -*- coding: utf-8 -*-
+"""项目验证内核 v1 —— 11 项检查，并行执行，逐文件语法缓存。
+
+设计约束（来自用户的三条回答）：
+  · 对象任意：不预设是网页，靠文件类型自动判断该跑哪些检查
+  · 跑在 host 侧：能起子进程、能读整个目录
+  · 只在被叫到时跑：不做文件监听、不自动触发
+
+三态规则（写死在这里，任何检查都逃不掉）：
+  PASS    检查跑了，且通过
+  FAIL    检查跑了，且不通过
+  UNKNOWN 没跑 / 跑不了 / 判不了 —— 永远不许当 PASS
+  另有一个 applicable 标志：项目里根本没有这类文件时记 UNKNOWN + applicable=False，
+  它不参与总判定（那不是「判不了」，是「不适用」）。
+
+v1 相对 v0 的变化：
+  · 检查项 6 → 11：新增 html 结构、编码、Python 未用 import、运行时（HTTP）、TODO 统计
+  · 并行：所有检查同时跑，墙钟≈最慢那一项，而不是相加
+  · 缓存：node --check 的结果按 (mtime, size) 缓存，重复跑几乎零成本
+  · 每项检查报告自己的耗时，总耗时写进报告
+"""
+from __future__ import annotations
+
+import ast
+import fnmatch
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+
+import check_specs as S
+
+VERSION = "1.1.0"
+
+# Windows 控制台默认 GBK，印 ✓ / ✗ 会直接 UnicodeEncodeError（本项目踩过多次）。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+SKIP_DIRS = {
+    "node_modules", ".git", "__pycache__", ".venv", "venv", "env",
+    "dist", "build", "vendor", ".pnpm", ".next", ".cache", "shots",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".state", "site-packages",
+    ".idea", ".vscode", "coverage", "htmlcov", ".tox", ".nuxt", "out",
+}
+
+PY_EXT = {".py"}
+JS_EXT = {".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx"}
+HTML_EXT = {".html", ".htm"}
+JSON_EXT = {".json"}
+CSS_EXT = {".css"}
+TEXT_EXT = PY_EXT | JS_EXT | HTML_EXT | JSON_EXT | CSS_EXT | {
+    ".md", ".txt", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".env"}
+
+MAX_FILE_BYTES = 5 * 1024 * 1024
+JS_CHECK_CAP = 120               # node --check 单次运行的检查上限
+CACHE_DIR = Path(os.environ.get("TEMP", ".")) / "project-verify"
+
+SECRET_PATTERNS = [
+    ("OpenAI/DeepSeek 风格密钥", re.compile(r"\bsk-[A-Za-z0-9]{16,}")),
+    ("GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}")),
+    ("AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("私钥块", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+]
+# 「password = "..."」这种只看代码/配置，不看笔记：
+# 课程笔记里全是 password = "" 这类教学示例，扫进去就是一堆假阳性。
+CRED_PATTERN = ("疑似明文密码赋值",
+                re.compile(r"(?i)\b(password|passwd|pwd|secret|token)\s*[=:]\s*[\"'][^\"'\s]{8,}[\"']"))
+CODE_EXT = PY_EXT | JS_EXT | {".env", ".ini", ".cfg", ".conf", ".yml", ".yaml", ".json", ".toml"}
+TODO_RE = re.compile(r"\b(TODO|FIXME|XXX|HACK)\b")
+LOCAL_PATH_PATTERNS = [
+    ("Windows 用户绝对路径", re.compile(r"[A-Za-z]:\\Users\\[^\\\s\"']+")),
+    ("POSIX home 绝对路径", re.compile(r"/(?:home|Users)/[^/\s\"']+/")),
+]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 数据结构
+# ──────────────────────────────────────────────────────────────────────
+@dataclass
+class Check:
+    id: str
+    title: str
+    state: str = "UNKNOWN"          # PASS / FAIL / UNKNOWN
+    applicable: bool = True
+    blocking: bool = True           # False = 只报告，不影响总判定（由 risk 推导）
+    risk: str = "medium"            # critical / high / medium / low
+    remediation: str = ""           # 不通过时怎么改
+    refs: tuple = ()                # 标准出处
+    detail: str = ""
+    command: str = ""
+    exit_code: int | None = None
+    output: str = ""
+    findings: list = field(default_factory=list)
+    seconds: float = 0.0
+
+    def as_dict(self) -> dict:
+        d = asdict(self)
+        d["refs"] = list(self.refs)
+        return d
+
+
+@dataclass
+class Report:
+    project: str
+    started: str
+    seconds: float
+    files: int
+    by_ext: dict
+    checks: list
+    verdict: str
+    git: dict
+    notes: list
+    cache: dict
+
+    def as_dict(self) -> dict:
+        return {
+            "project": self.project,
+            "started": self.started,
+            "seconds": round(self.seconds, 3),
+            "files": self.files,
+            "by_ext": self.by_ext,
+            "verdict": self.verdict,
+            "git": self.git,
+            "notes": self.notes,
+            "cache": self.cache,
+            "checks": [c.as_dict() for c in self.checks],
+        }
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 基础工具
+# ──────────────────────────────────────────────────────────────────────
+def _glob_match(rel: str, name: str, pattern: str) -> bool:
+    """fnmatch 的 `**/x` 不会匹配根目录下的 x（它把 * 当普通字符，但要求有斜杠）。
+    这里补一条：`**/x` 同时匹配 x 本身。"""
+    if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(name, pattern):
+        return True
+    if pattern.startswith("**/"):
+        p = pattern[3:]
+        return fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(name, p)
+    return False
+
+
+def _load_ignores(root: Path) -> list[str]:
+    """`.verifyignore`：项目自己声明「这些文件别检查」。
+
+    格式同 .gitignore 的最小子集：一行一个 glob，`#` 开头是注释，相对项目根。
+    存在的理由：模板片段、页面快照、示例代码会被结构和链接检查误报，
+    与其在工具里猜哪些是模板，不如让项目自己说清楚。
+    """
+    f = root / ".verifyignore"
+    if not f.exists():
+        return []
+    try:
+        lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    return [ln.strip() for ln in lines if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+def scan_files(root: Path, limit: int = 200_000,
+               ignores: list[str] | None = None) -> tuple[list[Path], dict, int, int]:
+    out: list[Path] = []
+    by_ext: dict[str, int] = {}
+    skipped = 0
+    ignored = 0
+    ig = ignores or []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d.lower() not in SKIP_DIRS]
+        for name in filenames:
+            p = Path(dirpath) / name
+            if ig:
+                rel = _rel(root, p)
+                if any(_glob_match(rel, name, pat) for pat in ig):
+                    ignored += 1
+                    continue
+            try:
+                if p.stat().st_size > MAX_FILE_BYTES:
+                    skipped += 1
+                    continue
+            except OSError:
+                continue
+            out.append(p)
+            ext = p.suffix.lower() or "(无扩展名)"
+            by_ext[ext] = by_ext.get(ext, 0) + 1
+            if len(out) >= limit:
+                return out, by_ext, skipped, ignored
+    return out, by_ext, skipped, ignored
+
+
+def _read(path: Path) -> str | None:
+    """读文本。走共享缓存 —— 同一份文件会被 6 个检查各读一遍，
+    11k 文件的项目上这一点就是十几秒的差别。"""
+    if _READER is not None:
+        return _READER.get(path)
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+class _Reader:
+    """按字节预算缓存文件内容；多线程共用。"""
+
+    def __init__(self, budget_mb: int = 256):
+        self.lock = threading.Lock()
+        self.cache: dict[Path, str] = {}
+        self.bytes = 0
+        self.budget = budget_mb * 1024 * 1024
+
+    def get(self, p: Path) -> str | None:
+        with self.lock:
+            if p in self.cache:
+                return self.cache[p]
+        try:
+            t = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        self.put(p, t)
+        return t
+
+    def put(self, p: Path, t: str) -> None:
+        with self.lock:
+            if p in self.cache:
+                return
+            if self.bytes + len(t) <= self.budget:
+                self.cache[p] = t
+                self.bytes += len(t)
+
+
+_READER: _Reader | None = None
+
+
+def _strip_bom(s: str) -> str:
+    """Python 的 ast.parse / json.loads 看到开头的 U+FEFF 会直接报错，
+    但真实解释器按 utf-8-sig 读是能跑的 —— 读进来先去掉，免得把
+    「文件带 BOM」误报成「语法错误」。（BOM 本身由 bom 检查单独记。）"""
+    return s[1:] if s.startswith("\ufeff") else s
+
+
+def _rel(root: Path, p: Path) -> str:
+    try:
+        return p.relative_to(root).as_posix()
+    except ValueError:
+        return str(p)
+
+
+def _tail(text: str, n: int = 1200) -> str:
+    return (text or "").strip()[-n:]
+
+
+def _which(cmd: str) -> str:
+    """Windows 上 npm / npx 是 .cmd，直接 spawn "npm" 会 FileNotFoundError。
+    先 which，找不到再试 .cmd —— 不这样就永远 127，测试检查形同虚设。"""
+    p = shutil.which(cmd)
+    if p:
+        return p
+    if os.name == "nt":
+        for ext in (".cmd", ".exe", ".bat"):
+            p = shutil.which(cmd + ext)
+            if p:
+                return p
+    return cmd
+
+
+def _run(cmd: list[str], cwd: Path, timeout: int) -> tuple[int, str]:
+    argv = [_which(cmd[0])] + list(cmd[1:])
+    try:
+        r = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except FileNotFoundError:
+        return 127, f"命令不存在：{cmd[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, f"超时（>{timeout}s）：{' '.join(cmd)}"
+    except OSError as e:
+        return 126, f"起不来：{e}"
+
+
+def _node_error_line(out: str) -> str:
+    for ln in (out or "").splitlines():
+        s = ln.strip()
+        if s and "Error" in s:
+            return s[:200]
+    s = (out or "").strip()
+    return s.splitlines()[0][:200] if s else "node --check 失败"
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 语法缓存：(路径, mtime_ns, size) → 结果
+# ──────────────────────────────────────────────────────────────────────
+class Cache:
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.path = CACHE_DIR / "syntax-cache.json"
+        self.data: dict[str, dict] = {}
+        self.hits = 0
+        self.misses = 0
+        if enabled:
+            try:
+                self.data = json.loads(self.path.read_text(encoding="utf-8"))
+            except Exception:
+                self.data = {}
+
+    def key(self, p: Path) -> tuple[str, dict]:
+        try:
+            st = p.stat()
+        except OSError:
+            return "", {}
+        return str(p.resolve()), {"mtime": st.st_mtime_ns, "size": st.st_size}
+
+    def get(self, p: Path) -> dict | None:
+        if not self.enabled:
+            return None
+        k, meta = self.key(p)
+        hit = self.data.get(k)
+        if hit and hit.get("mtime") == meta["mtime"] and hit.get("size") == meta["size"]:
+            self.hits += 1
+            return hit
+        return None
+
+    def put(self, p: Path, ok: bool, msg: str = ""):
+        if not self.enabled:
+            return
+        k, meta = self.key(p)
+        if k:
+            self.data[k] = {"mtime": meta["mtime"], "size": meta["size"],
+                            "ok": ok, "msg": msg}
+
+    def save(self):
+        if not self.enabled:
+            return
+        try:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            # 只留最近 5000 条，别让缓存无限长
+            if len(self.data) > 5000:
+                keys = list(self.data)[-5000:]
+                self.data = {k: self.data[k] for k in keys}
+            self.path.write_text(json.dumps(self.data, ensure_ascii=False),
+                                 encoding="utf-8")
+        except Exception:
+            pass
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 1. 语法
+# ──────────────────────────────────────────────────────────────────────
+def check_syntax(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+    c = Check("syntax", "语法：每个源文件都要能被解析")
+    t0 = time.time()
+    pys = [p for p in files if p.suffix.lower() in PY_EXT]
+    jss = [p for p in files if p.suffix.lower() in JS_EXT]
+    jsonf = [p for p in files if p.suffix.lower() in JSON_EXT]
+    tomlf = [p for p in files if p.suffix.lower() == ".toml"]
+    if not (pys or jss or jsonf or tomlf):
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "项目里没有 .py / .js / .json / .toml 文件"
+        return c
+
+    bad: list[dict] = []
+    for p in pys:
+        src = _read(p)
+        if src is None:
+            bad.append({"file": _rel(root, p), "line": 0, "message": "读不出来"})
+            continue
+        try:
+            ast.parse(_strip_bom(src), filename=str(p))
+        except SyntaxError as e:
+            bad.append({"file": _rel(root, p), "line": e.lineno or 0, "message": f"{e.msg}"})
+    for p in jsonf:
+        try:
+            json.loads(_strip_bom(_read(p) or ""))
+        except json.JSONDecodeError as e:
+            bad.append({"file": _rel(root, p), "line": e.lineno, "message": f"JSON: {e.msg}"})
+    for p in tomlf:
+        try:
+            tomllib.loads(_strip_bom(_read(p) or ""))
+        except Exception as e:
+            bad.append({"file": _rel(root, p), "line": 0, "message": f"TOML: {e}"[:160]})
+
+    # JS：先查缓存，只对没命中/变了的文件起 node --check，并行
+    todo: list[Path] = []
+    for p in jss:
+        hit = ctx.cache.get(p)
+        if hit is not None:
+            if not hit.get("ok"):
+                bad.append({"file": _rel(root, p), "line": 0,
+                            "message": hit.get("msg") or "node --check 失败"})
+            continue
+        todo.append(p)
+
+    capped = todo[:JS_CHECK_CAP]
+    js_skipped = len(todo) - len(capped)
+    no_node = False
+    if capped:
+        def one(p: Path):
+            code, out = _run(["node", "--check", str(p)], root, 30)
+            return p, code, out
+
+        with ThreadPoolExecutor(max_workers=ctx.workers) as ex:
+            for p, code, out in ex.map(one, capped):
+                if code == 127:
+                    no_node = True
+                    break
+                if code == 0:
+                    ctx.cache.put(p, True)
+                else:
+                    msg = _node_error_line(out)
+                    ctx.cache.put(p, False, msg)
+                    bad.append({"file": _rel(root, p), "line": 0, "message": msg})
+        if no_node:
+            c.state, c.applicable = "UNKNOWN", False
+            c.detail = "这台机器上没有 node，JS 语法无法检查"
+            c.seconds = time.time() - t0
+            return c
+
+    c.findings = bad
+    c.state = "FAIL" if bad else "PASS"
+    c.detail = (f"py {len(pys)} / js {len(jss)}（缓存命中 {ctx.cache.hits}）/ "
+                f"json {len(jsonf)} / toml {len(tomlf)}；失败 {len(bad)}"
+                + (f"；另有 {js_skipped} 个 js 超出单次上限未查" if js_skipped else ""))
+    c.command = "ast.parse + node --check + json.loads + tomllib"
+    c.exit_code = 0 if not bad else 1
+    c.seconds = time.time() - t0
+    return c
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 2. 链接与锚点
+# ──────────────────────────────────────────────────────────────────────
+INLINE_SCRIPT = re.compile(r"(?is)<script(?![^>]*\bsrc=)[^>]*>.*?</script>")
+INLINE_STYLE = re.compile(r"(?is)<style[^>]*>.*?</style>")
+
+
+def _strip_inline(t: str) -> str:
+    return INLINE_STYLE.sub("", INLINE_SCRIPT.sub("", t))
+
+
+def check_links(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+    c = Check("links", "链接：相对链接与锚点都要能落地")
+    t0 = time.time()
+    htmls = [p for p in files if p.suffix.lower() in HTML_EXT]
+    if not htmls:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "项目里没有 HTML 文件"
+        return c
+
+    texts = {p: _strip_inline(_read(p) or "") for p in htmls}
+    ids = {p: set(re.findall(r'\bid="([^"]+)"', t)) for p, t in texts.items()}
+    dead, anchors, abs_paths = [], [], []
+    for p, t in texts.items():
+        for m in re.finditer(r'(?:href|src)\s*=\s*"([^"]+)"', t):
+            raw = m.group(1).strip()
+            if not raw or re.match(r"^(?:https?:|mailto:|tel:|data:|javascript:|//)", raw, re.I):
+                continue
+            line = t.count("\n", 0, m.start()) + 1
+            if raw.startswith("#"):
+                if raw[1:] and raw[1:] not in ids[p]:
+                    anchors.append({"file": _rel(root, p), "line": line,
+                                    "message": f"页内锚点不存在：{raw}"})
+                continue
+            if raw.startswith("/"):
+                abs_paths.append({"file": _rel(root, p), "line": line,
+                                  "message": f"站点根绝对路径，离线未校验：{raw}"})
+                continue
+            path = raw.split("#")[0].split("?")[0]
+            if not path:
+                continue
+            tgt = (p.parent / path).resolve()
+            if not tgt.exists():
+                dead.append({"file": _rel(root, p), "line": line, "message": f"死链：{raw}"})
+            elif "#" in raw:
+                frag = raw.split("#", 1)[1]
+                if tgt in ids and frag and frag not in ids[tgt]:
+                    anchors.append({"file": _rel(root, p), "line": line,
+                                    "message": f"跨页锚点不存在：{raw}"})
+
+    real = dead + anchors
+    c.findings = real + abs_paths
+    c.state = "FAIL" if real else "PASS"
+    c.detail = (f"{len(htmls)} 个页面；死链 {len(dead)}、坏锚点 {len(anchors)}"
+                + (f"、站点根绝对路径 {len(abs_paths)}（未校验）" if abs_paths else ""))
+    c.command = "内置解析（href/src）"
+    c.exit_code = 0 if not real else 1
+    c.seconds = time.time() - t0
+    return c
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 3. HTML 结构
+# ──────────────────────────────────────────────────────────────────────
+VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+        "meta", "param", "source", "track", "wbr"}
+BLOCK_P = re.compile(r"<(?:div|table|ul|ol|section|h[1-6]|p|form|blockquote)\b", re.I)
+
+
+def _scan_html(p: Path, t: str, root: Path) -> tuple[list[dict], list[dict]]:
+    """返回 (结构性, 规范性)。结构性问题算 bug；规范性只提示。
+
+    分开的原因：`h1 有两个` 在双语 404 页上是故意的，`img 缺 alt` 是风格问题，
+    它们不该让整个项目判 FAIL；而标签没闭合、id 重复会真的坏功能。
+    """
+    structural: list[dict] = []
+    polish: list[dict] = []
+    t = _strip_inline(t)
+    rel = _rel(root, p)
+
+    # 标签配平
+    stack: list[tuple[str, int]] = []
+    for m in re.finditer(r"<(/?)([a-zA-Z][\w:-]*)([^>]*?)(/?)>", t):
+        closing, tag, attrs, selfclose = m.group(1), m.group(2).lower(), m.group(3), m.group(4)
+        line = t.count("\n", 0, m.start()) + 1
+        if tag in VOID or selfclose:
+            continue
+        if not closing:
+            stack.append((tag, line))
+        else:
+            if stack and stack[-1][0] == tag:
+                stack.pop()
+            else:
+                idx = next((i for i in range(len(stack) - 1, -1, -1) if stack[i][0] == tag), None)
+                if idx is None:
+                    structural.append({"file": rel, "line": line, "message": f"孤立的 </{tag}>"})
+                else:
+                    skipped = [x[0] for x in stack[idx + 1:]]
+                    structural.append({"file": rel, "line": line,
+                                       "message": f"</{tag}> 收尾时还有未闭合的 {skipped}"})
+                    del stack[idx:]
+    for tag, line in stack[:5]:
+        structural.append({"file": rel, "line": line, "message": f"未闭合的 <{tag}>"})
+
+    # 重复 id（会让锚点失效，算结构问题）
+    seen: dict[str, int] = {}
+    for m in re.finditer(r'\bid="([^"]+)"', t):
+        v = m.group(1)
+        line = t.count("\n", 0, m.start()) + 1
+        if v in seen:
+            structural.append({"file": rel, "line": line, "message": f"重复 id「{v}」"})
+        else:
+            seen[v] = line
+
+    # 以下只提示
+    for m in re.finditer(r"<img\b([^>]*)>", t, re.I):
+        if not re.search(r"\balt\s*=", m.group(1), re.I):
+            polish.append({"file": rel, "line": t.count("\n", 0, m.start()) + 1,
+                           "message": "<img> 缺 alt"})
+    n_h1 = len(re.findall(r"<h1\b", t, re.I))
+    if n_h1 > 1:
+        polish.append({"file": rel, "line": 0, "message": f"h1 有 {n_h1} 个"})
+    if not re.search(r"<title>[^<]*\S[^<]*</title>", t, re.I):
+        polish.append({"file": rel, "line": 0, "message": "缺 <title> 或为空"})
+    if not re.search(r"<html[^>]*\slang=", t, re.I):
+        polish.append({"file": rel, "line": 0, "message": "<html> 缺 lang"})
+    for m in re.finditer(r"<a\b[^>]*target\s*=\s*[\"']_blank[\"'][^>]*>", t, re.I):
+        if "noopener" not in m.group(0) and "noreferrer" not in m.group(0):
+            polish.append({"file": rel, "line": t.count("\n", 0, m.start()) + 1,
+                           "message": "target=_blank 缺 rel=noopener"})
+    return structural, polish
+
+
+def check_html(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+    c = Check("html", "HTML 结构：标签配平、重复 id")
+    t0 = time.time()
+    htmls = [p for p in files if p.suffix.lower() in HTML_EXT]
+    if not htmls:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "项目里没有 HTML 文件"
+        return c
+    hits: list[dict] = []
+    for p in htmls:
+        structural, _ = _scan_html(p, _read(p) or "", root)
+        hits.extend(structural)
+    c.findings = hits
+    c.state = "FAIL" if hits else "PASS"
+    c.detail = f"{len(htmls)} 个页面，结构问题 {len(hits)} 处"
+    c.command = "内置结构扫描"
+    c.exit_code = 0 if not hits else 1
+    c.seconds = time.time() - t0
+    return c
+
+
+def check_a11y(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+    c = Check("a11y", "HTML 规范性：alt / h1 / title / lang / rel（默认不阻断）", blocking=False)
+    t0 = time.time()
+    htmls = [p for p in files if p.suffix.lower() in HTML_EXT]
+    if not htmls:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "项目里没有 HTML 文件"
+        return c
+    hits: list[dict] = []
+    for p in htmls:
+        _, polish = _scan_html(p, _read(p) or "", root)
+        hits.extend(polish)
+    c.findings = hits
+    c.state = "FAIL" if hits else "PASS"
+    c.detail = f"{len(htmls)} 个页面，提示 {len(hits)} 处"
+    c.command = "内置结构扫描（只报告）"
+    c.exit_code = 0 if not hits else 1
+    c.seconds = time.time() - t0
+    return c
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 4-6. 一次扫描，喂五项检查（secrets / paths / todos / encoding / bom）
+#
+# 为什么合并：这五项都是「逐文件逐行」。分开做就是五遍 11k 文件的
+# 读 + decode + splitlines —— 实测在 6.6GB 语料上要 13.5 秒，而且因为
+# GIL 串行，开更多线程没用。合成一遍后约为原来的 1/5。
+# ──────────────────────────────────────────────────────────────────────
+BOM = b"\xef\xbb\xbf"
+LOCKFILES = ("package-lock.json", "pnpm-lock.yaml", "yarn.lock")
+# 廉价预筛：这 16 个字面量一个都不出现，就不可能命中任何一条正则。
+# 绝大多数文件（尤其中文笔记、数据）一个都没有，直接跳过逐行扫描。
+MARKERS = (b"sk-", b"ghp", b"akia", b"-----begin", b"password", b"passwd",
+           b"pwd", b"secret", b"token", b"users\\", b"/home/", b"/users/",
+           b"todo", b"fixme", b"xxx", b"hack")
+BIG_SKIP = 2 * 1024 * 1024      # 超过 2MB 的文件只验编码，不做逐行扫描
+
+
+def scan_text_once(root: Path, files: list[Path]) -> dict:
+    secrets_hits, path_hits, todo_hits = [], [], []
+    enc_bad, bom_hits = [], []
+    n_files = 0
+    for p in files:
+        ext = p.suffix.lower()
+        if ext not in TEXT_EXT:
+            continue
+        n_files += 1
+        try:
+            raw = p.read_bytes()
+        except OSError:
+            enc_bad.append({"file": _rel(root, p), "line": 0, "message": "读不出来"})
+            continue
+        if raw.startswith(BOM):
+            bom_hits.append({"file": _rel(root, p), "line": 1, "message": "文件带 UTF-8 BOM"})
+            raw_body = raw[3:]
+        else:
+            raw_body = raw
+        # UTF-16：字节层面第一处就解不出来，报「第 0 字节」等于没说，直接点明编码
+        if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            enc_bad.append({"file": _rel(root, p), "line": 0,
+                            "message": "UTF-16 编码（带 BOM），不是 UTF-8"})
+            continue
+        # 先验编码（纯 C 速度），再决定要不要逐行扫
+        try:
+            raw_body.decode("utf-8")
+            text_ok = True
+        except UnicodeDecodeError as e:
+            enc_bad.append({"file": _rel(root, p), "line": 0,
+                            "message": f"不是合法 UTF-8（第 {e.start} 字节）"})
+            text_ok = False
+        if len(raw_body) > BIG_SKIP:
+            continue                      # 大文件只验编码，不逐行扫
+        low = raw_body.lower()
+        if not any(m in low for m in MARKERS):
+            # 一个标记都没有 → 不可能命中任何正则，连解码都省了
+            if text_ok and _READER is not None:
+                _READER.put(p, raw_body.decode("utf-8", "replace"))
+            continue
+        text = raw_body.decode("utf-8", "replace")
+        if _READER is not None:
+            _READER.put(p, text)          # 后面 links / html 检查不必再读一遍
+        if not text:
+            continue
+
+        is_lock = p.name.lower() in LOCKFILES
+        is_code = ext in CODE_EXT
+        rel = _rel(root, p)
+        for i, line in enumerate(text.splitlines(), 1):
+            if not is_lock:
+                hit = False
+                for label, rx in SECRET_PATTERNS:
+                    if rx.search(line):
+                        secrets_hits.append({"file": rel, "line": i,
+                                             "message": f"{label}：{line.strip()[:90]}"})
+                        hit = True
+                        break
+                if not hit and is_code and CRED_PATTERN[1].search(line):
+                    secrets_hits.append({"file": rel, "line": i,
+                                         "message": f"{CRED_PATTERN[0]}：{line.strip()[:90]}"})
+            for label, rx in LOCAL_PATH_PATTERNS:
+                m = rx.search(line)
+                if m:
+                    path_hits.append({"file": rel, "line": i,
+                                      "message": f"{label}：{m.group(0)[:60]}"})
+                    break
+            if TODO_RE.search(line):
+                todo_hits.append({"file": rel, "line": i, "message": line.strip()[:100]})
+    return {"files": n_files, "secrets": secrets_hits, "paths": path_hits,
+            "todos": todo_hits, "encoding": enc_bad, "bom": bom_hits}
+
+
+def _bundle(ctx: "Ctx", root: Path, files: list[Path]) -> dict:
+    # 双检锁：五个检查并行跑时会同时到这里，没有锁就会各扫一遍
+    # （实测 5 份并发扫描把 13.8s 拖成 61.9s）。
+    if ctx.bundle is None:
+        with ctx.bundle_lock:
+            if ctx.bundle is None:
+                ctx.bundle = scan_text_once(root, files)
+    return ctx.bundle
+
+
+def _mk(cid: str, title: str, ctx: "Ctx", root: Path, files: list[Path],
+        key: str, command: str, ok: str, bad: str, blocking: bool = True,
+        cap: int | None = None) -> Check:
+    c = Check(cid, title, blocking=blocking)
+    t0 = time.time()
+    if not any(p.suffix.lower() in TEXT_EXT for p in files):
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "没有可扫描的文本文件"
+        return c
+    b = _bundle(ctx, root, files)
+    hits = b.get(key, [])
+    c.findings = hits[:cap] if cap else hits
+    c.state = "FAIL" if hits else "PASS"
+    c.detail = (bad.format(n=len(hits)) if hits else ok.format(n=b.get("files", 0)))
+    c.command = command
+    c.exit_code = 0 if not hits else 1
+    c.seconds = time.time() - t0
+    return c
+
+
+def check_secrets(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+    return _mk("secrets", "密钥：代码里不该出现真凭据", ctx, root, files, "secrets",
+               "内置正则（4 类真凭据 + 代码里的明文密码）",
+               "{n} 个文本文件里没命中", "命中 {n} 处")
+
+
+def check_paths(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+    """本机绝对路径：默认不参与总判定（本地脚本写死路径很常见，发布前才要紧）。"""
+    return _mk("paths", "本机绝对路径（默认不阻断）", ctx, root, files, "paths",
+               "内置正则（Windows / POSIX 家目录）",
+               "{n} 个文本文件里没命中", "命中 {n} 处", blocking=False)
+
+
+def check_encoding(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+    return _mk("encoding", "编码：文本文件必须是合法 UTF-8", ctx, root, files, "encoding",
+               "bytes.decode('utf-8')",
+               "检查 {n} 个文件，全部合法", "非法 {n} 个")
+
+
+def check_bom(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+    """UTF-8 BOM：非阻断。多数场景无害，但会让 CSS/JS 首行规则失效、git diff 多一个隐形字符。"""
+    return _mk("bom", "UTF-8 BOM（默认不阻断）", ctx, root, files, "bom",
+               "前 3 字节 == EF BB BF",
+               "没有文件带 BOM", "{n} 个文件带 BOM", blocking=False)
+
+
+def check_todos(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+    return _mk("todos", "TODO / FIXME 数量（只报告）", ctx, root, files, "todos",
+               "正则 TODO|FIXME|XXX|HACK",
+               "没有 TODO", "{n} 处", blocking=False, cap=200)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 7. 测试
+# ──────────────────────────────────────────────────────────────────────
+def _detect_test_command(root: Path) -> tuple[list[str] | None, str, int]:
+    pkg = root / "package.json"
+    if pkg.exists():
+        try:
+            data = json.loads(pkg.read_text(encoding="utf-8"))
+            script = (data.get("scripts") or {}).get("test") or ""
+            if script and "no test specified" not in script:
+                return ["npm", "test", "--silent"], "package.json 的 scripts.test", 300
+        except Exception:
+            pass
+    pyproj = root / "pyproject.toml"
+    if pyproj.exists():
+        try:
+            if "pytest" in pyproj.read_text(encoding="utf-8", errors="replace").lower():
+                return [sys.executable, "-m", "pytest", "-q"], "pytest", 300
+        except Exception:
+            pass
+    if (root / "pytest.ini").exists() or (root / "conftest.py").exists():
+        return [sys.executable, "-m", "pytest", "-q"], "pytest", 300
+    tests = root / "tests"
+    if tests.is_dir():
+        if any(tests.glob("*.py")):
+            return [sys.executable, "-m", "unittest", "discover", "-s", "tests"], \
+                "tests/ 下的 unittest", 300
+        if any(list(tests.glob("*.mjs")) + list(tests.glob("*.js"))):
+            return ["node", "--test", "tests"], "tests/ 下的 node --test", 300
+    if (root / "test").is_dir() and any((root / "test").glob("*.py")):
+        return [sys.executable, "-m", "unittest", "discover", "-s", "test"], \
+            "test/ 下的 unittest", 300
+    return None, "没有识别到测试入口（scripts.test / pytest / tests/*.py / tests/*.mjs）", 0
+
+
+def check_tests(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+    c = Check("tests", "测试：跑得起来，且真的通过")
+    t0 = time.time()
+    if ctx.fast:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "fast 模式跳过测试"
+        return c
+    cmd, why, timeout = _detect_test_command(root)
+    if cmd is None:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = why
+        return c
+    code, out = _run(cmd, root, min(timeout, ctx.test_timeout))
+    c.command = " ".join(cmd)
+    c.exit_code = code
+    c.output = _tail(out, 2000)
+    if code == 127:
+        c.state, c.detail = "UNKNOWN", f"命令跑不起来：{why}"
+    elif code == 124:
+        c.state, c.detail = "UNKNOWN", f"超时：{why}"
+    else:
+        c.state = "PASS" if code == 0 else "FAIL"
+        c.detail = f"{why}；退出码 {code}"
+        # 从输出里抠出失败的用例名，省得再去翻日志
+        names = re.findall(r"^(?:FAIL|ERROR):\s+(\S+)", out, re.M)[:10]
+        if names:
+            c.findings = [{"file": why, "line": 0, "message": n} for n in names]
+    c.seconds = time.time() - t0
+    return c
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 8. Python 未使用的 import
+# ──────────────────────────────────────────────────────────────────────
+def check_imports(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+    """未使用的 import：非阻断。
+
+    为什么非阻断：`__all__` 再导出、`import x  # noqa` 这类合法写法会被误判，
+    它适合当提示，不适合当闸门。
+    """
+    c = Check("imports", "Python 未使用的 import（默认不阻断）", blocking=False)
+    t0 = time.time()
+    pys = [p for p in files if p.suffix.lower() in PY_EXT]
+    if not pys:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "项目里没有 .py 文件"
+        return c
+    hits = []
+    for p in pys:
+        src = _read(p)
+        if not src:
+            continue
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue                          # 语法错由 syntax 检查负责
+        body = src
+        for node in ast.walk(tree):
+            names: list[tuple[str, int, str]] = []
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    names.append((a.asname or a.name.split(".")[0], node.lineno, a.name))
+            elif isinstance(node, ast.ImportFrom):
+                for a in node.names:
+                    if a.name == "*":
+                        continue
+                    names.append((a.asname or a.name, node.lineno, a.name))
+            for local, line, orig in names:
+                # 去掉 import 行本身再数出现次数
+                rest = "\n".join(l for i, l in enumerate(body.splitlines(), 1)
+                                 if i != line)
+                if not re.search(rf"\b{re.escape(local)}\b", rest):
+                    hits.append({"file": _rel(root, p), "line": line,
+                                 "message": f"导入了但没用到：{orig}"})
+    c.findings = hits
+    c.state = "FAIL" if hits else "PASS"
+    c.detail = f"扫了 {len(pys)} 个 py 文件，可疑 {len(hits)} 处"
+    c.command = "AST 扫描"
+    c.exit_code = 0 if not hits else 1
+    c.seconds = time.time() - t0
+    return c
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 9. 运行时（HTTP）
+# ──────────────────────────────────────────────────────────────────────
+def _find_site_root(root: Path, htmls: list[Path]) -> Path | None:
+    """找静态站点根：优先项目根的 index.html，其次任意含 index.html 的目录
+    （取收录页面最多的那个）。找不到就说明这不是一个可服务的站点。"""
+    if (root / "index.html").exists() or (root / "index.htm").exists():
+        return root
+    cands = {p.parent for p in htmls if p.name.lower() in ("index.html", "index.htm")}
+    if not cands:
+        return None
+    return max(cands, key=lambda d: sum(1 for h in htmls if h.parent == d or d in h.parents))
+
+
+def check_runtime_web(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+    """真起一个静态服务器，逐个 GET 页面 —— 验的是「文件存在」之外的那一层：
+
+    大小写写错、路径多一层、目录索引缺失，只有在 HTTP 语义下才会露出来。
+    没有浏览器，所以抓不到 JS 报错（那是 v1.5 的事，这里如实写明）。
+    """
+    c = Check("runtime-web", "运行时：静态服务器起来后每页都能 200")
+    t0 = time.time()
+    if ctx.fast:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "fast 模式跳过运行时"
+        return c
+    htmls = [p for p in files if p.suffix.lower() in HTML_EXT]
+    if not htmls:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "项目里没有 HTML，跳过"
+        return c
+    site_root = _find_site_root(root, htmls)
+    if site_root is None:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "没有 index.html，无法确定站点根（不是可服务的静态站）"
+        return c
+    port = _free_port()
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1",
+             "--directory", str(site_root)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        import urllib.request
+        import urllib.error
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                    break
+            except OSError:
+                time.sleep(0.05)
+        bad = []
+        served = 0
+        for p in htmls[:200]:
+            try:
+                rel = p.relative_to(site_root).as_posix()
+            except ValueError:
+                continue
+            served += 1
+            url = f"http://127.0.0.1:{port}/{rel}"
+            try:
+                with urllib.request.urlopen(url, timeout=5) as r:
+                    if r.status != 200:
+                        bad.append({"file": rel, "line": 0, "message": f"HTTP {r.status}"})
+            except urllib.error.HTTPError as e:
+                bad.append({"file": rel, "line": 0, "message": f"HTTP {e.code}"})
+            except Exception as e:
+                bad.append({"file": rel, "line": 0, "message": f"{type(e).__name__}"})
+        c.findings = bad
+        c.state = "FAIL" if bad else "PASS"
+        c.detail = (f"站点根 {_rel(root, site_root) or '.'}，起 http.server:{port}，"
+                    f"GET {served} 个页面，失败 {len(bad)}")
+        c.command = f"python -m http.server {port} + urllib GET"
+        c.exit_code = 0 if not bad else 1
+    except Exception as e:
+        c.state = "UNKNOWN"
+        c.detail = f"起不来静态服务器：{type(e).__name__}: {e}"
+    finally:
+        if proc:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+    c.seconds = time.time() - t0
+    return c
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 11. git
+# ──────────────────────────────────────────────────────────────────────
+def check_git(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+    c = Check("git", "工作区状态（默认不阻断）", blocking=False)
+    t0 = time.time()
+    if not (root / ".git").exists():
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "不是 git 仓库"
+        return c
+    code, out = _run(["git", "status", "--porcelain"], root, 60)
+    if code != 0:
+        c.state = "UNKNOWN"
+        c.detail = f"git status 失败：{_tail(out, 200)}"
+        return c
+    dirty = [ln for ln in out.splitlines() if ln.strip()]
+    c.findings = [{"file": ln[3:].strip(), "line": 0, "message": ln[:2].strip()}
+                  for ln in dirty[:50]]
+    c.state = "PASS" if not dirty else "FAIL"
+    c.detail = "工作区干净" if not dirty else f"有 {len(dirty)} 个未提交改动"
+    c.command = "git status --porcelain"
+    c.exit_code = code
+    c.seconds = time.time() - t0
+    return c
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 注册表
+# ──────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
+# 12. 自定义规则（verify.toml）—— 规则即数据
+#
+# 抄的是 Semgrep 的思路：加一条检查不该改引擎。项目在根目录放 verify.toml：
+#
+#   [[rules]]
+#   id = "no-console-log"
+#   pattern = 'console\.log\('
+#   paths = ["**/*.js", "**/*.mjs"]
+#   message = "生产代码里不要留 console.log"
+#   risk = "medium"
+# ──────────────────────────────────────────────────────────────────────
+def check_custom(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+    c = Check("custom", "自定义规则（verify.toml）")
+    t0 = time.time()
+    cfg = root / "verify.toml"
+    if not cfg.exists():
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "没有 verify.toml"
+        return c
+    try:
+        data = tomllib.loads(_strip_bom(cfg.read_text(encoding="utf-8")))
+    except Exception as e:
+        c.state = "FAIL"
+        c.findings = [{"file": "verify.toml", "line": 0, "message": f"解析失败：{e}"}]
+        c.detail = "verify.toml 解析失败"
+        c.exit_code = 1
+        c.seconds = time.time() - t0
+        return c
+
+    rules = data.get("rules") or []
+    if not isinstance(rules, list):
+        rules = []
+    findings = []
+    compiled = 0
+    for idx, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            continue
+        rid = str(rule.get("id") or f"rule{idx + 1}")
+        pat = rule.get("pattern")
+        if not pat:
+            findings.append({"file": "verify.toml", "line": 0,
+                             "message": f"规则 {rid} 缺 pattern"})
+            continue
+        try:
+            rx = re.compile(pat)
+        except re.error as e:
+            findings.append({"file": "verify.toml", "line": 0,
+                             "message": f"规则 {rid} 的正则无效：{e}"})
+            continue
+        compiled += 1
+        globs = rule.get("paths") or ["**/*"]
+        if isinstance(globs, str):
+            globs = [globs]
+        msg = str(rule.get("message") or pat)
+        sev = str(rule.get("risk") or "medium")
+        for p in files:
+            if p.suffix.lower() not in TEXT_EXT:
+                continue
+            rel = _rel(root, p)
+            if not any(_glob_match(rel, p.name, g) for g in globs):
+                continue
+            t = _read(p)
+            if not t:
+                continue
+            for i, line in enumerate(t.splitlines(), 1):
+                if rx.search(line):
+                    findings.append({"file": rel, "line": i,
+                                     "message": f"[{rid}] {msg}", "severity": sev})
+    c.findings = findings
+    c.state = "FAIL" if findings else "PASS"
+    c.detail = f"{len(rules)} 条规则（{compiled} 条可用），命中 {len(findings)} 处"
+    c.command = "verify.toml + 内置正则"
+    c.exit_code = 0 if not findings else 1
+    c.risk = "high" if any(f.get("severity") in ("critical", "high") for f in findings) else "medium"
+    c.seconds = time.time() - t0
+    return c
+
+
+@dataclass
+class Ctx:
+    cache: Cache
+    workers: int = 8
+    fast: bool = False
+    test_timeout: int = 300
+    bundle: dict | None = None       # 一次扫描的结果，五个检查共用
+    bundle_lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+# 函数表；标题 / 风险 / 说明 / 修复建议全部来自 check_specs.py，这里只负责「怎么跑」。
+CHECKS: dict[str, object] = {
+    "syntax": check_syntax,
+    "links": check_links,
+    "html": check_html,
+    "secrets": check_secrets,
+    "encoding": check_encoding,
+    "tests": check_tests,
+    "runtime-web": check_runtime_web,
+    "a11y": check_a11y,
+    "bom": check_bom,
+    "paths": check_paths,
+    "imports": check_imports,
+    "todos": check_todos,
+    "custom": check_custom,
+    "git": check_git,
+}
+ORDER = [s.id for s in S.SPECS if s.id in CHECKS]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 入口
+# ──────────────────────────────────────────────────────────────────────
+def verify(project: str, checks: list[str] | None = None,
+           include_git: bool = False, fast: bool = False,
+           use_cache: bool = True, workers: int = 8) -> dict:
+    root = Path(project).expanduser().resolve()
+    if not root.is_dir():
+        return {"error": f"不是目录：{root}", "verdict": "UNKNOWN"}
+
+    t_all = time.time()
+    global _READER
+    ignores = _load_ignores(root)
+    files, by_ext, skipped_big, ignored = scan_files(root, ignores=ignores)
+    _READER = _Reader()
+
+    if checks:
+        selected = [c for c in checks if c in CHECKS]
+        unknown = [c for c in checks if c not in CHECKS]
+    else:
+        selected = [k for k in ORDER if k != "git" or include_git]
+        unknown = []
+    if include_git and "git" not in selected:
+        selected.append("git")
+
+    ctx = Ctx(cache=Cache(use_cache), workers=max(1, min(workers, 16)), fast=fast)
+
+    # 这五项共用一次逐行扫描：先在这里算好（一次），再并行跑其余检查。
+    # 不预计算的话，五个线程会各自从头扫一遍，反而更慢。
+    BUNDLED = {"secrets", "paths", "todos", "encoding", "bom"}
+    if BUNDLED & set(selected):
+        ctx.bundle = scan_text_once(root, files)
+
+    results: list[Check] = []
+    t_par = time.time()
+    with ThreadPoolExecutor(max_workers=min(ctx.workers, max(1, len(selected)))) as ex:
+        futs = {ex.submit(CHECKS[k], root, files, ctx): k for k in selected}
+        for fut in as_completed(futs):
+            k = futs[fut]
+            spec = S.get(k)
+            try:
+                res = fut.result()
+            except Exception as e:
+                res = Check(k, spec.title, "UNKNOWN", True, spec.blocking,
+                            spec.risk, spec.remediation, spec.refs,
+                            detail=f"检查内部异常：{type(e).__name__}: {e}")
+            res.title = spec.title
+            res.remediation = spec.remediation
+            res.refs = spec.refs
+            # custom 的等级可以由 config 里的 risk 抬高（例如声明成 high 就要阻断）
+            if k != "custom":
+                res.risk = spec.risk
+            res.blocking = res.risk in S.BLOCKING_RISKS
+            results.append(res)
+    parallel_seconds = time.time() - t_par
+    for k in unknown:
+        results.append(Check(k, k, "UNKNOWN", False, "未知检查项"))
+    order_index = {k: i for i, k in enumerate(ORDER)}
+    results.sort(key=lambda c: order_index.get(c.id, 99))
+
+    ctx.cache.save()
+
+    blocking_fail = [c for c in results if c.state == "FAIL" and c.applicable and c.blocking]
+    unknown_blocking = [c for c in results if c.state == "UNKNOWN" and c.applicable and c.blocking]
+    passed = [c for c in results if c.state == "PASS" and c.applicable and c.blocking]
+    warned = [c for c in results if c.state == "FAIL" and c.applicable and not c.blocking]
+
+    verdict = "FAIL" if blocking_fail else ("UNKNOWN" if unknown_blocking else
+                                            ("PASS" if passed else "UNKNOWN"))
+
+    git_info = {}
+    if (root / ".git").exists():
+        code, out = _run(["git", "rev-parse", "--short", "HEAD"], root, 30)
+        git_info["head"] = out.strip() if code == 0 else ""
+        code, out = _run(["git", "status", "--porcelain"], root, 30)
+        git_info["dirty"] = len([x for x in out.splitlines() if x.strip()]) if code == 0 else None
+
+    notes = []
+    if not any(c.applicable for c in results):
+        notes.append("这个目录里没有识别出任何可检查的源文件 —— 结论是 UNKNOWN，不是 PASS。")
+    elif not (passed or blocking_fail or unknown_blocking) and results:
+        notes.append("这轮只跑了非阻断检查，没有任何能定性的检查 —— 所以是 UNKNOWN，不是 PASS。")
+    if warned:
+        notes.append("有 " + str(len(warned)) + " 项非阻断检查未通过："
+                     + "、".join(c.id for c in warned) + "（不计入总判定）")
+    if skipped_big:
+        notes.append(f"{skipped_big} 个超过 5MB 的文件未扫描")
+    if ignored:
+        notes.append(f".verifyignore 跳过了 {ignored} 个文件")
+
+    return Report(
+        project=str(root),
+        started=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        seconds=time.time() - t_all,
+        files=len(files),
+        by_ext=dict(sorted(by_ext.items(), key=lambda kv: -kv[1])[:12]),
+        checks=results,
+        verdict=verdict,
+        git=git_info,
+        notes=notes,
+        cache={"hits": ctx.cache.hits, "misses": ctx.cache.misses,
+               "parallel_seconds": round(parallel_seconds, 3),
+               "checks": len(selected)},
+    ).as_dict()
+
+
+def render(report: dict) -> str:
+    if "error" in report:
+        return f"✗ {report['error']}"
+    v = report["verdict"]
+    mark = {"PASS": "✓ PASS", "FAIL": "✗ FAIL", "UNKNOWN": "? UNKNOWN"}.get(v, v)
+    lines = [f"{mark}  {report['project']}"]
+    ext = ", ".join(f"{k} {n}" for k, n in list(report["by_ext"].items())[:8])
+    cch = report.get("cache", {})
+    lines.append(f"  文件 {report['files']} 个（{ext}）· 总耗时 {report['seconds']}s"
+                 f" · {cch.get('checks', '?')} 项检查并行 {cch.get('parallel_seconds', '?')}s"
+                 f" · 语法缓存命中 {cch.get('hits', 0)}")
+    if report.get("git", {}).get("head"):
+        lines.append(f"  HEAD {report['git']['head']} · 未提交 {report['git'].get('dirty')}")
+    lines.append("")
+    for c in report["checks"]:
+        icon = {"PASS": "✓", "FAIL": "✗", "UNKNOWN": "?"}.get(c["state"], "?")
+        if not c["applicable"]:
+            tag = "（不适用）"
+        elif c["blocking"]:
+            tag = f"【{S.RISK_LABEL.get(c.get('risk', 'medium'), '中')}】"
+        else:
+            tag = f"（{S.RISK_LABEL.get(c.get('risk', 'low'), '低')}·不阻断）"
+        lines.append(f"  {icon} {c['title']}{tag} — {c['detail']}  [{c['seconds']:.2f}s]")
+        if c.get("command"):
+            lines.append(f"      命令：{c['command']}"
+                         + (f"（退出码 {c['exit_code']}）" if c["exit_code"] is not None else ""))
+        for f in c["findings"][:6]:
+            loc = f["file"] + (f":{f['line']}" if f.get("line") else "")
+            lines.append(f"      · {loc} {f['message']}")
+        if len(c["findings"]) > 6:
+            lines.append(f"      · …另有 {len(c['findings']) - 6} 条")
+        if c["state"] == "FAIL" and c.get("remediation") and c["applicable"]:
+            lines.append(f"      → 怎么改：{c['remediation']}")
+        if c["state"] == "FAIL" and c.get("output"):
+            last = c["output"].strip().splitlines()
+            if last:
+                lines.append("      输出尾部：" + last[-1][:160])
+    if report.get("notes"):
+        lines.append("")
+        for n in report["notes"]:
+            lines.append(f"  注意：{n}")
+    return "\n".join(lines)
+
+
+def list_checks_text() -> str:
+    lines = [f"{'id':<13}{'风险':<5}{'阻断':<5}判定什么"]
+    lines.append("-" * 78)
+    for s in S.SPECS:
+        lines.append(f"{s.id:<13}{S.RISK_LABEL[s.risk]:<5}{'是' if s.blocking else '否':<5}{s.doc}")
+    return "\n".join(lines)
+
+
+def main_cli(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="verify-helper",
+        description=f"验证助手 v{VERSION} —— 给任意项目目录跑一组机械检查，返回三态结论与证据。")
+    ap.add_argument("project", nargs="?", help="项目目录（--list-checks 时可省略）")
+    ap.add_argument("--checks", default="", help="逗号分隔；省略=默认全部（不含 git）")
+    ap.add_argument("--git", action="store_true", help="把 git 状态也算进总判定")
+    ap.add_argument("--fast", action="store_true", help="跳过测试与运行时")
+    ap.add_argument("--no-cache", action="store_true", help="忽略语法缓存")
+    ap.add_argument("--workers", type=int, default=8, help="并行度，默认 8")
+    ap.add_argument("--json", action="store_true", help="输出完整 JSON 报告")
+    ap.add_argument("--sarif", metavar="FILE", help="写出 SARIF 2.1.0（给 GitHub Code Scanning 用）")
+    ap.add_argument("--list-checks", action="store_true", help="列出全部检查项")
+    a = ap.parse_args(argv)
+
+    if a.list_checks:
+        print(list_checks_text())
+        return 0
+    if not a.project:
+        ap.error("缺少 project 参数（或用 --list-checks）")
+
+    sel = [x.strip() for x in a.checks.split(",") if x.strip()] or None
+    rep = verify(a.project, sel, include_git=a.git, fast=a.fast,
+                 use_cache=not a.no_cache, workers=a.workers)
+
+    if a.sarif:
+        import sarif as sarif_mod
+        Path(a.sarif).write_text(sarif_mod.dumps(rep, VERSION), encoding="utf-8")
+        print(f"SARIF 已写入：{a.sarif}")
+
+    print(json.dumps(rep, ensure_ascii=False, indent=1) if a.json else render(rep))
+    return 0 if rep.get("verdict") == "PASS" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main_cli())
