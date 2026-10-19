@@ -36,13 +36,13 @@ class TestBrowserLayer(unittest.TestCase):
         finally:
             fixture.cleanup(p)
 
-    def test_fast_mode_skips(self):
+    def test_fast_no_longer_skips_browser(self):
+        """v1.4 起 fast 只跳测试/变异 —— 浏览器层是抓真问题的主力，不能被 fast 吞掉。"""
         p = fixture.make_clean()
         try:
             rep = V.verify(str(p), checks=["browser"], fast=True, use_cache=False)
             c = by_id(rep)["browser"]
-            self.assertEqual(c["state"], "UNKNOWN")
-            self.assertFalse(c["applicable"])
+            self.assertNotIn("fast", c["detail"])
         finally:
             fixture.cleanup(p)
 

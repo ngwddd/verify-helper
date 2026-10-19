@@ -63,7 +63,7 @@ TOOLS = [
                 "include_git": {"type": "boolean",
                                 "description": "是否把 git 工作区状态算进总判定，默认 false"},
                 "fast": {"type": "boolean",
-                         "description": "跳过测试与运行时检查，只跑静态项（秒级）"},
+                         "description": "跳过测试与变异检查，保留运行时和浏览器（仍是秒级）"},
                 "no_cache": {"type": "boolean",
                              "description": "忽略语法缓存，全部重新解析"},
                 "workers": {"type": "integer",

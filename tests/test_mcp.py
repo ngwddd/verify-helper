@@ -116,12 +116,16 @@ class TestMcp(unittest.TestCase):
         self.assertEqual(doc["version"], "2.1.0")
         self.assertTrue(doc["runs"][0]["results"])
 
-    def test_fast_skips_runtime(self):
+    def test_fast_skips_tests_but_keeps_runtime(self):
+        """fast 只跳过「慢且不一定有入口」的测试/变异，运行时与浏览器照跑。"""
         res = self.call_tool("verify_start",
                              {"path": str(self.clean), "fast": True, "format": "json"})
         rep = json.loads(res["content"][0]["text"])
-        rt = {c["id"]: c for c in rep["checks"]}["runtime-web"]
-        self.assertFalse(rt["applicable"])
+        by = {c["id"]: c for c in rep["checks"]}
+        self.assertFalse(by["tests"]["applicable"])
+        self.assertIn("fast", by["tests"]["detail"])
+        # runtime-web 在干净项目上应该真跑过（而不是被 fast 跳过）
+        self.assertNotIn("fast", by["runtime-web"]["detail"])
 
     def test_report_roundtrip(self):
         self.call_tool("verify_start", {"path": str(self.clean)})

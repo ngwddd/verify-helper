@@ -31,7 +31,7 @@ python verify_core.py /path/to/project
 # 列出全部检查项
 python verify_core.py --list-checks
 
-# 快速模式：跳过测试与运行时，秒级返回
+# 快速模式：只跳过「测试」与「变异」（运行时和浏览器照跑）
 python verify_core.py /path/to/project --fast
 
 # 输出 SARIF（给 GitHub Code Scanning 用）

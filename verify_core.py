@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """项目验证内核 v1 —— 11 项检查，并行执行，逐文件语法缓存。
 
 设计约束（来自用户的三条回答）：
@@ -39,7 +39,7 @@ from pathlib import Path
 
 import check_specs as S
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # Windows 控制台默认 GBK，印 ✓ / ✗ 会直接 UnicodeEncodeError（本项目踩过多次）。
 for _s in (sys.stdout, sys.stderr):
@@ -78,7 +78,7 @@ SECRET_PATTERNS = [
 CRED_PATTERN = ("疑似明文密码赋值",
                 re.compile(r"(?i)\b(password|passwd|pwd|secret|token)\s*[=:]\s*[\"'][^\"'\s]{8,}[\"']"))
 CODE_EXT = PY_EXT | JS_EXT | {".env", ".ini", ".cfg", ".conf", ".yml", ".yaml", ".json", ".toml"}
-TODO_RE = re.compile(r"\b(TODO|FIXME|XXX|HACK)\b")
+TODO_RE = re.compile(r"\b(TODO|FIXME)\b")
 LOCAL_PATH_PATTERNS = [
     ("Windows 用户绝对路径", re.compile(r"[A-Za-z]:\\Users\\[^\\\s\"']+")),
     ("POSIX home 绝对路径", re.compile(r"/(?:home|Users)/[^/\s\"']+/")),
@@ -103,6 +103,9 @@ class Check:
     exit_code: int | None = None
     output: str = ""
     findings: list = field(default_factory=list)
+    # 不是问题、但值得说一声的观察（例如「站点根绝对路径，本地无法判」）。
+    # 和 findings 分开：findings 只装真问题，PASS 就不该有 findings。
+    hints: list = field(default_factory=list)
     seconds: float = 0.0
 
     def as_dict(self) -> dict:
@@ -494,10 +497,13 @@ def check_links(root: Path, files: list[Path], ctx: "Ctx") -> Check:
                                     "message": f"跨页锚点不存在：{raw}"})
 
     real = dead + anchors
-    c.findings = real + abs_paths
+    # 「站点根绝对路径」不是问题，只是本地没法判 —— 放进 hints。
+    # findings 必须只装真问题：PASS 却带着一堆 findings，会让人以为哪儿坏了。
+    c.findings = real
+    c.hints = abs_paths
     c.state = "FAIL" if real else "PASS"
     c.detail = (f"{len(htmls)} 个页面；死链 {len(dead)}、坏锚点 {len(anchors)}"
-                + (f"、站点根绝对路径 {len(abs_paths)}（未校验）" if abs_paths else ""))
+                + (f"、站点根绝对路径 {len(abs_paths)}（本地无法判，见提示）" if abs_paths else ""))
     c.command = "内置解析（href/src）"
     c.exit_code = 0 if not real else 1
     c.seconds = time.time() - t0
@@ -790,10 +796,6 @@ def _find_playwright(root: Path) -> Path | None:
 def check_browser(root: Path, files: list[Path], ctx: "Ctx") -> Check:
     c = Check("browser", "浏览器运行时：页面跑起来有没有报错")
     t0 = time.time()
-    if ctx.fast:
-        c.state, c.applicable = "UNKNOWN", False
-        c.detail = "fast 模式跳过浏览器"
-        return c
     htmls = [p for p in files if p.suffix.lower() in HTML_EXT]
     if not htmls:
         c.state, c.applicable = "UNKNOWN", False
@@ -804,7 +806,7 @@ def check_browser(root: Path, files: list[Path], ctx: "Ctx") -> Check:
         c.state, c.applicable = "UNKNOWN", False
         c.detail = "没有 index.html，无法确定站点根"
         return c
-    pw_dir = _find_playwright(root)
+    pw_dir = _find_playwright(root) or _find_playwright(site_root)
     if pw_dir is None:
         c.state, c.applicable = "UNKNOWN", False
         c.detail = "没找到 playwright（npm i -D playwright && npx playwright install chromium）"
@@ -1057,7 +1059,32 @@ def _detect_test_command(root: Path) -> tuple[list[str] | None, str, int]:
     if (root / "test").is_dir() and any((root / "test").glob("*.py")):
         return [sys.executable, "-m", "unittest", "discover", "-s", "test"], \
             "test/ 下的 unittest", 300
-    return None, "没有识别到测试入口（scripts.test / pytest / tests/*.py / tests/*.mjs）", 0
+
+    # 散落的测试文件：不靠 scripts.test 也能认出来。
+    # 之前只认 tests/ 目录，结果一个装了 15 个测试文件的项目被判「没有测试入口」。
+    def _has(patterns: list[str], dirs: list[Path]) -> bool:
+        for d in dirs:
+            if not d.is_dir():
+                continue
+            for pat in patterns:
+                try:
+                    if next(d.glob(pat), None) is not None:
+                        return True
+                except OSError:
+                    continue
+        return False
+
+    dirs = [root] + [d for d in root.iterdir() if d.is_dir() and d.name not in SKIP_DIRS][:40]
+    if _has(["*.test.js", "*.test.mjs", "*.test.cjs", "*.spec.js", "*.spec.mjs"], dirs):
+        return ["node", "--test"], "node --test 自动发现 *.test.*", 300
+    if _has(["*.test.ts", "*.spec.ts"], dirs):
+        return ["npx", "vitest", "run"], "vitest（TypeScript 测试）", 420
+    if _has(["test_*.py", "*_test.py"], [root] + ([root / "tests"] if (root / "tests").is_dir() else [])):
+        return [sys.executable, "-m", "unittest", "discover", "-p", "test_*.py"], \
+            "根目录下的 test_*.py", 300
+
+    return None, ("没有识别到测试入口"
+                  "（scripts.test / pytest / tests/*.py / tests/*.mjs / *.test.js / test_*.py）"), 0
 
 
 def check_tests(root: Path, files: list[Path], ctx: "Ctx") -> Check:
@@ -1217,10 +1244,6 @@ def check_runtime_web(root: Path, files: list[Path], ctx: "Ctx") -> Check:
     """
     c = Check("runtime-web", "运行时：静态服务器起来后每页都能 200")
     t0 = time.time()
-    if ctx.fast:
-        c.state, c.applicable = "UNKNOWN", False
-        c.detail = "fast 模式跳过运行时"
-        return c
     htmls = [p for p in files if p.suffix.lower() in HTML_EXT]
     if not htmls:
         c.state, c.applicable = "UNKNOWN", False
@@ -1553,6 +1576,11 @@ def render(report: dict) -> str:
             lines.append(f"      · {loc} {f['message']}")
         if len(c["findings"]) > 6:
             lines.append(f"      · …另有 {len(c['findings']) - 6} 条")
+        for h in (c.get("hints") or [])[:3]:
+            loc = h["file"] + (f":{h['line']}" if h.get("line") else "")
+            lines.append(f"      ~ 提示：{loc} {h['message']}")
+        if len(c.get("hints") or []) > 3:
+            lines.append(f"      ~ …另有 {len(c['hints']) - 3} 条提示")
         if c["state"] == "FAIL" and c.get("remediation") and c["applicable"]:
             lines.append(f"      → 怎么改：{c['remediation']}")
         if c["state"] == "FAIL" and c.get("output"):
@@ -1678,7 +1706,8 @@ def main_cli(argv=None):
     ap.add_argument("project", nargs="?", help="项目目录（--list-checks 时可省略）")
     ap.add_argument("--checks", default="", help="逗号分隔；省略=默认全部（不含 git）")
     ap.add_argument("--git", action="store_true", help="把 git 状态也算进总判定")
-    ap.add_argument("--fast", action="store_true", help="跳过测试与运行时")
+    ap.add_argument("--fast", action="store_true",
+                    help="跳过测试与变异（保留运行时与浏览器：那才是抓真问题的两层）")
     ap.add_argument("--no-cache", action="store_true", help="忽略语法缓存")
     ap.add_argument("--workers", type=int, default=8, help="并行度，默认 8")
     ap.add_argument("--json", action="store_true", help="输出完整 JSON 报告")
