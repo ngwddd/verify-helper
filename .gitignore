@@ -15,3 +15,6 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+
+# 本地基线
+.verify-baseline.json

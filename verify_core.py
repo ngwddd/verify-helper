@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """项目验证内核 v1 —— 11 项检查，并行执行，逐文件语法缓存。
 
 设计约束（来自用户的三条回答）：
@@ -39,7 +39,7 @@ from pathlib import Path
 
 import check_specs as S
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # Windows 控制台默认 GBK，印 ✓ / ✗ 会直接 UnicodeEncodeError（本项目踩过多次）。
 for _s in (sys.stdout, sys.stderr):
@@ -901,6 +901,124 @@ def check_browser(root: Path, files: list[Path], ctx: "Ctx") -> Check:
     return c
 
 
+# ──────────────────────────────────────────────────────────────────────
+# 13. 变异门（opt-in）
+#
+# 覆盖率只说明「执行到了」，变异测试说明「断言有效」。
+# 全量变异太慢，所以：只打 git diff 的行，最多 max_mutants 个。
+# 默认不跑（不在 ORDER 里），需要 --checks mutation 显式打开。
+# ──────────────────────────────────────────────────────────────────────
+MUTATIONS_PY = [
+    (" == ", " != "), (" != ", " == "),
+    (" >= ", " > "), (" <= ", " < "),
+    (" > ", " >= "), (" < ", " <= "),
+    (" + ", " - "), (" and ", " or "),
+    ("True", "False"), ("False", "True"),
+]
+
+
+def _changed_lines(root: Path) -> dict[str, set[int]]:
+    """git diff 里改动的行（按文件）。不在 git 里就返回空。"""
+    if not (root / ".git").exists():
+        return {}
+    code, out = _run(["git", "diff", "--unified=0", "HEAD"], root, 60)
+    if code != 0:
+        return {}
+    changed: dict[str, set[int]] = {}
+    cur = None
+    for ln in out.splitlines():
+        if ln.startswith("+++ b/"):
+            cur = ln[6:].strip()
+            changed.setdefault(cur, set())
+        elif ln.startswith("@@") and cur:
+            m = re.search(r"\+(\d+)(?:,(\d+))?", ln)
+            if m:
+                start = int(m.group(1))
+                count = int(m.group(2) or 1)
+                changed[cur].update(range(start, start + count))
+    return changed
+
+
+def check_mutation(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+    c = Check("mutation", "变异门：测试能不能发现改坏的行")
+    t0 = time.time()
+    if ctx.fast:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "fast 模式跳过变异"
+        return c
+    cmd, why, _ = _detect_test_command(root)
+    if cmd is None:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "没有测试入口，变异门无从判定"
+        return c
+
+    pys = [p for p in files if p.suffix.lower() in PY_EXT]
+    if not pys:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "没有 .py 文件，变异门目前只支持 Python"
+        return c
+
+    changed = _changed_lines(root)
+    candidates: list[tuple[Path, int, str, str]] = []
+    for p in pys:
+        rel = _rel(root, p)
+        t = _read(p) or ""
+        lines = t.splitlines()
+        want = changed.get(rel)
+        for i, line in enumerate(lines, 1):
+            if want is not None and i not in want:
+                continue
+            if line.lstrip().startswith("#") or "def " in line or "import " in line:
+                continue
+            for src_tok, dst_tok in MUTATIONS_PY:
+                if src_tok in line:
+                    candidates.append((p, i, src_tok, dst_tok))
+                    break
+    if not candidates:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "在改动行里没找到可变异的位置"
+        return c
+
+    budget = ctx.mutation_max
+    survivors, killed, errors = [], 0, []
+    for p, lineno, src_tok, dst_tok in candidates[:budget]:
+        original = p.read_text(encoding="utf-8", errors="replace")
+        lines = original.splitlines(keepends=True)
+        if lineno - 1 >= len(lines):
+            continue
+        mutated_line = lines[lineno - 1].replace(src_tok, dst_tok, 1)
+        if mutated_line == lines[lineno - 1]:
+            continue
+        lines[lineno - 1] = mutated_line
+        try:
+            p.write_text("".join(lines), encoding="utf-8")
+            code, out = _run(cmd, root, ctx.mutation_timeout)
+        finally:
+            p.write_text(original, encoding="utf-8")     # 一定要还原
+        if code == 0:
+            survivors.append({
+                "file": _rel(root, p), "line": lineno,
+                "message": f"把 {src_tok.strip()} 改成 {dst_tok.strip()} 后测试仍然通过 —— 这行没有有效断言",
+                "severity": "medium",
+            })
+        elif code in (124, 127):
+            errors.append(f"{_rel(root, p)}:{lineno} 运行时出错（{code}）")
+        else:
+            killed += 1
+
+    c.findings = survivors
+    total = killed + len(survivors)
+    if errors:
+        c.detail = f"试了 {total} 个变异，存活 {len(survivors)}（另有 {len(errors)} 个跑不起来）"
+    else:
+        c.detail = f"试了 {total} 个变异，被杀 {killed}，存活 {len(survivors)}"
+    c.state = "FAIL" if survivors else ("PASS" if total else "UNKNOWN")
+    c.command = " ".join(cmd) + "（逐个变异重跑）"
+    c.exit_code = 0 if not survivors else 1
+    c.seconds = time.time() - t0
+    return c
+
+
 def check_todos(root: Path, files: list[Path], ctx: "Ctx") -> Check:
     return _mk("todos", "TODO / FIXME 数量（只报告）", ctx, root, files, "todos",
                "正则 TODO|FIXME|XXX|HACK",
@@ -1270,6 +1388,8 @@ class Ctx:
     fast: bool = False
     test_timeout: int = 300
     browser_timeout: int = 180
+    mutation_max: int = 5
+    mutation_timeout: int = 90
     bundle: dict | None = None       # 一次扫描的结果，五个检查共用
     bundle_lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -1284,6 +1404,7 @@ CHECKS: dict[str, object] = {
     "tests": check_tests,
     "runtime-web": check_runtime_web,
     "browser": check_browser,
+    "mutation": check_mutation,
     "a11y": check_a11y,
     "bom": check_bom,
     "paths": check_paths,
@@ -1315,7 +1436,7 @@ def verify(project: str, checks: list[str] | None = None,
         selected = [c for c in checks if c in CHECKS]
         unknown = [c for c in checks if c not in CHECKS]
     else:
-        selected = [k for k in ORDER if k != "git" or include_git]
+        selected = [k for k in ORDER if k not in S.OPT_IN or k == "git" and include_git]
         unknown = []
     if include_git and "git" not in selected:
         selected.append("git")
@@ -1442,11 +1563,93 @@ def render(report: dict) -> str:
         lines.append("")
         for n in report["notes"]:
             lines.append(f"  注意：{n}")
+    if report.get("baseline"):
+        lines.append("")
+        lines.extend(render_baseline(report["baseline"]))
+    if report.get("baseline_error"):
+        lines.append("")
+        lines.append(f"  基线：{report['baseline_error']}")
     return "\n".join(lines)
 
 
+# ──────────────────────────────────────────────────────────────────────
+# 基线：上次全绿是什么样，这次多了什么
+#
+# 只做「差异」，不做「通过/不通过」—— 判定已经有三态了。
+# 指纹用 文件 + 消息 的哈希，行号会漂移，消息不会。
+# ──────────────────────────────────────────────────────────────────────
+BASELINE_NAME = ".verify-baseline.json"
+
+
+def _fingerprint(f: dict) -> str:
+    raw = f"{f.get('file', '')}|{f.get('message', '')[:120]}"
+    import hashlib
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def baseline_snapshot(report: dict) -> dict:
+    return {
+        "version": VERSION,
+        "saved": report.get("started", ""),
+        "verdict": report.get("verdict"),
+        "checks": {
+            c["id"]: {
+                "state": c["state"],
+                "findings": [_fingerprint(f) for f in c.get("findings", [])],
+            }
+            for c in report.get("checks", [])
+        },
+    }
+
+
+def baseline_compare(report: dict, snap: dict) -> dict:
+    """返回新增了哪些问题、修好了哪些、哪些检查恶化了。"""
+    old = snap.get("checks", {})
+    new_items, fixed_items, regressed, improved = [], [], [], []
+    for c in report.get("checks", []):
+        cid = c["id"]
+        now = {_fingerprint(f): f for f in c.get("findings", [])}
+        before = set(old.get(cid, {}).get("findings", []))
+        before_state = old.get(cid, {}).get("state")
+        for fp, f in now.items():
+            if fp not in before:
+                new_items.append({"check": cid, "file": f.get("file"),
+                                  "line": f.get("line"), "message": f.get("message", "")[:120]})
+        gone = before - set(now)
+        if gone:
+            fixed_items.append({"check": cid, "count": len(gone)})
+        if before_state == "PASS" and c["state"] == "FAIL":
+            regressed.append(cid)
+        if before_state == "FAIL" and c["state"] == "PASS":
+            improved.append(cid)
+    return {"new": new_items, "fixed": fixed_items,
+            "regressed": regressed, "improved": improved,
+            "saved_at": snap.get("saved"), "saved_verdict": snap.get("verdict")}
+
+
+def render_baseline(b: dict) -> list[str]:
+    lines = []
+    if b["new"]:
+        lines.append(f"  与基线相比：新增 {len(b['new'])} 条问题")
+        for x in b["new"][:8]:
+            loc = (x["file"] or "") + (f":{x['line']}" if x.get("line") else "")
+            lines.append(f"    + [{x['check']}] {loc} {x['message']}")
+        if len(b["new"]) > 8:
+            lines.append(f"    + …另有 {len(b['new']) - 8} 条")
+    if b["fixed"]:
+        total = sum(x["count"] for x in b["fixed"])
+        lines.append(f"  与基线相比：修好 {total} 条"
+                     + "（" + "、".join(x["check"] for x in b["fixed"]) + "）")
+    if b["regressed"]:
+        lines.append(f"  恶化的检查：{'、'.join(b['regressed'])}")
+    if b["improved"]:
+        lines.append(f"  转好的检查：{'、'.join(b['improved'])}")
+    if not (b["new"] or b["fixed"] or b["regressed"]):
+        lines.append("  与基线相比：没有变化")
+    return lines
+
+
 def worst_risk(report: dict) -> str | None:
-    """报告里最严重的那条问题的等级；没有问题返回 None。"""
     worst = None
     for c in report.get("checks", []):
         if c.get("state") != "FAIL" or not c.get("applicable", True):
@@ -1484,6 +1687,9 @@ def main_cli(argv=None):
                     choices=["critical", "high", "medium", "low"],
                     help="退出码阈值：该等级及以上的问题会让退出码为 1（默认 high）")
     ap.add_argument("--list-checks", action="store_true", help="列出全部检查项")
+    ap.add_argument("--baseline", default="off", choices=["off", "save", "check"],
+                    help="基线：save 存一份，check 与上次比对")
+    ap.add_argument("--baseline-file", default="", help="基线文件路径（默认项目根 .verify-baseline.json）")
     a = ap.parse_args(argv)
 
     if a.list_checks:
@@ -1495,6 +1701,22 @@ def main_cli(argv=None):
     sel = [x.strip() for x in a.checks.split(",") if x.strip()] or None
     rep = verify(a.project, sel, include_git=a.git, fast=a.fast,
                  use_cache=not a.no_cache, workers=a.workers)
+
+    if a.baseline != "off" and "error" not in rep:
+        bpath = Path(a.baseline_file) if a.baseline_file else Path(rep["project"]) / BASELINE_NAME
+        try:
+            if a.baseline == "save":
+                bpath.write_text(json.dumps(baseline_snapshot(rep), ensure_ascii=False, indent=1),
+                                 encoding="utf-8")
+                rep["baseline_saved"] = str(bpath)
+            else:
+                if bpath.exists():
+                    snap = json.loads(bpath.read_text(encoding="utf-8"))
+                    rep["baseline"] = baseline_compare(rep, snap)
+                else:
+                    rep["baseline_error"] = f"基线文件不存在：{bpath}（先跑一次 --baseline save）"
+        except Exception as e:
+            rep["baseline_error"] = f"{type(e).__name__}: {e}"
 
     if a.sarif:
         import sarif as sarif_mod

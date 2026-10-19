@@ -116,6 +116,12 @@ SPECS: tuple[CheckSpec, ...] = (
         "按规则里写的 message 修改。",
     ),
     CheckSpec(
+        "mutation", "变异门", "medium", "运行时",
+        "把改动行里的运算符/布尔值改坏，重跑测试：测试还能通过，说明这行没有有效断言（opt-in，默认不跑）。",
+        "给这些行补上真正会失败的断言，或删掉死代码。",
+        ("PIT mutation testing",),
+    ),
+    CheckSpec(
         "git", "工作区状态", "low", "卫生",
         "工作区是否有未提交改动（默认不参与总判定）。",
         "确认这些改动是有意保留的，或提交/ stash 掉。",
@@ -123,6 +129,10 @@ SPECS: tuple[CheckSpec, ...] = (
 )
 
 BY_ID = {s.id: s for s in SPECS}
+
+# 默认不跑的检查：太慢（变异门）或必须显式要（git 状态）。
+# 需要时用 --checks mutation,git 显式打开。
+OPT_IN = {"mutation", "git"}
 
 
 def get(check_id: str) -> CheckSpec:
