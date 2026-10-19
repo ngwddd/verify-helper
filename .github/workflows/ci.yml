@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (py${{ matrix.python }} · ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+        exclude:
+          # 3.14 在 ubuntu 上偶发没有预编译产物，先用 Windows 覆盖
+          - os: ubuntu-latest
+            python: "3.14"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: 版本与依赖检查
+        run: |
+          python -V
+          python -c "import tomllib, json, ast; print('stdlib ok')"
+
+      - name: 单元测试
+        run: python -m unittest discover -s tests -v
+
+      - name: CLI 冒烟
+        run: |
+          python verify_core.py --list-checks
+          python verify_core.py . --fast --no-cache
+
+      - name: 自检（应通过）
+        run: python verify_core.py . --fast
+
+  sarif:
+    name: 生成 SARIF 并上传 Code Scanning
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 自检可能因低风险项报 FAIL，这里允许失败，只要求 SARIF 能生成
+      - name: 生成 SARIF
+        run: python verify_core.py . --sarif verify.sarif || true
+
+      - name: 上传
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: verify.sarif
+          category: verify-helper
