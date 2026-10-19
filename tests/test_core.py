@@ -98,6 +98,11 @@ class TestVerdicts(unittest.TestCase):
         self.assertEqual(b["secrets"]["risk"], "critical")
         self.assertEqual(b["a11y"]["risk"], "low")
 
+    def test_render_shows_version(self):
+        """报告首行必须带版本号 —— 外部报告曾把 1.6.1 的输出标成 1.6.0。"""
+        text = V.render(self.rep_clean)
+        self.assertIn(f"v{V.VERSION}", text.splitlines()[0])
+
     def test_nonblocking_failure_renders_as_warning(self):
         """低风险项不通过时用 ⚠ 而不是 ✗ —— 它不影响判定，不该长得像失败。"""
         import tempfile

@@ -39,7 +39,7 @@ from pathlib import Path
 
 import check_specs as S
 
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 
 # Windows 控制台默认 GBK，印 ✓ / ✗ 会直接 UnicodeEncodeError（本项目踩过多次）。
 for _s in (sys.stdout, sys.stderr):
@@ -161,6 +161,7 @@ class Report:
     def as_dict(self) -> dict:
         return {
             "project": self.project,
+            "version": VERSION,
             "started": self.started,
             "seconds": round(self.seconds, 3),
             "files": self.files,
@@ -558,7 +559,7 @@ def check_links(root: Path, files: list[Path], ctx: "Ctx") -> Check:
                 continue
             if raw.startswith("/"):
                 abs_paths.append({"file": _rel(root, p), "line": line,
-                                  "message": f"站点根绝对路径，离线未校验：{raw}"})
+                                  "message": f"站点根绝对路径，本地无法判定：{raw}"})
                 continue
             path = raw.split("#")[0].split("?")[0]
             if not path:
@@ -1676,7 +1677,7 @@ def render(report: dict) -> str:
         return f"✗ {report['error']}"
     v = report["verdict"]
     mark = {"PASS": "✓ PASS", "FAIL": "✗ FAIL", "UNKNOWN": "? UNKNOWN"}.get(v, v)
-    lines = [f"{mark}  {report['project']}"]
+    lines = [f"{mark}  {report['project']}   ·  v{report.get('version') or VERSION}"]
     ext = ", ".join(f"{k} {n}" for k, n in list(report["by_ext"].items())[:8])
     cch = report.get("cache", {})
     lines.append(f"  文件 {report['files']} 个（{ext}）· 总耗时 {report['seconds']}s"
