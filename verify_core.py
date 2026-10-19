@@ -39,7 +39,7 @@ from pathlib import Path
 
 import check_specs as S
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 # Windows 控制台默认 GBK，印 ✓ / ✗ 会直接 UnicodeEncodeError（本项目踩过多次）。
 for _s in (sys.stdout, sys.stderr):
@@ -1648,8 +1648,8 @@ def verify(project: str, checks: list[str] | None = None,
                 "根目录没有测试入口，但子项目里有：" + "、".join(with_tests[:5])
                 + "。要对它们跑测试，请把 path 指到那个子项目。")
     if warned:
-        notes.append("有 " + str(len(warned)) + " 项非阻断检查未通过："
-                     + "、".join(c.id for c in warned) + "（不计入总判定）")
+        notes.append("有 " + str(len(warned)) + " 项提示（不影响判定）："
+                     + "、".join(c.id for c in warned))
     if skipped_big:
         notes.append(f"{skipped_big} 个超过 5MB 的文件未扫描")
     if ignored:
@@ -1686,13 +1686,18 @@ def render(report: dict) -> str:
         lines.append(f"  HEAD {report['git']['head']} · 未提交 {report['git'].get('dirty')}")
     lines.append("")
     for c in report["checks"]:
-        icon = {"PASS": "✓", "FAIL": "✗", "UNKNOWN": "?"}.get(c["state"], "?")
+        # 不阻断的问题用 ⚠ 而不是 ✗：它不是失败，不该长得像失败。
+        # 之前一律打 ✗，报告里就变成「又挂了 2 项」，其实判定是 PASS。
+        if c["state"] == "FAIL" and c["applicable"] and not c["blocking"]:
+            icon = "⚠"
+        else:
+            icon = {"PASS": "✓", "FAIL": "✗", "UNKNOWN": "?"}.get(c["state"], "?")
         if not c["applicable"]:
             tag = "（不适用）"
         elif c["blocking"]:
             tag = f"【{S.RISK_LABEL.get(c.get('risk', 'medium'), '中')}】"
         else:
-            tag = f"（{S.RISK_LABEL.get(c.get('risk', 'low'), '低')}·不阻断）"
+            tag = f"（{S.RISK_LABEL.get(c.get('risk', 'low'), '低')}·仅提示）"
         lines.append(f"  {icon} {c['title']}{tag} — {c['detail']}  [{c['seconds']:.2f}s]")
         if c.get("command"):
             lines.append(f"      命令：{c['command']}"

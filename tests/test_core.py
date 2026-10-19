@@ -98,6 +98,19 @@ class TestVerdicts(unittest.TestCase):
         self.assertEqual(b["secrets"]["risk"], "critical")
         self.assertEqual(b["a11y"]["risk"], "low")
 
+    def test_nonblocking_failure_renders_as_warning(self):
+        """低风险项不通过时用 ⚠ 而不是 ✗ —— 它不影响判定，不该长得像失败。"""
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="vh-warn-"))
+        try:
+            (d / "a.py").write_text(f'X = r"C:\\Users\\{Path.home().name}\\x"\n', encoding="utf-8")
+            text = V.render(V.verify(str(d), checks=["paths"], use_cache=False))
+            self.assertIn("⚠", text)
+            self.assertIn("仅提示", text)
+            self.assertNotIn("✗ 本机绝对路径", text)
+        finally:
+            fixture.cleanup(d)
+
 
 class TestIgnoreAndRules(unittest.TestCase):
     def test_verifyignore_excludes_template(self):
