@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "验证助手",
+    "description": "输入框工具栏一键填入验证请求：跑 verify-helper 的三态检查，按风险等级报告 PASS / FAIL / UNKNOWN。"
+  }
+}

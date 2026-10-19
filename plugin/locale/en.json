@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Verify Helper",
+    "description": "One-click verification request in the composer toolbar: runs the verify-helper checks and reports PASS / FAIL / UNKNOWN with risk levels."
+  }
+}
