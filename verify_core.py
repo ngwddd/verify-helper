@@ -703,7 +703,9 @@ def scan_text_once(root: Path, files: list[Path]) -> dict:
                                       "message": f"{label}：{m.group(0)[:60]}"})
                     break
             if TODO_RE.search(line):
-                todo_hits.append({"file": rel, "line": i, "message": line.strip()[:100]})
+                # 只在代码里数 TODO：文档里提到「TODO 这个词」不该算一处待办
+                if ext in CODE_EXT or ext in HTML_EXT or ext == ".css":
+                    todo_hits.append({"file": rel, "line": i, "message": line.strip()[:100]})
     return {"files": n_files, "secrets": secrets_hits, "paths": path_hits,
             "todos": todo_hits, "encoding": enc_bad, "bom": bom_hits}
 
@@ -858,7 +860,7 @@ def check_imports(root: Path, files: list[Path], ctx: "Ctx") -> Check:
         if not src:
             continue
         try:
-            tree = ast.parse(src)
+            tree = ast.parse(_strip_bom(src))
         except SyntaxError:
             continue                          # 语法错由 syntax 检查负责
         body = src
@@ -868,6 +870,10 @@ def check_imports(root: Path, files: list[Path], ctx: "Ctx") -> Check:
                 for a in node.names:
                     names.append((a.asname or a.name.split(".")[0], node.lineno, a.name))
             elif isinstance(node, ast.ImportFrom):
+                # `from __future__ import annotations` 是编译器指令，不是名字绑定，
+                # 永远「用不到」——不能算未使用 import。
+                if (node.module or "") == "__future__":
+                    continue
                 for a in node.names:
                     if a.name == "*":
                         continue
