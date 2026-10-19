@@ -39,7 +39,7 @@ from pathlib import Path
 
 import check_specs as S
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 
 # Windows 控制台默认 GBK，印 ✓ / ✗ 会直接 UnicodeEncodeError（本项目踩过多次）。
 for _s in (sys.stdout, sys.stderr):

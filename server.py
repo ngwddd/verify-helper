@@ -25,7 +25,17 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 SERVER_NAME = "verify-helper"
-SERVER_VERSION = verify_core.VERSION
+
+
+def _version() -> str:
+    """每次都读当前值。
+
+    之前把它在 import 时存成常量：热加载内核后 serverInfo 还停在启动时的版本号，
+    客户端看到的版本和实际跑的代码对不上（实测报 1.3.0 而实际已是 1.4）。
+    """
+    return verify_core.VERSION
+
+
 PROTOCOL = "2024-11-05"
 
 LAST: dict[str, dict] = {}      # run_id -> report
@@ -227,7 +237,7 @@ def handle(msg: dict):
         result(msg_id, {
             "protocolVersion": PROTOCOL,
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            "serverInfo": {"name": SERVER_NAME, "version": _version()},
         })
         return
 
@@ -267,7 +277,7 @@ def handle(msg: dict):
 
 
 def main():
-    log(f"{SERVER_NAME} v{SERVER_VERSION} 已启动（stdio）")
+    log(f"{SERVER_NAME} v{_version()} 已启动（stdio）")
     for line in sys.stdin:
         line = line.strip()
         if not line:
