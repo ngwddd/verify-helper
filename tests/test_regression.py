@@ -337,6 +337,26 @@ class TestIdempotent(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_todo_counts_only_comments(self):
+        """字符串里的待办标记不算一处待办，注释里的才算。
+
+        自检时发现的：工具把自己的 UI 标签（`"TODO 统计"`）当成待办数了进去。
+        业界惯例（flake8-todo 等）也只认注释。
+        """
+        d = Path(tempfile.mkdtemp(prefix="vh-todo-"))
+        try:
+            (d / "a.py").write_text(
+                'LABEL = "TODO 统计"\n'          # 字符串：不算
+                'x = 1  # TODO 真的待办\n'        # 注释：算
+                'y = 2\n', encoding="utf-8")
+            rep = V.verify(str(d), checks=["todos"], use_cache=False)
+            c = {x["id"]: x for x in rep["checks"]}["todos"]
+            self.assertEqual(c["state"], "FAIL")
+            self.assertEqual(len(c["findings"]), 1, c["findings"])
+            self.assertIn("真的待办", c["findings"][0]["message"])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -40,7 +40,7 @@ from pathlib import Path
 import check_specs as S
 import directions as DIR
 
-VERSION = "1.8.3"
+VERSION = "1.8.4"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -105,6 +105,45 @@ CRED_PATTERN = ("疑似明文密码赋值",
                 re.compile(r"(?i)\b(password|passwd|pwd|secret|token)\s*[=:]\s*[\"'][^\"'\s]{8,}[\"']"))
 CODE_EXT = PY_EXT | JS_EXT | {".env", ".ini", ".cfg", ".conf", ".yml", ".yaml", ".json", ".toml"}
 TODO_RE = re.compile(r"\b(TODO|FIXME)\b")
+
+
+def _comment_marker_pos(line: str, ext: str) -> int:
+    """返回这一行「注释」开始的下标；没有注释返回 -1。
+
+    必须跳过引号里的内容 —— 否则 `x = 'a # TODO b'` 会被当成注释里的待办，
+    而它其实只是一个字符串（自检时踩到过）。
+    """
+    if ext in HTML_EXT:
+        markers = ("<!--",)
+    elif ext in JS_EXT:
+        markers = ("//", "/*")
+    elif ext == ".css":
+        markers = ("/*",)
+    else:
+        markers = ("#",)
+
+    quote = ""
+    i, n = 0, len(line)
+    while i < n:
+        ch = line[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            i += 1
+            continue
+        for m in markers:
+            if line.startswith(m, i):
+                return i
+        i += 1
+    return -1
+
 LOCAL_PATH_PATTERNS = [
     ("Windows 用户绝对路径", re.compile(r"[A-Za-z]:\\Users\\[^\\\s\"']+")),
     ("POSIX home 绝对路径", re.compile(r"/(?:home|Users)/[^/\s\"']+/")),
@@ -746,6 +785,7 @@ BIG_SKIP = 2 * 1024 * 1024      # 超过 2MB 的文件只验编码，不做逐�
 
 def scan_text_once(root: Path, files: list[Path]) -> dict:
     secrets_hits, path_hits, todo_hits = [], [], []
+    todo_in_string = 0          # 出现在字符串里的待办标记：是标签不是待办，只用于说明
     path_other: list[dict] = []
     enc_bad, bom_hits = [], []
     n_files = 0
@@ -822,11 +862,19 @@ def scan_text_once(root: Path, files: list[Path]) -> dict:
                         path_other.append(item)
                     break
             if TODO_RE.search(line):
-                # 只在代码里数 TODO：文档里提到「TODO 这个词」不该算一处待办
+                # 只在**代码文件**里数，且只数**注释里的**待办标记：
+                #   · 文档里提到这个词不该算一处待办
+                #   · UI 字符串里的「待办统计」也是标签，不是待办
+                # 业界（flake8-todo 等）同样只认注释。
                 if ext in CODE_EXT or ext in HTML_EXT or ext == ".css":
-                    todo_hits.append({"file": rel, "line": i, "message": line.strip()[:100]})
+                    m = TODO_RE.search(line)
+                    cpos = _comment_marker_pos(line, ext)
+                    if cpos != -1 and cpos < m.start():
+                        todo_hits.append({"file": rel, "line": i, "message": line.strip()[:100]})
+                    else:
+                        todo_in_string += 1
     return {"files": n_files, "secrets": secrets_hits, "paths": path_hits,
-            "paths_other": path_other,
+            "paths_other": path_other, "todo_in_string": todo_in_string,
             "todos": todo_hits, "encoding": enc_bad, "bom": bom_hits}
 
 

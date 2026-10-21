@@ -16,5 +16,5 @@ venv/
 .idea/
 .DS_Store
 
-# 本地基线
+# 鍩虹嚎锛堟瘡鍙版満鍣ㄤ笉鍚岋級
 .verify-baseline.json

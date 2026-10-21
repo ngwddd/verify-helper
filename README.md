@@ -446,9 +446,29 @@ python verify_core.py . --sarif verify.sarif
 ## 开发
 
 ```bash
-python -m unittest discover -s tests -v     # 34 个测试，全部用临时目录造的 fixture
+python -m unittest discover -s tests -v     # 102 个单元测试
+python conformance.py                       # 48 项符合性测试（喂整个项目进去）
 python verify_core.py . --fast              # 自己检查自己
 ```
+
+两套测试分工不同：
+
+| | 单元测试（`tests/`） | 符合性测试（`conformance.py`） |
+|---|---|---|
+| 测什么 | 函数与规则的边界 | **喂一整个项目进去，结论对不对** |
+| 怎么造 | 临时目录里的最小 fixture | 自己生成 32 个小项目 |
+| 覆盖 | 解析、判定、渲染、MCP 协议 | 真阳性 / 假阳性抵抗 / 三态 / 刁难用例 / 输出契约 |
+| 退出码 | unittest 的 | 非 0 = 有回归 |
+
+`conformance.py` 的用例分六类：
+
+1. **干净项目不能被冤枉** —— 最简包、空目录、只有 README
+2. **每个检查抓到该抓的** —— 坏语法、死链、未闭合、假密钥、GBK、BOM、a11y、未用 import
+3. **假阳性抵抗** —— 占位符路径、别人的路径、单引号 `href`、`.verifyignore`、`build/`
+4. **三态规则** —— 只跑非阻断项 / 没源文件 / 拼错检查名，都必须是 UNKNOWN
+5. **刁难它** —— 外链、`mailto:`、`#锚点`、坏 TOML、CRLF、0 字节文件、
+   中文加空格文件名、非法 UTF-8、嵌套 ignore、3MB 大文件
+6. **输出契约** —— SARIF、`--json`、`--sarif`、幂等、方向卡四段、退出码语义（含 fail-closed）
 
 测试不依赖任何本机真实项目：所有 fixture 在临时目录里现造、跑完即删。
 
