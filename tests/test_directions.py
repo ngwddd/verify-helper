@@ -66,6 +66,28 @@ class TestCardShape(unittest.TestCase):
         self.assertIsNotNone(card)
         self.assertIn("第 3 步", card["root_cause"])
 
+    def test_blocking_check_says_pass(self):
+        card = DIR.build("links", {"file": "a.html", "line": 5, "message": "死链：x"},
+                         blocking=True)
+        self.assertIn("应 PASS", card["verify"])
+        self.assertTrue(card["blocking"])
+
+    def test_nonblocking_check_never_says_pass(self):
+        """非阻断项单独跑只会得到 UNKNOWN，写「应 PASS」是不可能达成的判据。
+
+        外部实测报告抓到的 bug（v1.8.1）：paths 的验证提示永远失败。
+        """
+        for cid, f in (("paths", {"file": "a.py", "line": 4, "message": "C:\\Users\\x"}),
+                       ("a11y", {"file": "a.html", "line": 6, "message": "<img> 缺 alt"}),
+                       ("bom", {"file": "a.css", "line": 0, "message": "开头有 BOM"}),
+                       ("imports", {"file": "a.py", "line": 7, "message": "未使用：json"})):
+            with self.subTest(check=cid):
+                card = DIR.build(cid, f, blocking=False)
+                self.assertIsNotNone(card)
+                self.assertNotIn("应 PASS", card["verify"])
+                self.assertIn("0 处", card["verify"])
+                self.assertFalse(card["blocking"])
+
 
 class TestGate(unittest.TestCase):
     def test_no_file_no_card(self):

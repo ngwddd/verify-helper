@@ -40,7 +40,7 @@ from pathlib import Path
 import check_specs as S
 import directions as DIR
 
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -1779,7 +1779,7 @@ def verify(project: str, checks: list[str] | None = None,
         for f in c.findings:
             if directed >= DIR.MAX_CARDS:      # 病态情况下别把响应撑爆
                 break
-            card = DIR.build(c.id, f)
+            card = DIR.build(c.id, f, blocking=c.blocking)
             if card:
                 f["direction"] = card
                 directed += 1

@@ -51,6 +51,20 @@ def _where(f: dict) -> str:
     return file
 
 
+def _verify_text(check_id: str, blocking: bool) -> str:
+    """验证方式。**必须区分阻断项与非阻断项**。
+
+    非阻断项单独跑时，没有任何能定性的检查 —— 按设计结论必然是 UNKNOWN，
+    永远不可能 PASS。所以对它们写「应 PASS」是错的（v1.8.1 的 bug，
+    由外部实测报告抓出来）：判据只能是「这一项不再列出任何条目」。
+    """
+    if blocking:
+        return (f'verify_start(checks=["{check_id}"]) 应 PASS'
+                f'（命令行 --checks {check_id}）')
+    return (f'verify_start(checks=["{check_id}"]) 应 0 处提示'
+            f'（只报告不参与判定；命令行 --checks {check_id}）')
+
+
 def _card(f: dict, cls, cause, action, must_not, check_id, scale="low", cite=True):
     """造一张方向卡。
 
@@ -65,10 +79,7 @@ def _card(f: dict, cls, cause, action, must_not, check_id, scale="low", cite=Tru
         "root_cause": _clip(head + cause, 160),
         "action": action,
         "must_not_touch": list(must_not),
-        # 两种调用方式都写上：读这份报告的主体通常是 agent（走 MCP），
-        # 只写命令行会让它去跑一个它根本没有的工具；只写 MCP 又顾不上命令行用户。
-        "verify": (f'verify_start(checks=["{check_id}"]) 应 PASS'
-                   f'（命令行 --checks {check_id}）'),
+        "verify": "",          # 由 build() 按 blocking 填，避免这里猜
         "scale": scale,
     }
 
@@ -171,7 +182,7 @@ def _b_paths(f):
         f"{_clip(f.get('message'))} —— 要不要改取决于会不会发布它",
         "如果这个文件会进仓库或发布：换成相对路径或环境变量；"
         "如果只是本机脚本：可以不改，但要知道它会泄漏用户名和目录结构",
-        ["同一项目里其他只在本机跑的文件"],
+        ["先确认发布范围：整个项目都要发布的话，这几处得一起改（半改半不改更乱）"],
         "paths",
     )
 
@@ -357,8 +368,12 @@ def _gate(card: dict, finding: dict) -> bool:
     return True
 
 
-def build(check_id: str, finding: dict) -> dict | None:
-    """给一条失败项生成方向卡；不该生成时返回 None。"""
+def build(check_id: str, finding: dict, blocking: bool = True) -> dict | None:
+    """给一条失败项生成方向卡；不该生成时返回 None。
+
+    blocking 决定「验证」那句怎么写：非阻断项单独跑只会得到 UNKNOWN，
+    写「应 PASS」是不可能达成的判据。
+    """
     if check_id in NO_DIRECTION:
         return None
     fn = _BUILDERS.get(check_id)
@@ -370,4 +385,8 @@ def build(check_id: str, finding: dict) -> dict | None:
     except Exception:
         # 填卡失败绝不能影响验证本身
         return None
+    if card is None:
+        return None
+    card["blocking"] = bool(blocking)
+    card["verify"] = _verify_text(check_id, bool(blocking))
     return card if _gate(card, finding) else None

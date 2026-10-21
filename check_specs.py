@@ -70,7 +70,9 @@ SPECS: tuple[CheckSpec, ...] = (
     CheckSpec(
         "tests", "测试", "high", "运行时",
         "项目自带的测试套件必须真的跑起来并通过（以退出码为准）。",
-        "先修失败的用例；没有测试入口的话，至少补一个冒烟测试。",
+        "先修失败的用例。判定「有没有测试入口」的顺序：package.json 的 scripts.test → "
+        "pytest 配置或用例 → tests/ 或 test/ 目录 → 根目录 test_*.py。都没有就记 UNKNOWN；"
+        "补一个冒烟测试，比假装验过强。",
     ),
     CheckSpec(
         "runtime-web", "运行时（HTTP）", "high", "运行时",
