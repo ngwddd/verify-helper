@@ -84,6 +84,12 @@ SPECS: tuple[CheckSpec, ...] = (
         ("Playwright",),
     ),
     CheckSpec(
+        "interaction", "交互测试", "high", "运行时",
+        "按 verify.toml 的 [[flows]] 真的去点、填、选，再断言结果；未捕获异常一律算失败（需要 playwright）。",
+        "修失败的那一步：选择器写错就改选择器，点了没反应就查脚本。",
+        ("Playwright",),
+    ),
+    CheckSpec(
         "a11y", "HTML 规范性", "low", "结构",
         "img 有 alt、单页一个 h1、有 title 与 lang、target=_blank 带 rel=noopener。",
         "补 alt / 调整标题层级 / 加 lang；外链加 rel=\"noopener\"。",

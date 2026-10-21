@@ -1,0 +1,47 @@
+# 交互测试示例：复制到项目根目录，改名 verify.toml
+#
+# 每条 [[flows]] 是一条「用户会走的路」。steps 从上往下执行，
+# 任何一步失败整条流程就算失败，后面的步骤不再执行。
+#
+# 可用动作（每步只能写一个）：
+#   goto   = "相对站点根的路径"     打开页面
+#   click  = "CSS 选择器"           点一下
+#   fill   = "#input", value = "x"  清空并填入
+#   select = "#sel",   value = "x"  下拉选择（按 value 或 label）
+#   press  = "Enter", selector = "#x"（selector 可省略）
+#   wait   = 500                    等毫秒
+#   expect = { ... }                断言，见下
+#
+# expect 的写法（可组合）：
+#   { selector = "#id", visible = true }            元素存在且可见（默认）
+#   { selector = "#id", text_contains = "85" }      文本包含
+#   { selector = "#id", input_value = "85" }        输入框的值
+#   { url_contains = "/en/" }                       当前 URL 包含
+#   { no_console_error = true }                     到现在为止没有 console.error
+#   { selector = "#id", timeout = 3000 }            自定义超时（毫秒）
+#
+# 提示：
+#   · 选择器写错会以「等待超时」报出来，不会静默通过
+#   · 流程执行期间出现未捕获异常，整条流程直接判失败（不用写 no_console_error）
+#   · 想断言「状态」，用属性选择器最稳：'[data-tab="report"][aria-selected="true"]'
+
+[[flows]]
+name = "搜索：输入关键词能出结果"
+steps = [
+  { goto   = "index.html" },
+  { fill   = '#search', value = '函数' },
+  { press  = 'Enter', selector = '#search' },
+  { expect = { url_contains = 'q=' } },
+  { expect = { selector = '.result-item', visible = true } },
+  { expect = { no_console_error = true } },
+]
+
+[[flows]]
+name = "表单：提交后清空且出现成功提示"
+steps = [
+  { goto   = "contact.html" },
+  { fill   = '#email', value = 'someone@example.com' },
+  { click  = 'button[type="submit"]' },
+  { expect = { selector = '.toast-success', text_contains = '成功' } },
+  { expect = { selector = '#email', input_value = '' } },
+]

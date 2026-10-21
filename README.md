@@ -153,11 +153,12 @@ FAIL 时返回 `isError: true` —— 调用方不会被「静默通过」骗过
 | `tests` | 高 | ✅ | 项目自带的测试套件必须真的跑起来并通过（以退出码为准）。 | 先修失败的用例；没有测试入口的话，至少补一个冒烟测试。 |
 | `runtime-web` | 高 | ✅ | 静态站点的每个页面通过 HTTP 请求都必须返回 200（大小写、路径层级只有这一层能验出来）。 | 核对文件实际路径与链接大小写；确认站点根目录正确。 |
 | `browser` | 高 | ✅ | 用真实浏览器打开每个页面，抓 JS 未捕获异常、console.error 与资源 404（需要本机装有 playwright）。 | 按报错栈修脚本；资源 404 通常是路径或大小写写错。 |
+| `interaction` | 高 | ✅ | 按 verify.toml 的 [[flows]] 真的去点、填、选，再断言结果；未捕获异常一律算失败（需要 playwright）。 | 修失败的那一步：选择器写错就改选择器，点了没反应就查脚本。 |
 | `a11y` | 低 | — | img 有 alt、单页一个 h1、有 title 与 lang、target=_blank 带 rel=noopener。 | 补 alt / 调整标题层级 / 加 lang；外链加 rel="noopener"。 |
 | `bom` | 低 | — | 文件开头不应有 UTF-8 BOM（会让 CSS/JS 首行规则失效、diff 多一个隐形字符）。 | 用编辑器或脚本去掉开头的 EF BB BF 三字节。 |
 | `paths` | 低 | — | 代码与文档里不应写死本机绝对路径（发布时会泄漏用户名与目录结构）。 | 改成相对路径或环境变量。 |
 | `imports` | 低 | — | Python 里导入了却没用到的名字（会拖慢启动、掩盖真实依赖）。 | 删掉未使用的 import；若是再导出，加进 __all__ 或用 # noqa 说明。 |
-| `todos` | 低 | — | 代码里 TODO / FIXME / XXX / HACK 的数量（只报告，不判定对错）。 | 要么做完，要么改成 issue 编号。 |
+| `todos` | 低 | — | 代码里 TODO / FIXME 的数量（只报告，不判定对错）。 | 要么做完，要么改成 issue 编号。 |
 | `custom` | 中 | — | 项目 verify.toml 里声明的正则规则（规则即数据，不用改引擎）。 | 按规则里写的 message 修改。 |
 | `mutation` | 中 | — | 把改动行里的运算符/布尔值改坏，重跑测试：测试还能通过，说明这行没有有效断言（opt-in，默认不跑）。 | 给这些行补上真正会失败的断言，或删掉死代码。 |
 | `git` | 低 | — | 工作区是否有未提交改动（默认不参与总判定）。 | 确认这些改动是有意保留的，或提交/ stash 掉。 |
@@ -230,6 +231,61 @@ python verify_core.py . --checks mutation
 - 改完**立刻还原**源文件（`finally` 里还原，测试崩了也不会留坏代码）；
 - 默认不跑（不在默认检查集里），要显式 `--checks mutation`；
 - 没测试入口就记 UNKNOWN，不假装验过。
+
+---
+
+## 交互测试：真的点一下
+
+`browser` 只证明「页面能打开」；**交互测试**证明「点了有反应」。
+
+在 `verify.toml` 写几条用户会走的路：
+
+```toml
+[[flows]]
+name = "升学自检：切标签 + 空输入应给提示"
+steps = [
+  { goto   = "notes/advising/index.html" },
+  { click  = '[data-tab="report"]' },
+  { expect = { selector = '[data-tab="report"][aria-selected="true"]', visible = true } },
+  { fill   = '#targetAtar', value = '85' },
+  { expect = { selector = '#targetAtar', input_value = '85' } },
+  { click  = '#btnAtar' },
+  { expect = { selector = '#atarBox', text_contains = '门' } },
+  { expect = { no_console_error = true } },
+]
+```
+
+```bash
+python verify_core.py . --checks interaction
+```
+
+```
+✓ 交互测试【高】 — 1 条流程，通过 1，失败 0（部署前缀 /ausmat-guide）  [2.68s]
+```
+
+失败时给到「第几步、什么动作、为什么」：
+
+```
+✗ 交互测试【高】 — 1 条流程，通过 0，失败 1
+    · 故意写错选择器:2 「故意写错选择器」第 2 步 点击 #btnAtarTYPO 失败：
+      page.click: Timeout 10000ms exceeded.
+  证据在 C:\...\vh-flow-fqatw16p（失败截图留在里面）
+```
+
+**动作**：`goto` / `click` / `fill` / `select` / `press` / `wait` / `expect`（每步一个）
+
+**断言**：`selector` + `visible` / `text_contains` / `input_value`；或 `url_contains`；
+或 `no_console_error`；都可加 `timeout`
+
+规则：
+
+- **流程执行期间出现未捕获异常 → 整条失败**，不用你写断言
+- 选择器写错会以「超时」报出来，不会静默通过
+- 断言状态用属性选择器最稳：`'[data-tab="report"][aria-selected="true"]'`
+- 需要 playwright；没有就记 UNKNOWN，不假装验过
+- `--fast` 会跳过它
+
+完整示例见 [`examples/verify-flows.toml`](examples/verify-flows.toml)。
 
 ---
 

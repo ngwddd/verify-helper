@@ -39,7 +39,7 @@ from pathlib import Path
 
 import check_specs as S
 
-VERSION = "1.6.2"
+VERSION = "1.7.0"
 
 # Windows 控制台默认 GBK，印 ✓ / ✗ 会直接 UnicodeEncodeError（本项目踩过多次）。
 for _s in (sys.stdout, sys.stderr):
@@ -1002,6 +1002,148 @@ def check_browser(root: Path, files: list[Path], ctx: "Ctx") -> Check:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# 9c. 交互测试：真的点、填、选，然后断言结果
+#
+# browser 检查只证明「页面能打开」；这一层证明「点了有反应」。
+# 流程写在 verify.toml 的 [[flows]] 里，由 flow_runner.mjs 逐条执行。
+# ──────────────────────────────────────────────────────────────────────
+FLOW_ACTIONS = {"goto", "click", "fill", "select", "press", "wait", "expect"}
+EXPECT_KEYS = {"selector", "visible", "text_contains", "url_contains",
+               "input_value", "no_console_error", "timeout"}
+
+
+def _load_flows(root: Path) -> tuple[list[dict], str]:
+    """读 verify.toml 的 [[flows]]。返回 (flows, 错误说明)。"""
+    cfg = root / "verify.toml"
+    if not cfg.exists():
+        return [], "没有 verify.toml"
+    try:
+        data = tomllib.loads(_strip_bom(cfg.read_text(encoding="utf-8")))
+    except Exception as e:
+        return [], f"verify.toml 解析失败：{e}"
+
+    raw = data.get("flows")
+    if raw is None:
+        return [], "verify.toml 里没有 [[flows]]"
+    if not isinstance(raw, list):
+        return [], "[[flows]] 必须是数组"
+
+    flows: list[dict] = []
+    for i, f in enumerate(raw, 1):
+        if not isinstance(f, dict):
+            return [], f"第 {i} 条流程不是表"
+        name = str(f.get("name") or f"flow{i}")
+        steps = f.get("steps")
+        if not isinstance(steps, list) or not steps:
+            return [], f"「{name}」没有 steps"
+        clean = []
+        for j, s in enumerate(steps, 1):
+            if not isinstance(s, dict):
+                return [], f"「{name}」第 {j} 步不是表"
+            acts = set(s) & FLOW_ACTIONS
+            if not acts:
+                return [], (f"「{name}」第 {j} 步没有可识别的动作"
+                            f"（可用：{', '.join(sorted(FLOW_ACTIONS))}）")
+            if len(acts) > 1:
+                return [], f"「{name}」第 {j} 步写了多个动作：{', '.join(sorted(acts))}"
+            if "expect" in acts:
+                exp = s["expect"]
+                if not isinstance(exp, dict):
+                    return [], f"「{name}」第 {j} 步的 expect 必须是表"
+                unknown = set(exp) - EXPECT_KEYS
+                if unknown:
+                    return [], (f"「{name}」第 {j} 步的 expect 有不认识的键："
+                                f"{', '.join(sorted(unknown))}")
+                if not (exp.get("no_console_error") or exp.get("url_contains")
+                        or exp.get("selector")):
+                    return [], f"「{name}」第 {j} 步的 expect 缺少 selector / url_contains / no_console_error"
+            clean.append(s)
+        flows.append({"name": name, "steps": clean})
+    return flows, ""
+
+
+def check_interaction(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+    c = Check("interaction", "交互测试：点击 / 表单 / 跳转之后对不对")
+    t0 = time.time()
+    flows, why = _load_flows(root)
+    if not flows:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = why
+        return c
+    if ctx.fast:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = f"{len(flows)} 条流程（fast 模式跳过交互测试）"
+        return c
+
+    htmls = [p for p in files if p.suffix.lower() in HTML_EXT]
+    site_root = _find_site_root(root, htmls) or root
+    pw_dir = _find_playwright(root) or _find_playwright(site_root)
+    if pw_dir is None:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "没找到 playwright，交互测试跑不了"
+        return c
+    node = shutil.which("node")
+    if not node:
+        c.state, c.applicable = "UNKNOWN", False
+        c.detail = "这台机器上没有 node"
+        return c
+
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix="vh-flow-"))
+    spec_file = tmp / "spec.json"
+    out_file = tmp / "out.json"
+    shots = tmp / "shots"
+
+    base = _detect_base(htmls)
+    httpd = None
+    try:
+        httpd, port = _serve(site_root, base)
+        spec_file.write_text(json.dumps(
+            {"base": f"http://127.0.0.1:{port}{base}", "timeoutMs": ctx.flow_timeout,
+             "flows": flows}, ensure_ascii=False), encoding="utf-8")
+
+        runner = Path(__file__).resolve().parent / "flow_runner.mjs"
+        code, out = _run([node, str(runner), "--module", str(pw_dir),
+                          "--spec", str(spec_file), "--out", str(out_file),
+                          "--shots", str(shots)], root, ctx.flow_total_timeout)
+        if code != 0 or not out_file.exists():
+            c.state = "UNKNOWN"
+            c.detail = f"流程执行器没跑成（退出码 {code}）：{_tail(out, 200)}"
+        else:
+            data = json.loads(out_file.read_text(encoding="utf-8"))
+            results = data.get("flows", [])
+            failed = [r for r in results if not r.get("passed")]
+            findings = []
+            for r in failed:
+                fs = r.get("failedStep") or {}
+                msg = f"「{r.get('name')}」第 {fs.get('index')} 步 {fs.get('action')} 失败：{fs.get('detail')}"
+                line = fs.get("index") if isinstance(fs.get("index"), int) and fs["index"] > 0 else 0
+                findings.append({"file": r.get("name", "flow"), "line": line,
+                                 "message": msg[:400],
+                                 "shot": r.get("shot")})
+            c.findings = findings
+            c.state = "FAIL" if failed else "PASS"
+            c.detail = f"{len(flows)} 条流程，通过 {len(results) - len(failed)}，失败 {len(failed)}"
+            if base:
+                c.detail += f"（部署前缀 {base}）"
+            c.command = f"playwright(chromium) 逐条执行 verify.toml [[flows]]"
+            c.exit_code = 0 if not failed else 1
+    except Exception as e:
+        c.state = "UNKNOWN"
+        c.detail = f"交互测试出错：{type(e).__name__}: {e}"
+    finally:
+        if httpd:
+            httpd.shutdown()
+            httpd.server_close()
+        if c.state != "FAIL":
+            shutil.rmtree(tmp, ignore_errors=True)   # 失败时保留截图作为证据
+        else:
+            c.detail += f"；证据在 {tmp}"
+    c.seconds = time.time() - t0
+    return c
+
+
+# ──────────────────────────────────────────────────────────────────────
 # 13. 变异门（opt-in）
 #
 # 覆盖率只说明「执行到了」，变异测试说明「断言有效」。
@@ -1512,6 +1654,8 @@ class Ctx:
     browser_timeout: int = 180
     mutation_max: int = 5
     mutation_timeout: int = 90
+    flow_timeout: int = 10000          # 单步超时（毫秒）
+    flow_total_timeout: int = 180      # 整个交互检查的墙钟上限（秒）
     bundle: dict | None = None       # 一次扫描的结果，五个检查共用
     bundle_lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -1526,6 +1670,7 @@ CHECKS: dict[str, object] = {
     "tests": check_tests,
     "runtime-web": check_runtime_web,
     "browser": check_browser,
+    "interaction": check_interaction,
     "mutation": check_mutation,
     "a11y": check_a11y,
     "bom": check_bom,
