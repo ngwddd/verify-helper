@@ -40,7 +40,7 @@ from pathlib import Path
 import check_specs as S
 import directions as DIR
 
-VERSION = "1.8.2"
+VERSION = "1.8.3"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -1647,7 +1647,9 @@ def check_custom(root: Path, files: list[Path], ctx: "Ctx") -> Check:
         if isinstance(globs, str):
             globs = [globs]
         msg = str(rule.get("message") or pat)
-        sev = str(rule.get("risk") or "medium")
+        # risk 是正式键名；severity 是很多人会顺手写的别名（各 linter 的惯例不同），
+        # 静默忽略会让规则「看起来配了等级、实际没生效」，所以两个都收。
+        sev = str(rule.get("risk") or rule.get("severity") or "medium").lower()
         for p in files:
             if p.suffix.lower() not in TEXT_EXT:
                 continue

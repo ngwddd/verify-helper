@@ -316,6 +316,27 @@ class TestIdempotent(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_custom_rule_accepts_severity_alias(self):
+        """verify.toml 的规则写 severity 而不是 risk 时，等级不能静默变成 medium。
+
+        符合性测试里发现的：很多人会顺手写 severity（各 linter 的惯例不同），
+        旧代码只认 risk，于是「看起来配了 high，实际还是 medium、不阻断」。
+        """
+        d = Path(tempfile.mkdtemp(prefix="vh-cf-sev-"))
+        try:
+            (d / "a.py").write_text("print('x')\n", encoding="utf-8")
+            (d / "verify.toml").write_text(
+                '[[rules]]\nid = "no-print"\nseverity = "high"\n'
+                'pattern = "print\\\\("\nmessage = "不要留 print"\n', encoding="utf-8")
+            rep = V.verify(str(d), checks=["custom"], use_cache=False)
+            c = {x["id"]: x for x in rep["checks"]}["custom"]
+            self.assertEqual(c["state"], "FAIL")
+            self.assertEqual(c["risk"], "high")
+            self.assertTrue(c["blocking"])
+            self.assertEqual(rep["verdict"], "FAIL")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
