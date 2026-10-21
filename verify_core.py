@@ -40,7 +40,7 @@ from pathlib import Path
 import check_specs as S
 import directions as DIR
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:

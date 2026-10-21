@@ -65,7 +65,10 @@ def _card(f: dict, cls, cause, action, must_not, check_id, scale="low", cite=Tru
         "root_cause": _clip(head + cause, 160),
         "action": action,
         "must_not_touch": list(must_not),
-        "verify": f"python verify_core.py . --checks {check_id} 应 PASS",
+        # 两种调用方式都写上：读这份报告的主体通常是 agent（走 MCP），
+        # 只写命令行会让它去跑一个它根本没有的工具；只写 MCP 又顾不上命令行用户。
+        "verify": (f'verify_start(checks=["{check_id}"]) 应 PASS'
+                   f'（命令行 --checks {check_id}）'),
         "scale": scale,
     }
 
@@ -331,9 +334,9 @@ def _gate(card: dict, finding: dict) -> bool:
         return False
     if card.get("evidence") and card["evidence"] not in card.get("root_cause", ""):
         return False
-    # ② 可验证：必须是一条能跑的命令
+    # ② 可验证：必须同时给出 MCP 调用与命令行两种形式
     verify = card.get("verify") or ""
-    if "verify_core.py" not in verify or "--checks" not in verify:
+    if "verify_start(" not in verify or "--checks" not in verify:
         return False
     # ③ 有边界：至少一条「不要动」
     must_not = card.get("must_not_touch") or []

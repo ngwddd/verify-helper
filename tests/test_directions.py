@@ -43,8 +43,10 @@ class TestCardShape(unittest.TestCase):
                 self.assertIn(card["scale"], ("low", "medium", "high"))
                 self.assertTrue(card["root_cause"])
                 self.assertTrue(card["action"])
-                self.assertGreaterEqual(len(card["must_not_touch"]), 1)
-                self.assertIn("verify_core.py", card["verify"])
+                self.assertTrue(card["must_not_touch"])
+                # 验证方式必须同时给 MCP 调用与命令行两种
+                self.assertIn("verify_start(", card["verify"])
+                self.assertIn(f'checks=["{cid}"]', card["verify"])
                 self.assertIn(f"--checks {cid}", card["verify"])
 
     def test_cards_cite_the_location(self):
@@ -132,7 +134,7 @@ class TestIntegration(unittest.TestCase):
             text = V.render(V.verify(str(d), checks=["links"], use_cache=False))
             self.assertIn("方向：", text)
             self.assertIn("别动：", text)
-            self.assertIn("验证：python verify_core.py . --checks links 应 PASS", text)
+            self.assertIn('验证：verify_start(checks=["links"]) 应 PASS', text)
             # 有方向卡时，通用的那句「怎么改」不该再出现
             self.assertNotIn("→ 怎么改：改链接指向真实文件", text)
         finally:

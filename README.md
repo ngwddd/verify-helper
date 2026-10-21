@@ -244,7 +244,7 @@ python verify_core.py . --checks mutation
       方向：站点里没有 advising-rules.js 这个文件，但这一行在引用它 → 把这一行的引用改成
             真实存在的文件；如果文件名是构建时改掉的，改构建脚本，别改生成出来的页面
       别动：.verifyignore（加进去只是掩盖，不算修好） / 同页的其他链接
-      验证：python verify_core.py . --checks links 应 PASS
+      验证：verify_start(checks=[links]) 应 PASS（命令行 --checks links）
 ```
 
 **为什么需要这个**：只说「改链接指向真实文件」，模型能选的做法太多 ——

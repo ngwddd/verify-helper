@@ -1,5 +1,27 @@
 # 更新日志
 
+## v1.8.1 — 2026-10-21
+
+**修方向卡里的验证命令：它写成了命令行版，agent 根本跑不了。**
+
+v1.8.0 的卡里写的是：
+
+```
+验证：python verify_core.py . --checks links 应 PASS
+```
+
+但读这份报告的主体是**通过 MCP 调用的 agent** —— 它手里没有 `verify_core.py`
+这个命令行工具，只有 `verify_start` 这个工具。等于给了一条它执行不了的指令。
+
+现在两种形式都写：
+
+```
+验证：verify_start(checks=["links"]) 应 PASS（命令行 --checks links）
+```
+
+agent 直接用前半句，人用括号里的。四道闸②也跟着改了：
+必须同时包含 `verify_start(` 与 `--checks`，少一个就不写方向。
+
 ## v1.8.0 — 2026-10-21
 
 **每条失败项自带「往哪修」。**
@@ -15,7 +37,7 @@
   方向：站点里没有 advising-rules.js 这个文件，但这一行在引用它 → 把这一行的引用改成
         真实存在的文件；如果文件名是构建时改掉的，改构建脚本，别改生成出来的页面
   别动：.verifyignore（加进去只是掩盖，不算修好） / 同页的其他链接
-  验证：python verify_core.py . --checks links 应 PASS
+  验证：verify_start(checks=[links]) 应 PASS（命令行 --checks links）
 ```
 
 ### 怎么保证方向是对的
