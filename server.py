@@ -181,8 +181,24 @@ HANDLERS = {
 # 而重启要靠改 profile 的配置（还不一定触发 respawn）。改成每次调用前
 # 比一下 mtime，变了就 reload —— 开发循环从此不用碰进程。
 # ──────────────────────────────────────────────────────────────────────
-_CORE_MTIME = 0
 _DEPS = ("check_specs.py", "sarif.py", "verify_core.py")
+
+
+def _stamp() -> int:
+    stamps = []
+    for name in _DEPS:
+        try:
+            stamps.append((name, (HERE / name).stat().st_mtime_ns))
+        except OSError:
+            stamps.append((name, 0))
+    return hash(tuple(stamps))
+
+
+# 必须在**导入时**就记下基线。
+# 之前初始化成 0，然后 `if _CORE_MTIME and ...` 判断 —— 结果是：
+# 进程启动后如果一直没人调用，等第一次调用时文件已经改过，那一次只会记基线、
+# 不会 reload，于是子进程一直跑旧代码（run-14 报 v1.6.2 而实际已是 v1.7.0）。
+_CORE_MTIME = _stamp()
 
 
 def _maybe_reload_core():
@@ -192,14 +208,8 @@ def _maybe_reload_core():
     里那份 check_specs 还是旧的 —— 新加的常量会报 has no attribute。
     """
     global _CORE_MTIME
-    stamps = []
-    for name in _DEPS:
-        try:
-            stamps.append((name, (HERE / name).stat().st_mtime_ns))
-        except OSError:
-            stamps.append((name, 0))
-    cur = hash(tuple(stamps))
-    if _CORE_MTIME and cur != _CORE_MTIME:
+    cur = _stamp()
+    if cur != _CORE_MTIME:
         import importlib
         # 依赖在前，使用者在后
         for name in _DEPS:

@@ -77,6 +77,17 @@ class TestMcp(unittest.TestCase):
         r = self.p.call("tools/list")
         self.assertEqual(r["result"]["tools"][0]["name"], "verify_start")
 
+    def test_reload_baseline_is_recorded_at_import(self):
+        """热加载的基线必须在导入时就记下，不能初始化成 0。
+
+        踩过的坑：初始化 0 时，进程启动后第一次调用只会「记基线」不 reload，
+        于是改了内核却一直跑旧代码（run-14 报 v1.6.2、实际已是 v1.7.0）。
+        """
+        sys.path.insert(0, str(ROOT))
+        import server as srv
+        self.assertNotEqual(srv._CORE_MTIME, 0)
+        self.assertEqual(srv._stamp(), srv._CORE_MTIME)
+
     def test_tools_list_shape(self):
         tools = self.p.call("tools/list")["result"]["tools"]
         self.assertEqual([t["name"] for t in tools],
