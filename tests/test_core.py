@@ -89,9 +89,15 @@ class TestVerdicts(unittest.TestCase):
             fixture.cleanup(empty)
 
     def test_failing_check_carries_remediation(self):
+        """失败项必须带可执行的指引。
+
+        v1.8 起：有方向卡时用方向卡（更具体），没有时才回落到通用的 remediation。
+        """
         b = by_id(self.rep_broken)
         self.assertTrue(b["syntax"]["remediation"])
-        self.assertIn("怎么改", V.render(self.rep_broken))
+        text = V.render(self.rep_broken)
+        self.assertIn("方向：", text)
+        self.assertIn("别动：", text)
 
     def test_risk_is_exposed(self):
         b = by_id(self.rep_broken)

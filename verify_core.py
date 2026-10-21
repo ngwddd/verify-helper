@@ -38,8 +38,34 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 import check_specs as S
+import directions as DIR
 
-VERSION = "1.7.1"
+VERSION = "1.8.0"
+
+
+def _wrap(text: str, width: int = 50) -> list[str]:
+    """按字数折行。中文没有空格，textwrap 在这里不适用。
+
+    额外一条：不要把英文单词/路径从中间劈开（"h|tml" 这种很伤可读性）。
+    切点落在长串 ASCII 里时往回退到词首；退得太远（超过半行）就宁可硬切。
+    """
+    text = " ".join(str(text or "").split())
+    if not text:
+        return [""]
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        end = min(i + width, n)
+        if end < n:
+            j = end
+            while j > i and (text[j - 1].isalnum() or text[j - 1] in "._-/"):
+                j -= 1
+            if j > i + width // 2:
+                end = j
+        out.append(text[i:end])
+        i = end
+    return out
+
 
 # Windows 控制台默认 GBK，印 ✓ / ✗ 会直接 UnicodeEncodeError（本项目踩过多次）。
 for _s in (sys.stdout, sys.stderr):
@@ -1743,6 +1769,22 @@ def verify(project: str, checks: list[str] | None = None,
     order_index = {k: i for i, k in enumerate(ORDER)}
     results.sort(key=lambda c: order_index.get(c.id, 99))
 
+    # 方向卡（v6）：只对已经失败的项填，通过的项一个字段都不加。
+    # 填卡是纯字符串处理，不新增检查、不读盘、不跑浏览器。
+    t_dir = time.time()
+    directed = 0
+    for c in results:
+        if c.state != "FAIL":
+            continue
+        for f in c.findings:
+            if directed >= DIR.MAX_CARDS:      # 病态情况下别把响应撑爆
+                break
+            card = DIR.build(c.id, f)
+            if card:
+                f["direction"] = card
+                directed += 1
+    direction_seconds = time.time() - t_dir
+
     # 生成文件提醒：改产物没用，下次构建就覆盖回去
     try:
         _annotate_generated(root, results)
@@ -1813,6 +1855,8 @@ def verify(project: str, checks: list[str] | None = None,
         notes=notes,
         cache={"hits": ctx.cache.hits, "misses": ctx.cache.misses,
                "parallel_seconds": round(parallel_seconds, 3),
+               "direction_seconds": round(direction_seconds, 4),
+               "directed": directed,
                "checks": len(selected)},
     ).as_dict()
 
@@ -1848,9 +1892,25 @@ def render(report: dict) -> str:
         if c.get("command"):
             lines.append(f"      命令：{c['command']}"
                          + (f"（退出码 {c['exit_code']}）" if c["exit_code"] is not None else ""))
+        # 方向卡在文本里最多打 3 条：同一检查有 30 条同类问题时，
+        # 逐条重复同一段建议只会把报告冲成噪声（JSON 里是全的）。
+        shown_dir = 0
         for f in c["findings"][:6]:
             loc = f["file"] + (f":{f['line']}" if f.get("line") else "")
             lines.append(f"      · {loc} {f['message']}")
+            d = f.get("direction")
+            if d and shown_dir < 3:
+                shown_dir += 1
+                # 上一行已经打了位置，这里不再重复「index.html:5 」
+                cause = d["root_cause"]
+                ev = d.get("evidence") or ""
+                if ev and cause.startswith(ev + " "):
+                    cause = cause[len(ev) + 1:]
+                text = f"{cause} → {d['action']}"
+                for i, chunk in enumerate(_wrap(text, 50)):
+                    lines.append(("        方向：" if i == 0 else "              ") + chunk)
+                lines.append(f"        别动：{' / '.join(d['must_not_touch'])}")
+                lines.append(f"        验证：{d['verify']}")
         if len(c["findings"]) > 6:
             lines.append(f"      · …另有 {len(c['findings']) - 6} 条")
         for h in (c.get("hints") or [])[:3]:
@@ -1858,7 +1918,10 @@ def render(report: dict) -> str:
             lines.append(f"      ~ 提示：{loc} {h['message']}")
         if len(c.get("hints") or []) > 3:
             lines.append(f"      ~ …另有 {len(c['hints']) - 3} 条提示")
-        if c["state"] == "FAIL" and c.get("remediation") and c["applicable"]:
+        # 已经有方向卡时不再打通用的「怎么改」——否则等于同一条问题给两句建议，
+        # 而且那句通用的正是「模型可以随便选」的根源。
+        has_dir = any(f.get("direction") for f in c["findings"])
+        if c["state"] == "FAIL" and c.get("remediation") and c["applicable"] and not has_dir:
             lines.append(f"      → 怎么改：{c['remediation']}")
         if c["state"] == "FAIL" and c.get("output"):
             last = c["output"].strip().splitlines()

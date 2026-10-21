@@ -181,7 +181,7 @@ HANDLERS = {
 # 而重启要靠改 profile 的配置（还不一定触发 respawn）。改成每次调用前
 # 比一下 mtime，变了就 reload —— 开发循环从此不用碰进程。
 # ──────────────────────────────────────────────────────────────────────
-_DEPS = ("check_specs.py", "sarif.py", "verify_core.py")
+_DEPS = ("check_specs.py", "directions.py", "sarif.py", "verify_core.py")
 
 
 def _stamp() -> int:
