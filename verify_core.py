@@ -162,7 +162,7 @@ _CURRENT_USERS = {
 
 
 def _is_own_path(matched: str) -> bool:
-    """`C:\\Users\\ggg` 是本人；`C:\\Users\\jonathans` 是别人资料里的，不算泄漏。"""
+    """当前用户家目录下的路径算自己的；别人资料里出现的家目录路径不算泄漏。"""
     m = re.match(r"(?i)^[A-Za-z]:\\Users\\([^\\]+)", matched)
     if not m:
         m = re.match(r"(?i)^/(?:home|Users)/([^/]+)/", matched)
