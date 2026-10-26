@@ -40,7 +40,7 @@ from pathlib import Path
 import check_specs as S
 import directions as DIR
 
-VERSION = "1.8.4"
+VERSION = "1.9.0"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -75,6 +75,7 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 SKIP_DIRS = {
+    ".verify-artifacts",
     "node_modules", ".git", "__pycache__", ".venv", "venv", "env",
     "dist", "build", "vendor", ".pnpm", ".next", ".cache", "shots",
     ".pytest_cache", ".mypy_cache", ".ruff_cache", ".state", "site-packages",
@@ -1764,7 +1765,16 @@ ORDER = [s.id for s in S.SPECS if s.id in CHECKS]
 # ──────────────────────────────────────────────────────────────────────
 def verify(project: str, checks: list[str] | None = None,
            include_git: bool = False, fast: bool = False,
-           use_cache: bool = True, workers: int = 8) -> dict:
+           use_cache: bool = True, workers: int = 8,
+           stage: str | None = None, tier: str = "auto",
+           accepts: list[dict] | None = None, only_new: bool = False,
+           artifacts: bool = True, review_md: bool = True,
+           against: str | None = None) -> dict:
+    """跑一轮验证。
+
+    stage / tier / accepts / only_new / artifacts / review_md / against
+    是 v1.9 的生命周期参数，交给 lifecycle.py 做后处理（见该模块文档）。
+    """
     root = Path(project).expanduser().resolve()
     if not root.is_dir():
         return {"error": f"不是目录：{root}", "verdict": "UNKNOWN"}
@@ -1893,7 +1903,7 @@ def verify(project: str, checks: list[str] | None = None,
     if ignored:
         notes.append(f".verifyignore 跳过了 {ignored} 个文件")
 
-    return Report(
+    _report = Report(
         project=str(root),
         started=time.strftime("%Y-%m-%dT%H:%M:%S"),
         seconds=time.time() - t_all,
@@ -1910,6 +1920,21 @@ def verify(project: str, checks: list[str] | None = None,
                "checks": len(selected)},
     ).as_dict()
 
+    # v1.9：生命周期后处理（分层 / tier / 接受 / 噪声 / 收敛 / 回归 / 安全 / 度量）
+    try:
+        import lifecycle as _LC
+        _report["lifecycle"] = {}
+        _LC.apply_review(_report, _LC.load_review_md(root)) if review_md else None
+        _LC.apply(_report, root, {
+            "stage": stage, "tier": tier, "accepts": accepts,
+            "only_new": only_new, "artifacts": artifacts,
+            "review_md": review_md, "against": against,
+        })
+    except Exception as _e:
+        _report.setdefault("notes", []).append(
+            f"lifecycle 后处理失败（不影响检查结果）：{type(_e).__name__}: {_e}")
+    return _report
+
 
 def render(report: dict) -> str:
     if "error" in report:
@@ -1922,6 +1947,40 @@ def render(report: dict) -> str:
     lines.append(f"  文件 {report['files']} 个（{ext}）· 总耗时 {report['seconds']}s"
                  f" · {cch.get('checks', '?')} 项检查并行 {cch.get('parallel_seconds', '?')}s"
                  f" · 语法缓存命中 {cch.get('hits', 0)}")
+    lc = report.get("lifecycle") or {}
+    if lc:
+        st = lc.get("stage") or {}
+        tier = lc.get("tier") or {}
+        acc = lc.get("accept") or {}
+        m = lc.get("metrics") or {}
+        conv = lc.get("convergence") or {}
+        sec = lc.get("security") or {}
+        reg = lc.get("regression") or {}
+        lines.append(f"  层 {st.get('stage')}（{st.get('title')}）· "
+                     f"风险档 {tier.get('tier')}（需要 {tier.get('human_approvals')} 人）· "
+                     f"闸门 {st.get('verdict')}")
+        if tier.get("reasons"):
+            lines.append("    档位理由：" + "；".join(tier["reasons"])[:160])
+        if st.get("blocked_by"):
+            for b in st["blocked_by"]:
+                lines.append("    ✗ " + str(b.get("reason")) +
+                             (f"（{b.get('count')} 条）" if b.get("count") else "") +
+                             (("：" + "、".join(b.get("checks") or [])) if b.get("checks") else ""))
+        if sec.get("count"):
+            lines.append(f"    安全层：{sec['count']} 条高危发现"
+                         + ("（阻塞）" if sec.get("blocked") else ""))
+        lines.append(
+            f"    未回应 {acc.get('unresolved_count', 0)} 条"
+            f"（中风险以上 {st.get('unresolved_blocking', 0)} / 低风险 {st.get('unresolved_low', 0)}）"
+            f" · 已接受 {acc.get('accepted', 0)} 条"
+            f" · 本轮新增 {m.get('noise_new', 0)} / 重复 {m.get('noise_repeat', 0)} / 修好 {m.get('noise_fixed', 0)}")
+        if conv.get("advice"):
+            lines.append(f"    收敛（第 {conv.get('rounds')} 轮）：{conv['advice']}")
+        if reg.get("cases"):
+            lines.append(f"    回归集 {reg['cases']} 条 · 缺检查 {len(reg.get('missing') or [])} 条")
+        arts = lc.get("artifacts") or {}
+        if arts.get("dir"):
+            lines.append(f"    证据留档：{arts.get('count')} 个文件 → {arts['dir']}")
     if report.get("git", {}).get("head"):
         lines.append(f"  HEAD {report['git']['head']} · 未提交 {report['git'].get('dirty')}")
     lines.append("")
@@ -2163,6 +2222,20 @@ def main_cli(argv=None):
     ap.add_argument("--baseline", default="off", choices=["off", "save", "check"],
                     help="基线：save 存一份，check 与上次比对")
     ap.add_argument("--baseline-file", default="", help="基线文件路径（默认项目根 .verify-baseline.json）")
+    # ── v1.9 生命周期 ──
+    ap.add_argument("--stage", default="pr",
+                    choices=["precommit", "pr", "merge", "postdeploy"],
+                    help="这一轮属于哪一层（默认 pr）")
+    ap.add_argument("--tier", default="auto", choices=["auto", "low", "medium", "high"],
+                    help="风险档；auto = 按 git 改动自动判定")
+    ap.add_argument("--accept", default="",
+                    help="接受某条 finding：id::理由（多个用 ; 分隔；也可用 | 分隔）")
+    ap.add_argument("--accept-file", default="",
+                    help="接受记录文件（默认项目根 .verify-accept.json）")
+    ap.add_argument("--only-new", action="store_true", help="只报本轮新出现的 finding")
+    ap.add_argument("--against", default="", help="合并队列：与目标分支组合后再判定")
+    ap.add_argument("--no-artifacts", action="store_true", help="不写 .verify-artifacts 证据")
+    ap.add_argument("--no-review-md", action="store_true", help="忽略 REVIEW.md")
     a = ap.parse_args(argv)
 
     if a.list_checks:
@@ -2172,8 +2245,52 @@ def main_cli(argv=None):
         ap.error("缺少 project 参数（或用 --list-checks）")
 
     sel = [x.strip() for x in a.checks.split(",") if x.strip()] or None
-    rep = verify(a.project, sel, include_git=a.git, fast=a.fast,
-                 use_cache=not a.no_cache, workers=a.workers)
+
+    accepts = []
+    for chunk in [x for x in a.accept.split(";") if x.strip()]:
+        # finding id 形如 check:file:line:hash，本身就带冒号 ——
+        # 所以优先用 "::" 或 "|" 分隔；退化时才从最右边切一个冒号。
+        if "::" in chunk:
+            fid, _, reason = chunk.partition("::")
+        elif "|" in chunk:
+            fid, _, reason = chunk.partition("|")
+        else:
+            fid, _, reason = chunk.rpartition(":")
+        if fid.strip() and reason.strip():
+            accepts.append({"id": fid.strip(), "reason": reason.strip(),
+                            "at": time.strftime("%Y-%m-%d")})
+
+    # 接受记录落盘：写下就是「我回答过了」，可审计、可入库
+    if accepts:
+        try:
+            import lifecycle as _LC
+            cur = _LC.load_accepts(Path(a.project))
+            merged = {e["id"]: e for e in (cur.get("accepted") or []) if e.get("id")}
+            for e in accepts:
+                merged[e["id"]] = e
+            _LC.save_accepts(Path(a.project), list(merged.values()))
+        except Exception as _e:
+            print(f"（接受记录未写盘：{_e}）", file=sys.stderr)
+
+    # 合并队列：先与目标分支组合，再对合并结果跑检查
+    merge = {}
+    target = a.project
+    if a.against:
+        import lifecycle as _LC
+        merge = _LC.merge_probe(Path(a.project), a.against)
+        if merge.get("ok"):
+            target = merge["path"]
+
+    rep = verify(target, sel, include_git=a.git, fast=a.fast,
+                 use_cache=not a.no_cache, workers=a.workers,
+                 stage=a.stage, tier=a.tier, accepts=accepts,
+                 only_new=a.only_new, artifacts=not a.no_artifacts,
+                 review_md=not a.no_review_md, against=a.against or None)
+    if a.against:
+        rep["merge_probe"] = {"ok": merge.get("ok"), "note": merge.get("note")}
+        if merge.get("ok"):
+            import lifecycle as _LC
+            _LC.cleanup_worktree(Path(a.project), merge.get("path", ""))
 
     if a.baseline != "off" and "error" not in rep:
         bpath = Path(a.baseline_file) if a.baseline_file else Path(rep["project"]) / BASELINE_NAME

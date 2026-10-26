@@ -91,10 +91,13 @@ class TestMcp(unittest.TestCase):
     def test_tools_list_shape(self):
         tools = self.p.call("tools/list")["result"]["tools"]
         self.assertEqual([t["name"] for t in tools],
-                         ["verify_start", "verify_report", "verify_checks"])
+                         ["verify_start", "verify_report", "verify_checks", "verify_accept"])
         schema = tools[0]["inputSchema"]
         self.assertEqual(schema["required"], ["path"])
         self.assertIn("sarif", schema["properties"]["format"]["enum"])
+        # v1.9：分层与回应机制必须在 schema 里可见
+        for key in ("stage", "tier", "accept", "only_new", "against", "artifacts", "review_md"):
+            self.assertIn(key, schema["properties"], f"schema 缺少 {key}")
 
     def test_checks_carry_risk(self):
         payload = json.loads(self.call_tool("verify_checks", {})["content"][0]["text"])

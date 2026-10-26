@@ -18,3 +18,7 @@ venv/
 
 # 基线（每台机器不同）
 .verify-baseline.json
+.verify-artifacts/
+.verify-noise.json
+.verify-accept.json
+*.bak-before-19

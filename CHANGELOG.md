@@ -1,3 +1,32 @@
+## [1.9.0] - 2026-10-26
+
+把「一次性检查器」升级成「分层闸门」。十个能力，全部是后处理，不改原有检查实现。
+
+### Added
+- **分层**：`--stage precommit|pr|merge|postdeploy`，每层有自己的检查集与"该拦什么"
+- **风险档由变更决定**：`--tier auto` 读 git diff；敏感路径（auth/billing/CI/migrations/
+  installer/证书）或 ≥400 行 / ≥25 文件 → high（2 人）；≥60 行或 ≥6 文件 → medium（1 人）
+- **每条 finding 必须被回应**：`--accept "id::理由"` 落盘到 `.verify-accept.json`；
+  凭据类不接受；只有中风险及以上未回应才阻断
+- **噪声与收敛**：记录 新增/重复/修好；连续三轮不变 → 判定收敛并给出建议；`--only-new`
+- **回归集**：`regression.toml` 声明「出过事的路径 + 该跑的检查」，每次必查
+- **安全层**：`shell=True` / `eval` / `exec` / `os.system` / 明文 http / 关 TLS；
+  只有凭据类阻塞，其余必须回应；跳过自身定义文件，尊重 `.verifyignore`
+- **证据留档**：`.verify-artifacts/<时间戳>/`，保留最近 20 次
+- **REVIEW.md**：skip / no-style / require-evidence / max-nits / fail-means
+- **度量**：unknown_rate、needs_human_eyes、noise_new/repeat/fixed、slowest
+- **MCP**：新工具 `verify_accept`；`verify_start` schema 增加 7 个参数
+
+### Changed
+- 三态更严格：缺 oracle → **UNKNOWN**（不再借 FAIL 表示）；全不可判定 → UNKNOWN
+- 低风险未回应不再阻断 PR（否则噪声会让人开始无视工具）
+- 工具数 3 → 4；测试 102 → 131
+
+### Fixed
+- `--accept` 用冒号切分会把 finding id 切坏（id 本身含冒号）→ 支持 `id::理由` / `id|理由`
+- 安全层曾把自己定义正则的源码文件当成危险调用（自指）→ 跳过自身文件
+- `.verify-artifacts` 目录会被自己扫描进去 → 加入跳过目录
+
 # 更新日志
 
 ## v1.8.4 — 2026-10-21

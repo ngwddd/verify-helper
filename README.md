@@ -475,3 +475,92 @@ python verify_core.py . --fast              # 自己检查自己
 ## 许可证
 
 MIT
+
+---
+
+## 分层闸门（v1.9）
+
+v1.9 之前，它是一次性跑 15 项、给一个 PASS/FAIL/UNKNOWN。
+现在多了**生命周期语义**：这一轮属于哪层、这次改动多危险、哪些问题被谁回应了。
+
+### 1. 分层：`--stage`
+
+| 层 | 该拦什么 | 跑哪些检查 |
+|---|---|---|
+| `precommit` | 秒级反馈，挂 git hook | syntax / encoding / bom / secrets / imports / paths / todos / custom |
+| `pr` | 完整静态 + 运行时 | 默认全部 |
+| `merge` | 与目标分支组合后全量再跑 | 默认全部（配 `--against main`） |
+| `postdeploy` | 只验线上行为 | runtime-web / browser / interaction / tests |
+
+```bash
+python verify_core.py . --stage precommit      # 提交前，亚秒级
+python verify_core.py . --stage pr             # PR
+python verify_core.py . --stage merge --against main   # 合并队列
+```
+
+### 2. 风险档：`--tier auto`
+
+**由变更决定，不由项目决定**。命中敏感路径（auth/、billing/、.github/workflows/、
+migrations/、installer、*.pem…）或改动 ≥400 行 / ≥25 文件 → `high`（要 2 人）；
+≥60 行或 ≥6 文件 → `medium`（1 人）；其余 `low`（0 人）。
+
+### 3. 每条 finding 必须被回应
+
+```bash
+# 修掉，或者写理由接受（会落盘到 .verify-accept.json，可入库、可审计）
+python verify_core.py . --accept "bom:a.py:1:3c7f56dfc6::构建会重新生成，已确认"
+```
+- **凭据类（secrets）永远不接受**，必须真修。
+- 只有**中风险及以上**未回应才会卡住合并；低风险只提示（避免噪声把人逼到无视它）。
+
+### 4. 噪声与收敛
+
+每轮记录 finding 集合，算 `新增 / 重复 / 修好`；**连续三轮条数不变 → 判定收敛**，
+提示「剩下的要么接受要么改，不要再刷第 4 轮」。
+`--only-new` 可只看本轮新出现的问题。
+
+### 5. 回归集：`regression.toml`
+
+```toml
+[[case]]
+path = "src/app.py"
+check = "syntax"
+why = "曾经少个括号，整站白屏"
+```
+
+每次运行都会检查这些「出过事的路径」有没有被覆盖到、对应检查有没有真的跑到。
+
+### 6. 安全层
+
+在 `secrets` 之上再扫一遍危险调用（`shell=True`、`eval/exec`、`os.system`、
+明文 `http://`、关闭 TLS 校验…）。**只有凭据类（critical）直接阻塞**；
+高危项进入「未回应」清单，必须修或写理由接受。
+
+### 7. 证据留档
+
+失败/未知项的**命令、退出码、原始输出、findings** 落到
+`.verify-artifacts/<时间戳>/`（只保留最近 20 次）。
+报告里给目录与文件数 —— 下一个人不用重跑，也不用相信"我看过了"。
+
+### 8. REVIEW.md
+
+仓库可以放一份 `REVIEW.md` 告诉检查器这个仓库的规矩：
+
+```
+skip: drafts/**, legacy/**
+no-style: true          # 只关 a11y 这类纯风格项
+require-evidence: true  # 没有 file:line 的 finding 直接丢
+max-nits: 2
+fail-means: 文档说谎
+```
+
+### 9. 度量
+
+报告里带 `metrics`：`unknown_rate`（缺 oracle 的比例）、
+`needs_human_eyes`（需要人看的条数，用来代理"人的时间"）、
+`noise_new/repeat/fixed`、`slowest` 三项。
+
+### 10. MCP 工具
+
+新增 `verify_accept`（list / add / clear），`verify_start` 的 schema 也带上了
+`stage / tier / accept / only_new / against / artifacts / review_md`。
