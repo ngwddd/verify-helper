@@ -42,7 +42,7 @@ import subprocess
 import time
 from pathlib import Path
 
-VERSION = "1.10.4"
+VERSION = "1.10.5"
 
 # ───────────────────────────── ① 分层 ─────────────────────────────
 # 层不是「跑哪几项」这么简单，每层有它该拦的东西和该放的东西。
@@ -472,14 +472,17 @@ def apply_regression(report: dict, rules: dict, root: Path) -> dict:
 # ─────────────────── ⑨ 安全层（独立、可阻塞、不可接受）───────────────────
 # (正则, 说明, 风险, 作用域) —— 作用域 code 表示「只在代码里算」，
 # 文档（.md/.txt/.rst）里的 http 链接是**参考资料**，不是请求，报它纯属噪声。
+# (正则, 说明, 风险, 作用域, 引号内是否跳过)
+#   · 调用类（eval/exec/os.system/shell=True）：引号里的是**模式字符串**，跳过
+#   · URL 类（http://）：URL 本来就写在字符串里，**不能**因为带引号就跳过
 DANGEROUS_PATTERNS = [
-    (r"subprocess\.(?:run|Popen|call)\([^)]*shell\s*=\s*True", "subprocess 使用 shell=True", "high", "any"),
-    (r"(?<![\w.])eval\s*\(", "使用 eval()", "high", "code"),
-    (r"(?<![\w.])exec\s*\(", "使用 exec()", "high", "code"),
-    (r"os\.system\s*\(", "使用 os.system()", "high", "code"),
-    (r"http://(?!127\.0\.0\.1|localhost)", "明文 http:// 外链（代码里）", "medium", "code"),
-    (r"verify\s*=\s*False", "requests 关闭了 TLS 校验", "high", "code"),
-    (r"--insecure|ssl\s*=\s*False|CERT_NONE", "关闭 TLS 校验", "high", "any"),
+    (r"subprocess\.(?:run|Popen|call)\([^)]*shell\s*=\s*True", "subprocess 使用 shell=True", "high", "any", True),
+    (r"(?<![\w.])eval\s*\(", "使用 eval()", "high", "code", True),
+    (r"(?<![\w.])exec\s*\(", "使用 exec()", "high", "code", True),
+    (r"os\.system\s*\(", "使用 os.system()", "high", "code", True),
+    (r"http://(?!127\.0\.0\.1|localhost)", "明文 http:// 外链（代码里）", "medium", "code", False),
+    (r"verify\s*=\s*False", "requests 关闭了 TLS 校验", "high", "code", True),
+    (r"--insecure|ssl\s*=\s*False|CERT_NONE", "关闭 TLS 校验", "high", "any", True),
 ]
 DOC_EXT = {".md", ".markdown", ".txt", ".rst", ".adoc"}
 STYLE_CHECKS = {"a11y"}          # 只这些算"风格"，受 no-style 影响
@@ -535,11 +538,18 @@ def security_layer(root: Path, report: dict, max_files: int = 4000,
             continue
         scanned += 1
         is_doc = p.suffix.lower() in DOC_EXT
-        for pat, label, risk, scope in DANGEROUS_PATTERNS:
+        for pat, label, risk, scope, skip_quoted in DANGEROUS_PATTERNS:
             if scope == "code" and is_doc:
                 continue
             for m in re.finditer(pat, text):
-                line = text.count("\n", 0, m.start()) + 1
+                # 只看**真调用**：如果这个 token 紧贴在引号后面，它多半是
+                # 测试里当模式用的字符串（`"os.system("`），不是调用。
+                # 实测：tests/test_v03_bridge.py 把四个模式写成元组，被误报成 3 条高危。
+                start = m.start()
+                prev = text[start - 1] if start > 0 else ""
+                if skip_quoted and prev in "\"'`":
+                    continue
+                line = text.count("\n", 0, start) + 1
                 findings.append({
                     "id": f"security:{p.relative_to(root).as_posix()}:{line}:{label}",
                     "file": p.relative_to(root).as_posix(),

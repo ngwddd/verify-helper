@@ -40,7 +40,7 @@ from pathlib import Path
 import check_specs as S
 import directions as DIR
 
-VERSION = "1.10.2"
+VERSION = "1.10.5"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -1845,14 +1845,18 @@ def _ensure_lifecycle() -> None:
     if not disk:
         return
     mod = sys.modules.get("lifecycle")
-    if mod is not None and getattr(mod, "VERSION", "") == disk:
+    if mod is None:
+        # 首次使用：这只是 import，不是 reload，别刷日志
+        try:
+            import lifecycle  # noqa: F401
+        except Exception:
+            pass
+        return
+    if getattr(mod, "VERSION", "") == disk:
         return
     try:
         import importlib
-        if mod is None:
-            import lifecycle as mod          # noqa: F401
-        else:
-            importlib.reload(mod)
+        importlib.reload(mod)
         print(f"[reload] lifecycle → v{getattr(mod, 'VERSION', '?')}", file=sys.stderr)
     except Exception:
         pass
