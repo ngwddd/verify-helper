@@ -98,6 +98,8 @@ TOOLS = [
                             "description": "合并队列：与目标分支组合后再判定（如 main）"},
                 "artifacts": {"type": "boolean",
                               "description": "是否写 .verify-artifacts 证据，默认 true"},
+                "artifacts_dir": {"type": "string",
+                                  "description": "证据目录（默认项目根 .verify-artifacts）"},
                 "review_md": {"type": "boolean",
                               "description": "是否读 REVIEW.md 的仓库级规则，默认 true"},
             },
@@ -162,6 +164,7 @@ def tool_verify_start(args: dict) -> tuple[str, bool]:
         artifacts=bool(args.get("artifacts", True)),
         review_md=bool(args.get("review_md", True)),
         against=args.get("against") or None,
+        artifacts_dir=args.get("artifacts_dir") or None,
     )
     if "error" in rep:
         # 路径不存在这类输入错误也要以 isError 返回，不能伪装成一次「跑过了」的验证。

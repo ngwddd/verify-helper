@@ -40,7 +40,7 @@ from pathlib import Path
 import check_specs as S
 import directions as DIR
 
-VERSION = "1.9.1"
+VERSION = "1.10.0"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -73,6 +73,10 @@ for _s in (sys.stdout, sys.stderr):
         _s.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+
+# 备份/草稿目录：默认不扫（与正本重名，重复报同一问题）
+BACKUP_DIR_RE = re.compile(r"(\.backup-|\.bak-|\.old$|\.orig$|^backup-|^bak-)", re.I)
+_SKIPPED_BACKUPS: list[str] = []
 
 SKIP_DIRS = {
     ".verify-artifacts",
@@ -319,6 +323,12 @@ def scan_files(root: Path, limit: int = 200_000,
         keep = []
         for name in dirnames:
             if name.lower() in SKIP_DIRS:
+                continue
+            # 备份/草稿目录默认跳过：它们和正本重名，会把同一条 finding 报两遍。
+            # （实测：my-site.backup-20260924 让 each finding 翻倍）
+            if BACKUP_DIR_RE.search(name):
+                _SKIPPED_BACKUPS.append(name)
+                ignored += 1
                 continue
             if chain and hit(d / name, name):
                 ignored += 1
@@ -1789,7 +1799,7 @@ def verify(project: str, checks: list[str] | None = None,
            stage: str | None = None, tier: str = "auto",
            accepts: list[dict] | None = None, only_new: bool = False,
            artifacts: bool = True, review_md: bool = True,
-           against: str | None = None) -> dict:
+           against: str | None = None, artifacts_dir: str | None = None) -> dict:
     """跑一轮验证。
 
     stage / tier / accepts / only_new / artifacts / review_md / against
@@ -1800,6 +1810,7 @@ def verify(project: str, checks: list[str] | None = None,
         return {"error": f"不是目录：{root}", "verdict": "UNKNOWN"}
 
     t_all = time.time()
+    _SKIPPED_BACKUPS.clear()
     global _READER
     ignores = _ignore_patterns(root / ".verifyignore")
     files, by_ext, skipped_big, ignored = scan_files(root, ignores=ignores)
@@ -1922,6 +1933,21 @@ def verify(project: str, checks: list[str] | None = None,
         notes.append(f"{skipped_big} 个超过 5MB 的文件未扫描")
     if ignored:
         notes.append(f".verifyignore 跳过了 {ignored} 个文件")
+    if _SKIPPED_BACKUPS:
+        notes.append("默认跳过备份目录：" + "、".join(sorted(set(_SKIPPED_BACKUPS))[:5])
+                     + "（与正本重名，重复报同一问题）")
+
+    profile = _workspace_profile(root, files)
+    if len(profile) >= 2:
+        with_tests = [r["path"] for r in profile if r["test_entry"]]
+        notes.append(
+            "子项目画像：" + "、".join(f"{r['path']}({r['files']} 文件"
+                                      + ("，有测试" if r["test_entry"] else "") + ")"
+                                      for r in profile[:6])
+            + (f" …共 {len(profile)} 个" if len(profile) > 6 else ""))
+        if with_tests:
+            notes.append("这些子项目有测试入口，想验测试请把 path 指过去："
+                         + "、".join(with_tests[:5]))
 
     _report = Report(
         project=str(root),
@@ -1940,6 +1966,11 @@ def verify(project: str, checks: list[str] | None = None,
                "checks": len(selected)},
     ).as_dict()
 
+    try:
+        _report["workspace"] = _workspace_profile(root, files)
+    except Exception:
+        _report["workspace"] = []
+
     # v1.9：生命周期后处理（分层 / tier / 接受 / 噪声 / 收敛 / 回归 / 安全 / 度量）
     try:
         import lifecycle as _LC
@@ -1949,6 +1980,7 @@ def verify(project: str, checks: list[str] | None = None,
             "stage": stage, "tier": tier, "accepts": accepts,
             "only_new": only_new, "artifacts": artifacts,
             "review_md": review_md, "against": against,
+            "artifacts_dir": artifacts_dir,
         })
     except Exception as _e:
         _report.setdefault("notes", []).append(
@@ -1967,6 +1999,12 @@ def render(report: dict) -> str:
     lines.append(f"  文件 {report['files']} 个（{ext}）· 总耗时 {report['seconds']}s"
                  f" · {cch.get('checks', '?')} 项检查并行 {cch.get('parallel_seconds', '?')}s"
                  f" · 语法缓存命中 {cch.get('hits', 0)}")
+    ws = report.get("workspace") or []
+    if len(ws) >= 2:
+        lines.append("  工作区：" + "、".join(
+            f"{w['path']}({w['files']}" + ("，有测试" if w.get("test_entry") else "") + ")"
+            for w in ws[:5]) + (f" …共 {len(ws)} 个" if len(ws) > 5 else ""))
+
     lc = report.get("lifecycle") or {}
     if lc:
         st = lc.get("stage") or {}
@@ -1987,8 +2025,19 @@ def render(report: dict) -> str:
                              (f"（{b.get('count')} 条）" if b.get("count") else "") +
                              (("：" + "、".join(b.get("checks") or [])) if b.get("checks") else ""))
         if sec.get("count"):
-            lines.append(f"    安全层：{sec['count']} 条高危发现"
-                         + ("（阻塞）" if sec.get("blocked") else ""))
+            groups = sec.get("groups") or []
+            lines.append(f"    安全层：{sec['count']} 条 / {len(groups)} 类"
+                         + ("（有阻塞项）" if sec.get("blocked") else ""))
+            for g in groups[:4]:
+                lines.append(f"      · {g['count']}× {g['message']} —— "
+                             + "、".join(g.get("files", [])[:2])
+                             + ("…" if g["count"] > 2 else ""))
+                if g.get("advice"):
+                    lines.append("        → " + str(g["advice"])[:76])
+        top_un = (m.get("unresolved_by_check") or {})
+        if top_un:
+            lines.append("    未回应来源：" + "、".join(
+                f"{k} {v}" for k, v in list(top_un.items())[:4]))
         lines.append(
             f"    未回应 {acc.get('unresolved_count', 0)} 条"
             f"（中风险以上 {st.get('unresolved_blocking', 0)} / 低风险 {st.get('unresolved_low', 0)}）"
@@ -2184,6 +2233,39 @@ def _annotate_generated(root: Path, results: list) -> None:
                 })
 
 
+def _workspace_profile(root: Path, files: list[Path]) -> list[dict]:
+    """列出子项目：规模、是否有测试入口、是否 git 仓库。
+
+    为什么需要：对工作区跑的时候，"测试在哪个子项目里"、"该对谁下结论"
+    光看一个总判定是看不出来的（实测 10 个子项目、tests 判在错误的根上）。
+    """
+    rows: list[dict] = []
+    try:
+        subs = [d for d in sorted(root.iterdir())
+                if d.is_dir() and d.name.lower() not in SKIP_DIRS
+                and not d.name.startswith(".") and not BACKUP_DIR_RE.search(d.name)]
+    except OSError:
+        return rows
+    for d in subs[:20]:
+        rel = d.relative_to(root).as_posix()
+        n_files = sum(1 for f in files if str(f).startswith(str(d)))
+        if n_files == 0:
+            continue
+        try:
+            cmd, why, _ = _detect_test_command(d)
+        except Exception:
+            cmd, why = None, "探测失败"
+        rows.append({
+            "path": rel,
+            "files": n_files,
+            "test_entry": bool(cmd),
+            "test_hint": why if cmd else "",
+            "git": (d / ".git").exists(),
+        })
+    rows.sort(key=lambda r: -r["files"])
+    return rows
+
+
 def _count_subprojects(root: Path) -> int:
     """数一下子目录里有几个像「独立项目」——用来看这是不是工作区。"""
     markers = ("package.json", "pyproject.toml", "index.html", "Cargo.toml",
@@ -2255,6 +2337,8 @@ def main_cli(argv=None):
     ap.add_argument("--only-new", action="store_true", help="只报本轮新出现的 finding")
     ap.add_argument("--against", default="", help="合并队列：与目标分支组合后再判定")
     ap.add_argument("--no-artifacts", action="store_true", help="不写 .verify-artifacts 证据")
+    ap.add_argument("--artifacts-dir", default="",
+                    help="证据写到哪里（默认项目根 .verify-artifacts）")
     ap.add_argument("--no-review-md", action="store_true", help="忽略 REVIEW.md")
     a = ap.parse_args(argv)
 
@@ -2305,7 +2389,8 @@ def main_cli(argv=None):
                  use_cache=not a.no_cache, workers=a.workers,
                  stage=a.stage, tier=a.tier, accepts=accepts,
                  only_new=a.only_new, artifacts=not a.no_artifacts,
-                 review_md=not a.no_review_md, against=a.against or None)
+                 review_md=not a.no_review_md, against=a.against or None,
+                 artifacts_dir=a.artifacts_dir or None)
     if a.against:
         rep["merge_probe"] = {"ok": merge.get("ok"), "note": merge.get("note")}
         if merge.get("ok"):

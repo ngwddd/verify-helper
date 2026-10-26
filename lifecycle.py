@@ -42,7 +42,7 @@ import subprocess
 import time
 from pathlib import Path
 
-VERSION = "1.9.1"
+VERSION = "1.10.0"
 
 # ───────────────────────────── ① 分层 ─────────────────────────────
 # 层不是「跑哪几项」这么简单，每层有它该拦的东西和该放的东西。
@@ -203,7 +203,8 @@ def tier_of(facts: dict, forced: str | None = None) -> dict:
 
 
 # ─────────────────── ③ 证据留档（失败项的原始输出）───────────────────
-def write_artifacts(report: dict, root: Path, keep: int = 20) -> dict:
+def write_artifacts(report: dict, root: Path, keep: int = 20,
+                    out_dir: str | None = None) -> dict:
     """把每条失败/未知检查的命令与输出落盘，报告里给路径。
 
     为什么要留档：文章里「读证据而不是读代码」。没有原始输出，
@@ -211,7 +212,7 @@ def write_artifacts(report: dict, root: Path, keep: int = 20) -> dict:
     """
     root = Path(root)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    base = root / ".verify-artifacts" / stamp
+    base = (Path(out_dir) if out_dir else root / ".verify-artifacts") / stamp
     written: list[str] = []
     try:
         for c in report.get("checks", []):
@@ -234,8 +235,8 @@ def write_artifacts(report: dict, root: Path, keep: int = 20) -> dict:
             (base / "index.json").write_text(
                 json.dumps({"project": report.get("project"), "verdict": report.get("verdict"),
                             "files": written}, ensure_ascii=False, indent=2), encoding="utf-8")
-        # 只保留最近 N 次
-        parent = root / ".verify-artifacts"
+        # 只保留最近 N 次（只在自管目录里裁剪，别动用户指定的目录）
+        parent = Path(out_dir) if out_dir else root / ".verify-artifacts"
         runs = sorted([d for d in parent.iterdir() if d.is_dir()]) if parent.is_dir() else []
         for d in runs[:-keep]:
             for f in d.rglob("*"):
@@ -483,6 +484,8 @@ SEC_CODE_EXT = {".py", ".js", ".mjs", ".cjs", ".ts", ".sh", ".ps1", ".yml", ".ya
 
 
 SELF_FILES = {"lifecycle.py"}          # 定义这些正则的文件本身不该被它扫
+# 备份/草稿目录：与正本重名，扫两遍等于把同一问题报两次
+BACKUP_PART_RE = re.compile(r"(\.backup-|\.bak-|\.old$|\.orig$|^backup-|^bak-)", re.I)
 
 
 def _ignore_patterns(root: Path) -> list[str]:
@@ -519,6 +522,8 @@ def security_layer(root: Path, report: dict, max_files: int = 4000,
         rel = p.relative_to(root).as_posix()
         if any(fnmatch.fnmatch(rel, pat) for pat in ignores):
             continue
+        if any(BACKUP_PART_RE.search(part) for part in p.parts):
+            continue
         try:
             if p.stat().st_size > 1_500_000:
                 continue
@@ -543,8 +548,29 @@ def security_layer(root: Path, report: dict, max_files: int = 4000,
                                  "file": f.get("file"), "line": f.get("line"),
                                  "message": "疑似真实凭据", "risk": "critical", "accept": False})
     blocked = any(f.get("risk") == "critical" for f in findings)
+    groups = aggregate_security(findings)
     return {"blocked": blocked, "scanned": scanned, "findings": findings[:80],
-            "count": len(findings)}
+            "count": len(findings), "groups": groups,
+            "group_count": len(groups)}
+
+
+def aggregate_security(findings: list[dict]) -> list[dict]:
+    """把同类发现聚合成一组：17 处 verify=False 不该显示成 17 行。"""
+    buckets: dict[tuple, dict] = {}
+    for f in findings:
+        key = (f.get("message") or "?", f.get("risk") or "?")
+        row = buckets.setdefault(key, {"message": key[0], "risk": key[1],
+                                       "count": 0, "files": []})
+        row["count"] += 1
+        row["files"].append(f"{f.get('file')}:{f.get('line')}")
+    groups = sorted(buckets.values(), key=lambda r: (-r["count"], r["message"]))
+    for g in groups:
+        g["files"] = g["files"][:6]
+        # 同一类超过 5 处 → 提示「一次性处理」，而不是逐条纠结
+        g["advice"] = ("同一类问题反复出现：要么一次性改掉，要么在 REVIEW.md 里 "
+                       "`security-skip:` 豁免那批文件（别逐条接受，那是噪声）"
+                       if g["count"] > 5 else "")
+    return groups
 
 
 # ───────────────────────── ⑩ 度量 ─────────────────────────
@@ -565,6 +591,8 @@ def metrics(report: dict, stage_result: dict, tier: dict, acc: dict,
         "accepted": acc.get("accepted", 0),
         "unresolved": acc.get("unresolved_count", 0),
         "needs_human_eyes": acc.get("unresolved_count", 0),   # 人要花的时间的代理指标
+        "unresolved_by_check": _count_by(acc.get("unresolved") or [], "check"),
+        "unresolved_by_risk": _count_by(acc.get("unresolved") or [], "risk"),
         "tier": tier.get("tier"),
         "human_approvals_required": tier.get("human_approvals"),
         "stage": stage_result.get("stage"),
@@ -574,6 +602,14 @@ def metrics(report: dict, stage_result: dict, tier: dict, acc: dict,
         "noise_fixed": (noise or {}).get("fixed", 0),
         "slowest": [{"check": c.get("id"), "seconds": c.get("seconds")} for c in slow],
     }
+
+
+def _count_by(rows: list[dict], key: str) -> dict:
+    out: dict[str, int] = {}
+    for r in rows:
+        k = str(r.get(key) or "?")
+        out[k] = out.get(k, 0) + 1
+    return dict(sorted(out.items(), key=lambda kv: -kv[1]))
 
 
 # ───────────────────── 闸门总判定（把上面拼起来）─────────────────────
@@ -650,7 +686,8 @@ def apply(report: dict, root: Path, opts: dict | None = None) -> dict:
     noise = noise_track(root, report)
     conv = convergence(root, report)
     reg = apply_regression(report, regression_rules(root), root)
-    arts = write_artifacts(report, root) if opts.get("artifacts", True) else {"written": []}
+    arts = (write_artifacts(report, root, out_dir=opts.get("artifacts_dir"))
+            if opts.get("artifacts", True) else {"written": []})
 
     # only_new：只留新出现的 finding（基于噪声库里的上一轮）
     dropped = 0

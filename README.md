@@ -564,3 +564,22 @@ fail-means: 文档说谎
 
 新增 `verify_accept`（list / add / clear），`verify_start` 的 schema 也带上了
 `stage / tier / accept / only_new / against / artifacts / review_md`。
+
+---
+
+## 噪声治理（v1.10）
+
+真实工作区（2240 文件 / 15 个子项目 / 51 条安全发现）跑出来的三个毛病，这一版修掉：
+
+| 毛病 | 之前 | 现在 |
+|---|---|---|
+| 备份目录重复扫 | `my-site.backup-*/` 与正本各报一遍 | **默认跳过**，notes 里说明 |
+| 同类问题铺满屏 | 「51 条高危发现」 | 「51 条 / **3 类**」+ 每类前 2 个位置 + 处理建议 |
+| 不知道噪声哪来的 | 「未回应 32 条」 | 「未回应来源：security 23、paths 5、imports 3、bom 1」 |
+| 工作区看不出该验谁 | 只给一个总判定 | **工作区画像**：每个子项目的文件数、有无测试入口、是否 git |
+
+```bash
+python verify_core.py <工作区>                        # 看画像 → 挑子项目
+python verify_core.py <工作区>/dsh-bili-whale          # 对单项目下结论
+python verify_core.py <项目> --artifacts-dir ../.vh   # 证据不落项目树
+```
