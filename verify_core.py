@@ -40,7 +40,7 @@ from pathlib import Path
 import check_specs as S
 import directions as DIR
 
-VERSION = "1.10.5"
+VERSION = "1.10.6"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -1372,6 +1372,35 @@ def _looks_like_tests(p: Path) -> bool:
     return bool(re.search(r"\b(?:test|it|describe)\s*\(\s*['\"`]", text))
 
 
+def _py_for(root: Path) -> str:
+    """跑 Python 测试用哪个解释器。
+
+    优先**项目自己的 venv**：很多项目的依赖只装在那儿，而且 ABI 可能和系统
+    Python 不同（实测：desktop-mcp 的 venv 是 3.12，系统是 3.14，用系统解释器
+    跑测试会 import 失败 → 全部用例被跳过 → 看着"绿"其实什么都没验）。
+    """
+    # ① 显式指定（环境变量）—— 用来对付「仓库里没有 venv，但本机有」的情况
+    env = os.environ.get("DSH_TEST_PYTHON")
+    if env and Path(env).is_file():
+        return env
+    # ② 项目根的 .verify-python 文件：一行路径，适合本机配置且可 .gitignore
+    ptr = root / ".verify-python"
+    if ptr.is_file():
+        try:
+            cand = ptr.read_text(encoding="utf-8", errors="ignore").strip().splitlines()[0].strip()
+            if cand and Path(cand).is_file():
+                return cand
+        except Exception:
+            pass
+    # ③ 项目自带的 venv
+    for rel in (("venv", "Scripts", "python.exe"), (".venv", "Scripts", "python.exe"),
+                ("venv", "bin", "python"), (".venv", "bin", "python")):
+        cand = root.joinpath(*rel)
+        if cand.is_file():
+            return str(cand)
+    return sys.executable
+
+
 def _detect_test_command(root: Path) -> tuple[list[str] | None, str, int]:
     pkg = root / "package.json"
     if pkg.exists():
@@ -1386,20 +1415,20 @@ def _detect_test_command(root: Path) -> tuple[list[str] | None, str, int]:
     if pyproj.exists():
         try:
             if "pytest" in pyproj.read_text(encoding="utf-8", errors="replace").lower():
-                return [sys.executable, "-m", "pytest", "-q"], "pytest", 300
+                return [_py_for(root), "-m", "pytest", "-q"], "pytest", 300
         except Exception:
             pass
     if (root / "pytest.ini").exists() or (root / "conftest.py").exists():
-        return [sys.executable, "-m", "pytest", "-q"], "pytest", 300
+        return [_py_for(root), "-m", "pytest", "-q"], "pytest", 300
     tests = root / "tests"
     if tests.is_dir():
         if any(tests.glob("*.py")):
-            return [sys.executable, "-m", "unittest", "discover", "-s", "tests"], \
+            return [_py_for(root), "-m", "unittest", "discover", "-s", "tests"], \
                 "tests/ 下的 unittest", 300
         if any(list(tests.glob("*.mjs")) + list(tests.glob("*.js"))):
             return ["node", "--test", "tests"], "tests/ 下的 node --test", 300
     if (root / "test").is_dir() and any((root / "test").glob("*.py")):
-        return [sys.executable, "-m", "unittest", "discover", "-s", "test"], \
+        return [_py_for(root), "-m", "unittest", "discover", "-s", "test"], \
             "test/ 下的 unittest", 300
 
     # 散落的测试文件：只在本项目和它的 tests/ 里找 ——
@@ -1457,6 +1486,31 @@ def _detect_test_command(root: Path) -> tuple[list[str] | None, str, int]:
                   "（scripts.test / pytest / tests/*.py / tests/*.mjs / *.test.js / test_*.py）"), 0
 
 
+def _test_counts(out: str) -> tuple[int, int]:
+    """从测试输出里抠出 (跑了几个用例, 跳过几个)。
+
+    unittest: "Ran 10 tests in 0.000s" + "OK (skipped=10)"
+    pytest:   "10 skipped in 0.02s" / "5 passed, 3 skipped"
+    """
+    ran = 0
+    m = re.search(r"^Ran (\d+) tests? in", out, re.M)
+    if m:
+        ran = int(m.group(1))
+    else:
+        m = re.search(r"(\d+) (?:passed|failed|skipped)", out)
+        if m:
+            ran = int(m.group(1))
+    skipped = 0
+    m = re.search(r"skipped=(\d+)", out)
+    if m:
+        skipped = int(m.group(1))
+    else:
+        m = re.search(r"(\d+) skipped", out)
+        if m:
+            skipped = int(m.group(1))
+    return ran, skipped
+
+
 def check_tests(root: Path, files: list[Path], ctx: "Ctx") -> Check:
     c = Check("tests", "测试：跑得起来，且真的通过")
     t0 = time.time()
@@ -1477,6 +1531,14 @@ def check_tests(root: Path, files: list[Path], ctx: "Ctx") -> Check:
         c.state, c.detail = "UNKNOWN", f"命令跑不起来：{why}"
     elif code == 124:
         c.state, c.detail = "UNKNOWN", f"超时：{why}"
+    elif code == 0 and _test_counts(out)[0] > 0 and _test_counts(out)[1] >= _test_counts(out)[0]:
+        # 全跳过 = 一个用例都没真跑（典型：解释器 ABI / 依赖不匹配 → import 失败被 skip）。
+        # 这种情况判 PASS 就是谎报 —— 它和「0 个用例」一样属于「测不了」。
+        ran, skipped = _test_counts(out)
+        c.state = "UNKNOWN"
+        c.detail = (f"{why}；退出码 0，但 {ran} 个用例里 {skipped} 个被跳过 —— "
+                    "没验到任何东西，多半是测试用的解释器或依赖与项目不匹配"
+                    "（例如 venv 是 3.12、系统 python 是 3.14）")
     elif code == 5 or "NO TESTS RAN" in out:
         # 识别到了入口，但一个用例都没收集到 —— 这是「测不了」，不是「测不过」。
         # 判成 FAIL 会把"模式没匹配上"说成"测试挂了"，属于谎报。
@@ -1520,7 +1582,12 @@ def check_imports(root: Path, files: list[Path], ctx: "Ctx") -> Check:
         except SyntaxError:
             continue                          # 语法错由 syntax 检查负责
         body = src
+        # 带 `# noqa` 的行不参与判定 —— 副作用导入（import _bootstrap）、
+        # 条件导入、公开再导出都用这个写法，标准 linter 也是这么处理的。
+        noqa_lines = {i for i, ln in enumerate(src.splitlines(), 1) if "# noqa" in ln}
         for node in ast.walk(tree):
+            if getattr(node, "lineno", 0) in noqa_lines:
+                continue
             names: list[tuple[str, int, str]] = []
             if isinstance(node, ast.Import):
                 for a in node.names:

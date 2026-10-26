@@ -1,3 +1,33 @@
+## [1.10.6] - 2026-10-27
+
+三条「别再谎报」的修复，都是拿真实项目验证时踩出来的。
+
+### Fixed — 全跳过的测试不再算 PASS
+- 现象：仓库测试在错误解释器下 import 失败 → 每个模块被 skip → 退出码 0 →
+  检查判 **PASS**。这是假绿，比 FAIL 更危险。
+- 现在：`Ran N tests` 且 `skipped >= N` → **UNKNOWN**，detail 写明「没验到任何东西，
+  多半是解释器或依赖不匹配」。
+- 部分跳过（skipped < ran）仍然 PASS —— 那是正常情况。
+
+### Added — 跑测试时可以指定解释器
+`_py_for()` 的优先级：
+```
+① DSH_TEST_PYTHON 环境变量
+② 项目根的 .verify-python 文件（一行路径，可 .gitignore）
+③ 项目自带的 venv / .venv
+④ sys.executable
+```
+理由：实测 desktop-mcp 的 venv 是 Python 3.12、系统 Python 是 3.14，
+用系统解释器跑测试会 import 失败（C 扩展 ABI 不匹配）。
+
+### Fixed — `# noqa` 的行不参与 import 检查
+副作用导入（`import _bootstrap  # noqa: F401`）以前被报成「未使用的 import」。
+现在带 `# noqa` 的行直接跳过，和标准 linter 一致。
+
+### Tests
+153 → **161**（新增 `tests/test_v1107_skipped_and_python.py` 8 项：全跳过/部分跳过/真失败、
+解释器优先级三档、noqa 正反例）。
+
 ## [1.10.5] - 2026-10-26
 
 最后一轮扫荡：修两个真误报 + 两个自己造成的版本/日志问题。
