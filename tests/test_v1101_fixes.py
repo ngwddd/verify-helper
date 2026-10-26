@@ -16,6 +16,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import _tmp  # noqa: F401  （统一回收临时目录）
 
 import lifecycle as LC  # noqa: E402
 import verify_core as V  # noqa: E402
@@ -30,7 +31,7 @@ def _mk(base: Path, files: dict[str, str]) -> None:
 
 class TestConsistentSubprojectCount(unittest.TestCase):
     def test_note_matches_profile(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="vh-cnt-"))
+        root = Path(_tmp.mkdtemp(prefix="vh-cnt-"))
         _mk(root, {
             "a/x.py": "print(1)\n",
             "b/y.py": "print(2)\n",
@@ -45,7 +46,7 @@ class TestConsistentSubprojectCount(unittest.TestCase):
 
 class TestDocHttpNotFlagged(unittest.TestCase):
     def test_doc_link_ignored_but_code_flagged(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="vh-http-"))
+        root = Path(_tmp.mkdtemp(prefix="vh-http-"))
         _mk(root, {
             "README.md": "参考 https://example.com 与 http://example.com/doc\n",
             "fetch.py": 'URL = "http://example.com/api"\n',
@@ -58,14 +59,14 @@ class TestDocHttpNotFlagged(unittest.TestCase):
 
 class TestAcceptFile(unittest.TestCase):
     def test_cli_accept_file_is_read(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="vh-af-"))
+        root = Path(_tmp.mkdtemp(prefix="vh-af-"))
         _mk(root, {"a.py": "import os\n"})          # imports 会给出低风险提示
         first = V.verify(str(root), checks=["imports"], use_cache=False, artifacts=False)
         un = ((first.get("lifecycle") or {}).get("accept") or {}).get("unresolved") or []
         self.assertTrue(un, "应当有一条未回应")
         fid = un[0]["id"]
 
-        af = Path(tempfile.mkdtemp(prefix="vh-afj-")) / "accept.json"
+        af = Path(_tmp.mkdtemp(prefix="vh-afj-")) / "accept.json"
         af.write_text(json.dumps({"accepted": [{"id": fid, "reason": "临时脚本，已知"}]},
                                  ensure_ascii=False), encoding="utf-8")
 
@@ -105,7 +106,7 @@ class TestLifecycleHotReload(unittest.TestCase):
 
 class TestBackupNote(unittest.TestCase):
     def test_note_when_backup_skipped(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="vh-note-"))
+        root = Path(_tmp.mkdtemp(prefix="vh-note-"))
         _mk(root, {
             "app.py": "print(1)\n",
             "old.backup-20260101/app.py": "print(2)\n",

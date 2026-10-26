@@ -40,7 +40,7 @@ from pathlib import Path
 import check_specs as S
 import directions as DIR
 
-VERSION = "1.10.6"
+VERSION = "1.10.7"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -208,6 +208,9 @@ class Check:
     # 和 findings 分开：findings 只装真问题，PASS 就不该有 findings。
     hints: list = field(default_factory=list)
     seconds: float = 0.0
+    # 证据文件（截图等）的临时目录。检查自己不做清理，交给 write_artifacts：
+    # 有 artifacts 就复制进去再删，没 artifacts 就直接删 —— 两头都不留垃圾。
+    evidence: dict | None = None
 
     def as_dict(self) -> dict:
         d = asdict(self)
@@ -1041,6 +1044,16 @@ def check_browser(root: Path, files: list[Path], ctx: "Ctx") -> Check:
             c.detail = f"探针没跑成（退出码 {code}）：{_tail(out, 200)}"
         else:
             data = json.loads(out_file.read_text(encoding="utf-8"))
+            # 截图现在会被 rmtree 掉（实测：报「截图 12 张」但 artifacts 里 0 张）。
+            # 先搬到独立的证据目录，再让 write_artifacts 决定「归档还是删除」。
+            try:
+                if shots.is_dir() and any(shots.iterdir()):
+                    ev = Path(tempfile.mkdtemp(prefix="vh-evidence-")) / "browser"
+                    shutil.move(str(shots), str(ev))
+                    c.evidence = {"dir": str(ev), "kind": "browser-screenshots",
+                                  "count": len(list(ev.glob("*.png")))}
+            except Exception:
+                pass
             findings = []
             for pg in data.get("pages", []):
                 rel = pg.get("rel", "?")

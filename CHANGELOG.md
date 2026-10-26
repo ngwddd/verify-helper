@@ -1,3 +1,32 @@
+## [1.10.7] - 2026-10-27
+
+两件事：**浏览器截图终于成了可复核的证据**，以及**跑测试不再往 %TEMP% 倒垃圾**。
+
+### Fixed — 浏览器截图不再被删掉
+以前 `finally: shutil.rmtree(tmp)` 把 12 张截图删了，而 `write_artifacts`
+又只写非 PASS 的检查 —— 结果「浏览器 0 处报错」只有一句结论，没有可视证据。
+现在：
+- 截图先搬到独立证据目录（`vh-evidence-*`）
+- `write_artifacts` **带证据的 PASS 检查也写**，截图复制进
+  `.verify-artifacts/<时间戳>/<check>-evidence/`，总结文件里附 `## evidence`
+- 归档后立刻删掉临时目录（`cleanup_evidence`），没开 artifacts 时直接删
+
+实测：工作区 20 个页面 → `browser-evidence/` 里 12 张 PNG + `browser.txt`。
+
+### Fixed — 临时目录不再累积
+根因：**测试自己**用 `tempfile.mkdtemp` 建临时项目却从不删除，
+一次全量测试就在 %TEMP% 留下 100+ 个 `vh-*`（实测 189 个）。
+- 新增 `tests/_tmp.py`：统一创建 + `atexit` 兜底删除，测试文件不用写 teardown
+- 11 个测试文件全部改用它
+- `lifecycle.sweep_temp_dirs()`：清理自己前缀（`vh-*`）的陈旧残留，
+  每次 `apply()` 自动跑；别的程序的目录一概不碰
+
+实测：一次全量测试后遗留 `vh-*` = **0**。
+
+### Tests
+161 → **167**（新增 `tests/test_v1107_evidence.py` 6 项：
+PASS 也留档 / 纯 PASS 仍跳过 / 临时目录清理 / 陈旧清理 / 新目录保留 / 别人目录不动）。
+
 ## [1.10.6] - 2026-10-27
 
 三条「别再谎报」的修复，都是拿真实项目验证时踩出来的。

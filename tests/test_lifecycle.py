@@ -21,12 +21,13 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import _tmp  # noqa: F401  （统一回收临时目录）
 
 import lifecycle as LC  # noqa: E402
 
 
 def _proj() -> Path:
-    d = Path(tempfile.mkdtemp())
+    d = Path(_tmp.mkdtemp())
     (d / "src").mkdir()
     (d / "src" / "app.py").write_text("print('hi')\n", encoding="utf-8")
     return d

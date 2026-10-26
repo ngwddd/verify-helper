@@ -17,6 +17,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import _tmp  # noqa: F401  （统一回收临时目录）
 
 import verify_core as V  # noqa: E402
 
@@ -73,7 +74,7 @@ def _detect(root):
 class TestDetection(unittest.TestCase):
     def test_subdir_tests_dir_is_used_as_start_dir(self) -> None:
         """tests/ 下有 test_*.py 时，应当 PASS（而不是在 root 收集 0 个）。"""
-        root = Path(tempfile.mkdtemp(prefix="vh-td-"))
+        root = Path(_tmp.mkdtemp(prefix="vh-td-"))
         _mk(root, {"tests/test_a.py": PASSING})
         c = _tests_check(root)
         self.assertEqual(c["state"], "PASS", f"应该是 PASS，实际 {c['state']}：{c.get('detail')}")
@@ -81,7 +82,7 @@ class TestDetection(unittest.TestCase):
 
     def test_no_tests_ran_is_unknown_not_fail(self) -> None:
         """有 test_*.py 但 0 个用例 → UNKNOWN（不能谎报失败）。"""
-        root = Path(tempfile.mkdtemp(prefix="vh-td-"))
+        root = Path(_tmp.mkdtemp(prefix="vh-td-"))
         _mk(root, {"test_empty.py": EMPTY})
         c = _tests_check(root)
         self.assertEqual(c["state"], "UNKNOWN", f"实际 {c['state']}：{c.get('detail')}")
@@ -91,7 +92,7 @@ class TestDetection(unittest.TestCase):
 
     def test_real_failure_stays_fail(self) -> None:
         """真有用例失败时仍然是 FAIL（别把这条修正用过头）。"""
-        root = Path(tempfile.mkdtemp(prefix="vh-td-"))
+        root = Path(_tmp.mkdtemp(prefix="vh-td-"))
         _mk(root, {"tests/test_a.py": FAILING})
         c = _tests_check(root)
         self.assertEqual(c["state"], "FAIL")
@@ -99,7 +100,7 @@ class TestDetection(unittest.TestCase):
 
     def test_script_named_test_is_not_entry(self) -> None:
         """`_foo_test.py` 这类探针脚本不该被当成测试入口（实测踩过）。"""
-        root = Path(tempfile.mkdtemp(prefix="vh-td-"))
+        root = Path(_tmp.mkdtemp(prefix="vh-td-"))
         _mk(root, {"_desktop_mcp_test.py": SCRIPT_NO_CASES})
         cmd, why, _ = _detect(root)
         self.assertIsNone(cmd, f"不该识别出入口，why={why}")
@@ -107,7 +108,7 @@ class TestDetection(unittest.TestCase):
 
     def test_star_test_pattern_is_used(self) -> None:
         """命中 `*_test.py` 时，命令里的 -p 必须是 `*_test.py`（否则等于没跑）。"""
-        root = Path(tempfile.mkdtemp(prefix="vh-td-"))
+        root = Path(_tmp.mkdtemp(prefix="vh-td-"))
         _mk(root, {"helpers_test.py": REAL_STAR_TEST})
         cmd, why, _ = _detect(root)
         self.assertIsNotNone(cmd, f"应识别出入口，why={why}")
@@ -116,7 +117,7 @@ class TestDetection(unittest.TestCase):
         self.assertEqual(c["state"], "PASS", f"实际 {c['state']}：{c.get('detail')}")
 
     def test_no_entry_is_unknown_not_applicable(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="vh-td-"))
+        root = Path(_tmp.mkdtemp(prefix="vh-td-"))
         _mk(root, {"app.py": "print(1)\n"})
         c = _tests_check(root)
         self.assertEqual(c["state"], "UNKNOWN")

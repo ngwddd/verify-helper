@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import _tmp  # noqa: F401  （统一回收临时目录）
 
 import lifecycle as LC  # noqa: E402
 import verify_core as V  # noqa: E402
@@ -39,7 +40,7 @@ class TestAggregation(unittest.TestCase):
         self.assertFalse(groups[1]["advice"], "只有 1 处不需要建议")
 
     def test_report_shape(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="vh-ag-"))
+        root = Path(_tmp.mkdtemp(prefix="vh-ag-"))
         _mk(root, {"bad.py": "import os\nos.system('ls')\n"})
         sec = LC.security_layer(root, {"checks": []})
         self.assertIn("groups", sec)
@@ -49,7 +50,7 @@ class TestAggregation(unittest.TestCase):
 
 class TestBackupSkip(unittest.TestCase):
     def test_backup_dir_not_scanned(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="vh-bk-"))
+        root = Path(_tmp.mkdtemp(prefix="vh-bk-"))
         _mk(root, {
             "app.py": "print('real')\n",
             "app.backup-20260101/app.py": "import os\nos.system('ls')\n",   # 备份里才有危险调用
@@ -68,7 +69,7 @@ class TestBackupSkip(unittest.TestCase):
 
 class TestWorkspaceProfile(unittest.TestCase):
     def test_lists_subprojects_and_tests(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="vh-ws-"))
+        root = Path(_tmp.mkdtemp(prefix="vh-ws-"))
         _mk(root, {
             "projA/app.py": "print(1)\n",
             "projB/tests/test_b.py": "import unittest\nclass T(unittest.TestCase):\n"
@@ -83,7 +84,7 @@ class TestWorkspaceProfile(unittest.TestCase):
         self.assertFalse(ws["projA"]["test_entry"])
 
     def test_single_project_has_no_profile(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="vh-ws1-"))
+        root = Path(_tmp.mkdtemp(prefix="vh-ws1-"))
         _mk(root, {"app.py": "print(1)\n"})
         rep = V.verify(str(root), checks=["todos"], use_cache=False)
         self.assertEqual(rep.get("workspace"), [], "单项目不该报工作区画像")
@@ -91,8 +92,8 @@ class TestWorkspaceProfile(unittest.TestCase):
 
 class TestArtifactsDir(unittest.TestCase):
     def test_custom_dir_used(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="vh-art-"))
-        out = Path(tempfile.mkdtemp(prefix="vh-art-out-"))
+        root = Path(_tmp.mkdtemp(prefix="vh-art-"))
+        out = Path(_tmp.mkdtemp(prefix="vh-art-out-"))
         _mk(root, {"a.py": "import os\n"})          # 触发 imports 提示 → 有非 PASS 项
         rep = V.verify(str(root), checks=["imports"], use_cache=False,
                        artifacts_dir=str(out))
@@ -104,7 +105,7 @@ class TestArtifactsDir(unittest.TestCase):
 
 class TestTierReasonInWorkspace(unittest.TestCase):
     def test_no_git_medium(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="vh-tier-"))
+        root = Path(_tmp.mkdtemp(prefix="vh-tier-"))
         _mk(root, {"a.py": "print(1)\n"})
         rep = V.verify(str(root), checks=["todos"], use_cache=False)
         tier = (rep.get("lifecycle") or {}).get("tier") or {}

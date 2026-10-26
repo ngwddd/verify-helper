@@ -14,12 +14,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+import _tmp  # noqa: F401  （统一回收临时目录）
 
 import verify_core as V          # noqa: E402
 
 
 def proj(toml_text: str | None) -> Path:
-    d = Path(tempfile.mkdtemp(prefix="vh-flow-"))
+    d = Path(_tmp.mkdtemp(prefix="vh-flow-"))
     (d / "index.html").write_text(
         '<html lang="zh"><head><title>t</title></head><body><h1>x</h1></body></html>',
         encoding="utf-8")

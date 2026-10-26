@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+import _tmp  # noqa: F401  （统一回收临时目录）
 
 import check_specs as S          # noqa: E402
 import verify_core as V          # noqa: E402
@@ -80,7 +81,7 @@ class TestVerdicts(unittest.TestCase):
 
     def test_unknown_is_not_pass(self):
         import tempfile
-        empty = Path(tempfile.mkdtemp(prefix="vh-empty-"))
+        empty = Path(_tmp.mkdtemp(prefix="vh-empty-"))
         try:
             rep = V.verify(str(empty), use_cache=False)
             self.assertEqual(rep["verdict"], "UNKNOWN")
@@ -112,7 +113,7 @@ class TestVerdicts(unittest.TestCase):
     def test_nonblocking_failure_renders_as_warning(self):
         """低风险项不通过时用 ⚠ 而不是 ✗ —— 它不影响判定，不该长得像失败。"""
         import tempfile
-        d = Path(tempfile.mkdtemp(prefix="vh-warn-"))
+        d = Path(_tmp.mkdtemp(prefix="vh-warn-"))
         try:
             (d / "a.py").write_text(f'X = r"C:\\Users\\{Path.home().name}\\x"\n', encoding="utf-8")
             text = V.render(V.verify(str(d), checks=["paths"], use_cache=False))

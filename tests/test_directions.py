@@ -10,6 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+import _tmp  # noqa: F401  （统一回收临时目录）
 
 import directions as DIR      # noqa: E402
 import verify_core as V       # noqa: E402
@@ -129,7 +130,7 @@ class TestGate(unittest.TestCase):
 
 class TestIntegration(unittest.TestCase):
     def _fixture(self):
-        d = Path(tempfile.mkdtemp(prefix="vh-dir-"))
+        d = Path(_tmp.mkdtemp(prefix="vh-dir-"))
         (d / "index.html").write_text(
             '<!doctype html>\n<html lang="zh"><head><title>t</title></head>\n'
             '<body><h1>标题</h1><a href="nope.html">死链</a></body></html>\n',
@@ -163,7 +164,7 @@ class TestIntegration(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
     def test_pass_has_no_extra_field(self):
-        d = Path(tempfile.mkdtemp(prefix="vh-dir-ok-"))
+        d = Path(_tmp.mkdtemp(prefix="vh-dir-ok-"))
         try:
             (d / "a.py").write_text("x = 1\n", encoding="utf-8")
             rep = V.verify(str(d), checks=["syntax"], use_cache=False)

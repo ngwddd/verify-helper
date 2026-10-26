@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+import _tmp  # noqa: F401  （统一回收临时目录）
 
 import check_specs as S          # noqa: E402
 import verify_core as V          # noqa: E402
@@ -68,7 +69,7 @@ class TestFailOn(unittest.TestCase):
 class TestDeployBase(unittest.TestCase):
     def test_detect_base_from_absolute_links(self):
         import tempfile
-        d = Path(tempfile.mkdtemp(prefix="vh-base-"))
+        d = Path(_tmp.mkdtemp(prefix="vh-base-"))
         try:
             (d / "index.html").write_text(
                 '<html lang="zh"><head><title>t</title></head><body>'
@@ -82,7 +83,7 @@ class TestDeployBase(unittest.TestCase):
 
     def test_no_base_when_relative(self):
         import tempfile
-        d = Path(tempfile.mkdtemp(prefix="vh-nobase-"))
+        d = Path(_tmp.mkdtemp(prefix="vh-nobase-"))
         try:
             (d / "index.html").write_text(
                 '<html lang="zh"><body><a href="a.html">a</a></body></html>', encoding="utf-8")

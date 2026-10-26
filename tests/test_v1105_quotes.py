@@ -19,6 +19,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import _tmp  # noqa: F401  （统一回收临时目录）
 
 import lifecycle as LC  # noqa: E402
 
@@ -37,21 +38,21 @@ def _labels(root: Path) -> list[str]:
 
 class TestQuotedPatterns(unittest.TestCase):
     def test_pattern_strings_not_flagged(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="vh-q1-"))
+        root = Path(_tmp.mkdtemp(prefix="vh-q1-"))
         _mk(root, {"t.py": 'BAD = ("os.system(", "eval(", "exec(")\n'})
         labels = _labels(root)
         self.assertFalse([x for x in labels if "系统" in x or "eval" in x or "exec" in x],
                          f"字符串里的模式不该被报：{labels}")
 
     def test_real_calls_still_flagged(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="vh-q2-"))
+        root = Path(_tmp.mkdtemp(prefix="vh-q2-"))
         _mk(root, {"t.py": "import os\nos.system('ls')\nprint(eval('1+1'))\n"})
         labels = _labels(root)
         self.assertTrue(any("os.system" in x for x in labels), labels)
         self.assertTrue(any("eval" in x for x in labels), labels)
 
     def test_single_quote_and_backtick_too(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="vh-q3-"))
+        root = Path(_tmp.mkdtemp(prefix="vh-q3-"))
         _mk(root, {"t.mjs": "const pats = ['eval(', `exec(`];\n"})
         labels = _labels(root)
         self.assertFalse([x for x in labels if "eval" in x or "exec" in x], labels)

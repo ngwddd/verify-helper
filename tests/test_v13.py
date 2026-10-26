@@ -10,6 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+import _tmp  # noqa: F401  （统一回收临时目录）
 
 import verify_core as V          # noqa: E402
 from tests import fixture        # noqa: E402
@@ -68,7 +69,7 @@ class TestBaseline(unittest.TestCase):
 
 class TestMutation(unittest.TestCase):
     def _weak_project(self) -> Path:
-        d = Path(tempfile.mkdtemp(prefix="vh-mut-"))
+        d = Path(_tmp.mkdtemp(prefix="vh-mut-"))
         (d / "tests").mkdir()
         (d / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
         (d / "tests" / "test_calc.py").write_text(

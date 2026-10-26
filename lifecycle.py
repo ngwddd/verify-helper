@@ -39,6 +39,7 @@ import json
 import os
 import re
 import subprocess
+import shutil
 import time
 from pathlib import Path
 
@@ -216,7 +217,9 @@ def write_artifacts(report: dict, root: Path, keep: int = 20,
     written: list[str] = []
     try:
         for c in report.get("checks", []):
-            if c.get("state") == "PASS":
+            # PASS 通常不写证据（省地方），但**带证据文件的不行** ——
+            # 否则「浏览器 0 处报错」只有一句结论，没有可视证据可复核。
+            if c.get("state") == "PASS" and not c.get("evidence"):
                 continue
             body = ["# " + c.get("id", "?"), "state: " + str(c.get("state")),
                     "risk: " + str(c.get("risk")), "command: " + str(c.get("command") or "-"),
@@ -228,6 +231,17 @@ def write_artifacts(report: dict, root: Path, keep: int = 20,
             for f in (c.get("findings") or [])[:40]:
                 body.append("- " + json.dumps(f, ensure_ascii=False)[:800])
             base.mkdir(parents=True, exist_ok=True)
+            ev = c.get("evidence") or {}
+            if ev.get("dir"):
+                src_dir = Path(ev["dir"])
+                if src_dir.is_dir():
+                    dst = base / f"{c.get('id', 'check')}-evidence"
+                    dst.mkdir(parents=True, exist_ok=True)
+                    for f in sorted(src_dir.iterdir()):
+                        if f.is_file():
+                            shutil.copy2(f, dst / f.name)
+                    body += ["## evidence",
+                             f"{len(list(dst.iterdir()))} 个文件 → {dst}", ""]
             p = base / f"{c.get('id', 'check')}.txt"
             p.write_text("\n".join(body), encoding="utf-8")
             written.append(str(p))
@@ -704,6 +718,9 @@ def apply(report: dict, root: Path, opts: dict | None = None) -> dict:
     reg = apply_regression(report, regression_rules(root), root)
     arts = (write_artifacts(report, root, out_dir=opts.get("artifacts_dir"))
             if opts.get("artifacts", True) else {"written": []})
+    # 证据临时目录：归档完就该消失；没开 artifacts 时直接删，别留在 %TEMP%
+    cleanup_evidence(report)
+    temp_sweep = sweep_temp_dirs()
 
     # only_new：只留新出现的 finding（基于噪声库里的上一轮）
     dropped = 0
@@ -841,3 +858,51 @@ def apply_review(report: dict, review: dict) -> dict:
             keep.append(f)
         c["findings"] = keep[: rules.get("max_nits") or 10] if c.get("risk") == "low" else keep
     return {"dropped": skipped, "no_evidence": no_evidence}
+
+
+def cleanup_evidence(report: dict) -> dict:
+    """删掉检查留下的证据临时目录（write_artifacts 已经复制过了）。"""
+    removed = []
+    for c in report.get("checks", []):
+        d = (c.get("evidence") or {}).get("dir")
+        if not d:
+            continue
+        p = Path(d)
+        parent = p.parent
+        try:
+            shutil.rmtree(p, ignore_errors=True)
+            if parent.name.startswith("vh-evidence-"):
+                shutil.rmtree(parent, ignore_errors=True)
+            removed.append(str(p))
+        except Exception:
+            continue
+    return {"removed": removed}
+
+
+def sweep_temp_dirs(max_age_hours: float = 6.0) -> dict:
+    """清掉本工具在系统临时目录里留下的东西（例如上次崩掉的残留）。
+
+    只认自己的前缀：vh-browser-* / vh-evidence-*；别的程序的东西一概不碰。
+    """
+    import tempfile as _tf
+    cutoff = time.time() - max_age_hours * 3600
+    removed, freed = [], 0
+    try:
+        base = Path(_tf.gettempdir())
+        for d in base.iterdir():
+            # 所有 vh-* 都是本工具（含自带测试）建的：检查、证据、流程、自检套件
+            # 用的都是这个前缀。别的程序的东西一概不碰。
+            if not d.is_dir() or not d.name.startswith("vh-"):
+                continue
+            try:
+                if d.stat().st_mtime > cutoff:
+                    continue
+                size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+                shutil.rmtree(d, ignore_errors=True)
+                removed.append(d.name)
+                freed += size
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return {"removed": removed, "freed_bytes": freed}

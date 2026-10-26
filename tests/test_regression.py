@@ -21,6 +21,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+import _tmp  # noqa: F401  （统一回收临时目录）
 
 import verify_core as V          # noqa: E402
 
@@ -30,7 +31,7 @@ def by_id(rep: dict) -> dict:
 
 
 def mkproj(files: dict[str, str], prefix: str = "vh-reg-") -> Path:
-    d = Path(tempfile.mkdtemp(prefix=prefix))
+    d = Path(_tmp.mkdtemp(prefix=prefix))
     for rel, content in files.items():
         p = d / rel
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -322,7 +323,7 @@ class TestIdempotent(unittest.TestCase):
         符合性测试里发现的：很多人会顺手写 severity（各 linter 的惯例不同），
         旧代码只认 risk，于是「看起来配了 high，实际还是 medium、不阻断」。
         """
-        d = Path(tempfile.mkdtemp(prefix="vh-cf-sev-"))
+        d = Path(_tmp.mkdtemp(prefix="vh-cf-sev-"))
         try:
             (d / "a.py").write_text("print('x')\n", encoding="utf-8")
             (d / "verify.toml").write_text(
@@ -343,7 +344,7 @@ class TestIdempotent(unittest.TestCase):
         自检时发现的：工具把自己的 UI 标签（`"TODO 统计"`）当成待办数了进去。
         业界惯例（flake8-todo 等）也只认注释。
         """
-        d = Path(tempfile.mkdtemp(prefix="vh-todo-"))
+        d = Path(_tmp.mkdtemp(prefix="vh-todo-"))
         try:
             (d / "a.py").write_text(
                 'LABEL = "TODO 统计"\n'          # 字符串：不算
