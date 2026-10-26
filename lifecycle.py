@@ -42,7 +42,7 @@ import subprocess
 import time
 from pathlib import Path
 
-VERSION = "1.10.3"
+VERSION = "1.10.4"
 
 # ───────────────────────────── ① 分层 ─────────────────────────────
 # 层不是「跑哪几项」这么简单，每层有它该拦的东西和该放的东西。

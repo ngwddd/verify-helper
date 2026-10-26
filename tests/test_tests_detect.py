@@ -85,7 +85,9 @@ class TestDetection(unittest.TestCase):
         _mk(root, {"test_empty.py": EMPTY})
         c = _tests_check(root)
         self.assertEqual(c["state"], "UNKNOWN", f"实际 {c['state']}：{c.get('detail')}")
-        self.assertIn("0 个用例", c.get("detail") or "")
+        # v1.10.3 起：没有用例的文件在**探测阶段**就被排除，detail 会说「没有用例」；
+        # 更早的版本靠跑出来「收集到 0 个用例」。两种都必须判 UNKNOWN。
+        self.assertIn("用例", c.get("detail") or "")
 
     def test_real_failure_stays_fail(self) -> None:
         """真有用例失败时仍然是 FAIL（别把这条修正用过头）。"""
