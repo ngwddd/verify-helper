@@ -42,7 +42,7 @@ import subprocess
 import time
 from pathlib import Path
 
-VERSION = "1.10.0"
+VERSION = "1.10.1"
 
 # ───────────────────────────── ① 分层 ─────────────────────────────
 # 层不是「跑哪几项」这么简单，每层有它该拦的东西和该放的东西。
@@ -470,15 +470,18 @@ def apply_regression(report: dict, rules: dict, root: Path) -> dict:
 
 
 # ─────────────────── ⑨ 安全层（独立、可阻塞、不可接受）───────────────────
+# (正则, 说明, 风险, 作用域) —— 作用域 code 表示「只在代码里算」，
+# 文档（.md/.txt/.rst）里的 http 链接是**参考资料**，不是请求，报它纯属噪声。
 DANGEROUS_PATTERNS = [
-    (r"subprocess\.(?:run|Popen|call)\([^)]*shell\s*=\s*True", "subprocess 使用 shell=True", "high"),
-    (r"(?<![\w.])eval\s*\(", "使用 eval()", "high"),
-    (r"(?<![\w.])exec\s*\(", "使用 exec()", "high"),
-    (r"os\.system\s*\(", "使用 os.system()", "high"),
-    (r"http://(?!127\.0\.0\.1|localhost)", "明文 http:// 外链", "medium"),
-    (r"verify\s*=\s*False", "requests 关闭了 TLS 校验", "high"),
-    (r"--insecure|ssl\s*=\s*False|CERT_NONE", "关闭 TLS 校验", "high"),
+    (r"subprocess\.(?:run|Popen|call)\([^)]*shell\s*=\s*True", "subprocess 使用 shell=True", "high", "any"),
+    (r"(?<![\w.])eval\s*\(", "使用 eval()", "high", "code"),
+    (r"(?<![\w.])exec\s*\(", "使用 exec()", "high", "code"),
+    (r"os\.system\s*\(", "使用 os.system()", "high", "code"),
+    (r"http://(?!127\.0\.0\.1|localhost)", "明文 http:// 外链（代码里）", "medium", "code"),
+    (r"verify\s*=\s*False", "requests 关闭了 TLS 校验", "high", "code"),
+    (r"--insecure|ssl\s*=\s*False|CERT_NONE", "关闭 TLS 校验", "high", "any"),
 ]
+DOC_EXT = {".md", ".markdown", ".txt", ".rst", ".adoc"}
 STYLE_CHECKS = {"a11y"}          # 只这些算"风格"，受 no-style 影响
 SEC_CODE_EXT = {".py", ".js", ".mjs", ".cjs", ".ts", ".sh", ".ps1", ".yml", ".yaml", ".toml"}
 
@@ -531,7 +534,10 @@ def security_layer(root: Path, report: dict, max_files: int = 4000,
         except Exception:
             continue
         scanned += 1
-        for pat, label, risk in DANGEROUS_PATTERNS:
+        is_doc = p.suffix.lower() in DOC_EXT
+        for pat, label, risk, scope in DANGEROUS_PATTERNS:
+            if scope == "code" and is_doc:
+                continue
             for m in re.finditer(pat, text):
                 line = text.count("\n", 0, m.start()) + 1
                 findings.append({

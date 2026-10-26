@@ -40,7 +40,7 @@ from pathlib import Path
 import check_specs as S
 import directions as DIR
 
-VERSION = "1.10.0"
+VERSION = "1.10.1"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -1900,7 +1900,10 @@ def verify(project: str, checks: list[str] | None = None,
         git_info["dirty"] = len([x for x in out.splitlines() if x.strip()]) if code == 0 else None
 
     notes = []
-    ws = _count_subprojects(root)
+    # 口径统一：用画像（含文件的目录）而不是另一套启发式 ——
+    # 之前正文说"识别到 10 个"，画像却列 15 个，自相矛盾。
+    ws_profile = _workspace_profile(root, files)
+    ws = len(ws_profile)
     if ws >= 3:
         notes.append(
             f"这看起来是**工作区**（识别到 {ws} 个子项目）。工具不会替你挑项目，"
@@ -1937,7 +1940,7 @@ def verify(project: str, checks: list[str] | None = None,
         notes.append("默认跳过备份目录：" + "、".join(sorted(set(_SKIPPED_BACKUPS))[:5])
                      + "（与正本重名，重复报同一问题）")
 
-    profile = _workspace_profile(root, files)
+    profile = ws_profile
     if len(profile) >= 2:
         with_tests = [r["path"] for r in profile if r["test_entry"]]
         notes.append(
@@ -1966,10 +1969,7 @@ def verify(project: str, checks: list[str] | None = None,
                "checks": len(selected)},
     ).as_dict()
 
-    try:
-        _report["workspace"] = _workspace_profile(root, files)
-    except Exception:
-        _report["workspace"] = []
+    _report["workspace"] = ws_profile
 
     # v1.9：生命周期后处理（分层 / tier / 接受 / 噪声 / 收敛 / 回归 / 安全 / 度量）
     try:
@@ -2266,7 +2266,7 @@ def _workspace_profile(root: Path, files: list[Path]) -> list[dict]:
     return rows
 
 
-def _count_subprojects(root: Path) -> int:
+def _count_subprojects(root: Path) -> int:      # 旧口径，保留给外部调用；内部已改用画像
     """数一下子目录里有几个像「独立项目」——用来看这是不是工作区。"""
     markers = ("package.json", "pyproject.toml", "index.html", "Cargo.toml",
                "go.mod", "setup.py", ".git")
@@ -2363,6 +2363,18 @@ def main_cli(argv=None):
         if fid.strip() and reason.strip():
             accepts.append({"id": fid.strip(), "reason": reason.strip(),
                             "at": time.strftime("%Y-%m-%d")})
+
+    # 从 --accept-file 读一批「已接受」（长期豁免放文件里，命令行只做临时接受）
+    if a.accept_file:
+        try:
+            import json as _json
+            data = _json.loads(Path(a.accept_file).read_text(encoding="utf-8"))
+            rows = data.get("accepted") if isinstance(data, dict) else data
+            for e in rows or []:
+                if isinstance(e, dict) and e.get("id") and e.get("reason"):
+                    accepts.append(e)
+        except Exception as _e:
+            print(f"（--accept-file 读失败：{_e}）", file=sys.stderr)
 
     # 接受记录落盘：写下就是「我回答过了」，可审计、可入库
     if accepts:
