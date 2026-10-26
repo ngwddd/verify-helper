@@ -9,12 +9,16 @@
 
 既是一个命令行工具，也是一个 MCP 服务器（agent 可以直接调用）。
 
+当前版本 **v1.10.7**（以 `verify_core.py` 的 `VERSION` 为准）；检查项数量以
+`python verify_core.py --list-checks` 的输出为准。
+
 ---
 
 ## 为什么做这个
 
 Agent 的自验经常很水：跑个构建看到「成功」就宣称完成，但页面点了没反应、链接 404、
-测试里根本没断言。有研究统计过 20,574 个真实编码会话，**22.58% 的失败来自「把没验证的状态说成已完成」**。
+测试里根本没断言。有研究统计了 20,574 个真实编码会话（1,639 个仓库）：**22.58% 的错位
+案例属于「不准确自我汇报」** —— 把还没做成的事说成做完了（[arXiv:2605.29442](https://arxiv.org/abs/2605.29442)）。
 
 这个工具把「完成」的判定从模型的自我叙述里拿出来，交给可复核的输出：
 
@@ -31,14 +35,15 @@ python verify_core.py /path/to/project
 # 列出全部检查项
 python verify_core.py --list-checks
 
-# 快速模式：只跳过「测试」与「变异」（运行时和浏览器照跑）
+# 快速模式：跳过「测试 / 变异 / 交互」三项（HTTP 与浏览器照跑）
 python verify_core.py /path/to/project --fast
 
 # 输出 SARIF（给 GitHub Code Scanning 用）
 python verify_core.py /path/to/project --sarif out.sarif
 ```
 
-退出码：`0 = PASS`，`1 = FAIL / UNKNOWN / 参数错误`。
+退出码：`0 = PASS`，`1 = FAIL / UNKNOWN`，`2 = 参数错误`（argparse 的默认值）。
+`--fail-on <等级>` 能把该等级的提示也算失败（默认 `high`）。
 
 ### 作为 MCP 服务器
 
@@ -72,7 +77,7 @@ Windows 示例：
 {
   "mcpServers": {
     "verify-helper": {
-      "command": "C:\\Program Files\\Python314\\python.exe",
+      "command": "C:\\Python312\\python.exe",
       "args": ["C:\\Users\\you\\verify-helper\\server.py"],
       "env": { "PYTHONIOENCODING": "utf-8" }
     }
@@ -100,16 +105,17 @@ Windows 示例：
 #### 装好了怎么确认
 
 ```bash
-python verify_core.py --list-checks     # 应列出 16 项检查
+python verify_core.py --list-checks     # 应列出 17 项检查（默认跑 15 项；mutation / git 需显式打开）
 ```
 
-客户端里应该出现三个工具：
+客户端里应该出现四个工具：
 
 | 工具 | 作用 |
 |---|---|
-| `verify_start(path, checks?, fast?, format?)` | 跑一遍验证，`format` 可选 `text` / `json` / `sarif` |
+| `verify_start(path, checks?, fast?, format?, stage?, tier?, accept?, …)` | 跑一遍验证，`format` 可选 `text` / `json` / `sarif`；生命周期参数见「分层闸门」 |
 | `verify_report(run_id?)` | 取回完整报告，默认最近一次 |
 | `verify_checks()` | 列出全部检查项、风险等级、修复建议 |
+| `verify_accept(action, path, id?, reason?)` | 管理接受记录：`list` / `add` / `clear`，`add` 必须写理由 |
 
 FAIL 时返回 `isError: true` —— 调用方不会被「静默通过」骗过去。
 
@@ -150,7 +156,7 @@ FAIL 时返回 `isError: true` —— 调用方不会被「静默通过」骗过
 | `html` | 高 | ✅ | 标签必须配平（无孤立闭合、无未闭合），同一页面 id 不得重复。 | 补齐缺失的闭合标签；重复 id 改名并同步修改引用它的锚点。 |
 | `secrets` | 严重 | ✅ | 源码与配置里不得出现真实凭据（API key、token、私钥、明文密码）。 | 立即吊销该凭据并改用环境变量；已提交历史也需清理。 |
 | `encoding` | 高 | ✅ | 文本文件必须是合法 UTF-8（UTF-16 与 GBK 会被 Windows 工具链悄悄弄坏）。 | 转存为 UTF-8（无 BOM）；批量转换时注意先备份。 |
-| `tests` | 高 | ✅ | 项目自带的测试套件必须真的跑起来并通过（以退出码为准）。 | 先修失败的用例；没有测试入口的话，至少补一个冒烟测试。 |
+| `tests` | 高 | ✅ | 项目自带的测试套件必须真的跑起来并通过（以退出码为准）。 | 先修失败的用例。判定「有没有测试入口」的顺序：package.json 的 scripts.test → pytest 配置或用例 → tests/ 或 test/ 目录 → 根目录 test_*.py。都没有就记 UNKNOWN；补一个冒烟测试，比假装验过强。 |
 | `runtime-web` | 高 | ✅ | 静态站点的每个页面通过 HTTP 请求都必须返回 200（大小写、路径层级只有这一层能验出来）。 | 核对文件实际路径与链接大小写；确认站点根目录正确。 |
 | `browser` | 高 | ✅ | 用真实浏览器打开每个页面，抓 JS 未捕获异常、console.error 与资源 404（需要本机装有 playwright）。 | 按报错栈修脚本；资源 404 通常是路径或大小写写错。 |
 | `interaction` | 高 | ✅ | 按 verify.toml 的 [[flows]] 真的去点、填、选，再断言结果；未捕获异常一律算失败（需要 playwright）。 | 修失败的那一步：选择器写错就改选择器，点了没反应就查脚本。 |
@@ -190,6 +196,9 @@ UNKNOWN 没跑 / 跑不了 / 判不了 —— 永远不许当 PASS
 
 这条规则的理论依据是测试领域的 **oracle 问题**：没有判定标准，跑再多遍也证明不了正确。
 
+v1.10.6 起还有一条写死的细则：`tests` 里出现 `Ran N tests` 且 `skipped ≥ N`（所有用例
+都被跳过）→ **UNKNOWN**，不是 PASS —— 退出码 0 只说明「没报错」，不说明「验到了」。
+
 ---
 
 ## 基线差分：这次比上次多了什么
@@ -221,13 +230,13 @@ python verify_core.py . --checks mutation
 ```
 
 ```
-✗ 变异门（中·不阻断） — 试了 1 个变异，被杀 0，存活 1
+⚠ 变异门（中·仅提示） — 试了 1 个变异，被杀 0，存活 1
     · calc.py:2 把 + 改成 - 后测试仍然通过 —— 这行没有有效断言
 ```
 
 规则：
 
-- **只打 git diff 的行**，最多 5 个变异，每个 90 秒超时 —— 全量变异在小项目上也跑不动；
+- **优先只打 git 改动行**（没有改动信息时退化为全文件扫描），最多 5 个变异，每个 90 秒超时 —— 全量变异在小项目上也跑不动；
 - 改完**立刻还原**源文件（`finally` 里还原，测试崩了也不会留坏代码）；
 - 默认不跑（不在默认检查集里），要显式 `--checks mutation`；
 - 没测试入口就记 UNKNOWN，不假装验过。
@@ -239,7 +248,7 @@ python verify_core.py . --checks mutation
 报告里不只有「哪儿错了」，还有方向：
 
 ```
-× 链接与锚点【高】 — 死链 1
+✗ 链接与锚点【高】 — 死链 1
     · notes/papers.html:205 死链：advising-rules.js
       方向：站点里没有 advising-rules.js 这个文件，但这一行在引用它 → 把这一行的引用改成
             真实存在的文件；如果文件名是构建时改掉的，改构建脚本，别改生成出来的页面
@@ -312,7 +321,7 @@ python verify_core.py . --checks interaction
 ✗ 交互测试【高】 — 1 条流程，通过 0，失败 1
     · 故意写错选择器:2 「故意写错选择器」第 2 步 点击 #btnAtarTYPO 失败：
       page.click: Timeout 10000ms exceeded.
-  证据在 C:\...\vh-flow-fqatw16p（失败截图留在里面）
+  证据在 %TEMP%\vh-flow-fqatw16p（失败截图留在里面）
 ```
 
 **动作**：`goto` / `click` / `fill` / `select` / `press` / `wait` / `expect`（每步一个）
@@ -394,9 +403,13 @@ python verify_core.py . --sarif verify.sarif
 
 | 项目规模 | 检查项 | 耗时 |
 |---|---|---|
-| 53 个文件 | 14 项 | 0.66s |
-| 1,868 个文件 | 14 项 | 1.85s |
-| 11,470 个文件 | 14 项 | **4.8s** |
+| 53 个文件 | 15 项 | 0.03s |
+| 1,868 个文件 | 15 项 | 0.7s |
+| 11,470 个文件 | 15 项 | **6.1s** |
+
+> 本机实测（Windows / Python 3.14 / 纯 `.py` 语料，磁盘缓存已热）。表里是报告内的「总耗时」，
+> 不含解释器启动；同一份 11,470 文件的语料第一次跑（冷盘）约 12s。换成 HTML/JS/CSS 混合的
+> 真实站点，单位成本会不一样。
 
 做到这一点的四件事：
 
@@ -435,19 +448,21 @@ python verify_core.py . --sarif verify.sarif
 
 ## 局限（说清楚，不掩饰）
 
-- **没有浏览器层**：`runtime-web` 只验 HTTP 200，抓不到 JS 报错、点击无反应、渲染错位。这是下一版（v1.2）的事。
-- **没有变异测试**：只跑现有测试，不判断测试本身够不够强。
-- **没有基线**：不做「这次比上次多了什么」的差分。
+- **浏览器层要自己备环境**：`browser` / `interaction` 需要本机有 `node` + `playwright`，没有就记 UNKNOWN，不假装验过。
+- **变异门范围很窄**：只支持 Python；最多 5 个变异，每个 90 秒超时；默认不跑，要 `--checks mutation`。
 - **JS 语法检查单次上限 120 个文件**，超出会如实写「另有 N 个未检查」，不假装查过。
 - **站点根绝对路径**（`/xxx`）离线不校验，只在报告里标注。
+- **测试解释器要对上**：Python 测试优先用项目自带 venv，也可以用 `DSH_TEST_PYTHON` 或项目根的
+  `.verify-python` 指定；解释器不对会整批跳过 —— 那记 UNKNOWN，不算 PASS。
+- **只做机械检查**：没有语义理解，也没有 LLM 评审；判断不了的一律 UNKNOWN。
 
 ---
 
 ## 开发
 
 ```bash
-python -m unittest discover -s tests -v     # 102 个单元测试
-python conformance.py                       # 48 项符合性测试（喂整个项目进去）
+python -m unittest discover -s tests -v     # 167 个单元测试
+python conformance.py                       # 48 项符合性断言（32 个项目夹具 + 输出契约）
 python verify_core.py . --fast              # 自己检查自己
 ```
 
@@ -480,7 +495,7 @@ MIT
 
 ## 分层闸门（v1.9）
 
-v1.9 之前，它是一次性跑 15 项、给一个 PASS/FAIL/UNKNOWN。
+v1.9 之前，它只是一次性跑完默认那批检查、给一个 PASS/FAIL/UNKNOWN。
 现在多了**生命周期语义**：这一轮属于哪层、这次改动多危险、哪些问题被谁回应了。
 
 ### 1. 分层：`--stage`
@@ -488,8 +503,8 @@ v1.9 之前，它是一次性跑 15 项、给一个 PASS/FAIL/UNKNOWN。
 | 层 | 该拦什么 | 跑哪些检查 |
 |---|---|---|
 | `precommit` | 秒级反馈，挂 git hook | syntax / encoding / bom / secrets / imports / paths / todos / custom |
-| `pr` | 完整静态 + 运行时 | 默认全部 |
-| `merge` | 与目标分支组合后全量再跑 | 默认全部（配 `--against main`） |
+| `pr` | 完整静态 + 运行时 | 默认 15 项（不含 mutation / git） |
+| `merge` | 与目标分支组合后全量再跑 | 默认 15 项（不含 mutation / git；配 `--against main`） |
 | `postdeploy` | 只验线上行为 | runtime-web / browser / interaction / tests |
 
 ```bash
@@ -538,9 +553,9 @@ why = "曾经少个括号，整站白屏"
 
 ### 7. 证据留档
 
-失败/未知项的**命令、退出码、原始输出、findings** 落到
-`.verify-artifacts/<时间戳>/`（只保留最近 20 次）。
-报告里给目录与文件数 —— 下一个人不用重跑，也不用相信"我看过了"。
+失败 / 未知项的**命令、退出码、原始输出、findings** 落到
+`.verify-artifacts/<时间戳>/`（只保留最近 20 次）；带证据文件的 PASS 项（比如浏览器截图）
+也一起留档。报告里给目录与文件数 —— 下一个人不用重跑，也不用相信"我看过了"。
 
 ### 8. REVIEW.md
 
@@ -551,7 +566,7 @@ skip: drafts/**, legacy/**
 no-style: true          # 只关 a11y 这类纯风格项
 require-evidence: true  # 没有 file:line 的 finding 直接丢
 max-nits: 2
-fail-means: 文档说谎
+security-skip: vendor/**  # 安全层豁免（比逐条接受干净）
 ```
 
 ### 9. 度量

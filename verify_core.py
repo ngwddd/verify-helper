@@ -155,7 +155,7 @@ LOCAL_PATH_PATTERNS = [
 ]
 
 # 当前这台机器的主人是谁 —— 用来把「你的路径」和「别人资料里的路径」分开。
-# 注意：Windows 账号名不一定等于用户目录名（这台机器账号 ngwddd、目录 ggg），
+# 注意：Windows 账号名不一定等于用户目录名（两者可能不同），
 # 所以两个都收，任一命中就算本人。
 _CURRENT_USERS = {
     x.lower() for x in (
