@@ -1,0 +1,90 @@
+# -*- coding: utf-8 -*-
+"""tests 检查的判定边界（v1.9.1 回归测试）。
+
+守三条真实踩过的坑：
+  1. 测试在 `root/tests/` 时，命令必须带 `-s tests`。
+     否则 discover 用默认 start dir（=root）→ 收集 0 个 → 退出码 5 → **假 FAIL**。
+     （实测现场：工作区根目录 62 个 .py、0 个 test_*.py，却被判"测试失败"）
+  2. 收集到 0 个用例（退出码 5 / "NO TESTS RAN"）是「测不了」，必须记 UNKNOWN，
+     不能记 FAIL —— FAIL 意味着"用例跑了但没过"。
+  3. 真有用例失败时，仍然是 FAIL，并带出失败用例名。
+"""
+from __future__ import annotations
+
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import verify_core as V  # noqa: E402
+
+
+def _mk(root: Path, files: dict[str, str]) -> None:
+    for rel, body in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body, encoding="utf-8")
+
+
+def _tests_check(root: Path):
+    rep = V.verify(str(root), checks=["tests"], use_cache=False)
+    return next(c for c in rep["checks"] if c["id"] == "tests")
+
+
+PASSING = """
+import unittest
+class T(unittest.TestCase):
+    def test_ok(self):
+        self.assertTrue(True)
+"""
+
+FAILING = """
+import unittest
+class T(unittest.TestCase):
+    def test_bad(self):
+        self.assertEqual(1, 2)
+"""
+
+EMPTY = """
+# 有文件，但没有用例
+X = 1
+"""
+
+
+class TestDetection(unittest.TestCase):
+    def test_subdir_tests_dir_is_used_as_start_dir(self) -> None:
+        """tests/ 下有 test_*.py 时，应当 PASS（而不是在 root 收集 0 个）。"""
+        root = Path(tempfile.mkdtemp(prefix="vh-td-"))
+        _mk(root, {"tests/test_a.py": PASSING})
+        c = _tests_check(root)
+        self.assertEqual(c["state"], "PASS", f"应该是 PASS，实际 {c['state']}：{c.get('detail')}")
+        self.assertIn("tests", c.get("command") or "", "命令里必须带 -s tests")
+
+    def test_no_tests_ran_is_unknown_not_fail(self) -> None:
+        """有 test_*.py 但 0 个用例 → UNKNOWN（不能谎报失败）。"""
+        root = Path(tempfile.mkdtemp(prefix="vh-td-"))
+        _mk(root, {"test_empty.py": EMPTY})
+        c = _tests_check(root)
+        self.assertEqual(c["state"], "UNKNOWN", f"实际 {c['state']}：{c.get('detail')}")
+        self.assertIn("0 个用例", c.get("detail") or "")
+
+    def test_real_failure_stays_fail(self) -> None:
+        """真有用例失败时仍然是 FAIL（别把这条修正用过头）。"""
+        root = Path(tempfile.mkdtemp(prefix="vh-td-"))
+        _mk(root, {"tests/test_a.py": FAILING})
+        c = _tests_check(root)
+        self.assertEqual(c["state"], "FAIL")
+        self.assertEqual(c.get("exit_code"), 1)
+
+    def test_no_entry_is_unknown_not_applicable(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="vh-td-"))
+        _mk(root, {"app.py": "print(1)\n"})
+        c = _tests_check(root)
+        self.assertEqual(c["state"], "UNKNOWN")
+        self.assertFalse(c.get("applicable", True))
+
+
+if __name__ == "__main__":
+    unittest.main()

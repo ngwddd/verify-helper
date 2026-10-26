@@ -40,7 +40,7 @@ from pathlib import Path
 import check_specs as S
 import directions as DIR
 
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -1395,9 +1395,23 @@ def _detect_test_command(root: Path) -> tuple[list[str] | None, str, int]:
         return ["node", "--test"], "node --test 自动发现 *.test.*", 300
     if _has(["*.test.ts", "*.spec.ts"], dirs):
         return ["npx", "vitest", "run"], "vitest（TypeScript 测试）", 420
-    if _has(["test_*.py", "*_test.py"], [root] + ([root / "tests"] if (root / "tests").is_dir() else [])):
-        return [sys.executable, "-m", "unittest", "discover", "-p", "test_*.py"], \
-            "根目录下的 test_*.py", 300
+    # 散落的 test_*.py：必须记清是**哪个目录**命中的 ——
+    # 命中 root/tests 却用默认 start dir（=root）去 discover，会收集 0 个用例，
+    # 得到一个假的 FAIL（实测：工作区根目录 62 个 py、0 个 test_*.py，退出码 5）。
+    probe_dirs = [root] + ([root / "tests"] if (root / "tests").is_dir() else [])
+    for d in probe_dirs:
+        for pat in ("test_*.py", "*_test.py"):
+            try:
+                if next(d.glob(pat), None) is None:
+                    continue
+            except OSError:
+                continue
+            if d == root:
+                return ([sys.executable, "-m", "unittest", "discover", "-p", "test_*.py"],
+                        "根目录下的 test_*.py", 300)
+            rel = d.name
+            return ([sys.executable, "-m", "unittest", "discover", "-s", rel, "-p", "test_*.py"],
+                    f"{rel}/ 下的 test_*.py", 300)
 
     return None, ("没有识别到测试入口"
                   "（scripts.test / pytest / tests/*.py / tests/*.mjs / *.test.js / test_*.py）"), 0
@@ -1423,6 +1437,12 @@ def check_tests(root: Path, files: list[Path], ctx: "Ctx") -> Check:
         c.state, c.detail = "UNKNOWN", f"命令跑不起来：{why}"
     elif code == 124:
         c.state, c.detail = "UNKNOWN", f"超时：{why}"
+    elif code == 5 or "NO TESTS RAN" in out:
+        # 识别到了入口，但一个用例都没收集到 —— 这是「测不了」，不是「测不过」。
+        # 判成 FAIL 会把"模式没匹配上"说成"测试挂了"，属于谎报。
+        c.state = "UNKNOWN"
+        c.detail = (f"{why}；但收集到 0 个用例（退出码 {code}）—— "
+                    "多半是匹配模式或目录不对，不是用例失败。")
     else:
         c.state = "PASS" if code == 0 else "FAIL"
         c.detail = f"{why}；退出码 {code}"
