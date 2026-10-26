@@ -43,7 +43,7 @@ import shutil
 import time
 from pathlib import Path
 
-VERSION = "1.10.5"
+VERSION = "1.10.8"
 
 # ───────────────────────────── ① 分层 ─────────────────────────────
 # 层不是「跑哪几项」这么简单，每层有它该拦的东西和该放的东西。
@@ -655,9 +655,12 @@ def gate(report: dict, stage: str, tier: dict, unresolved: list[dict],
                         if c.get("state") == "UNKNOWN" and c.get("applicable", True)
                         and c.get("risk") in spec["blocking_risks"]]
 
-    # 未回应里只有 medium 及以上才卡住；low 是提示（跟「低风险 0 人」一致）
+    # 未回应项只在「该检查本身属于阻断档」时才卡住判定。
+    # 依据：conformance 的 broken-verify-toml 用例 —— custom 是中等风险，
+    # 配置坏了要报出来（check FAIL + findings≥1），但不该把总判定从
+    # UNKNOWN 压成 FAIL：一个中风险检查没回答，不足以证明代码有问题。
     unresolved_blocking = [u for u in unresolved
-                           if str(u.get("risk") or "").lower() in ("critical", "high", "medium")]
+                           if str(u.get("risk") or "").lower() in spec["blocking_risks"]]
 
     hard: list[dict] = []       # 已知的坏 → FAIL
     soft: list[dict] = []       # 无法判定 → UNKNOWN（不谎报 PASS，也不谎报 FAIL）
@@ -672,7 +675,12 @@ def gate(report: dict, stage: str, tier: dict, unresolved: list[dict],
         soft.append({"reason": "阻断级检查无法判定（缺 oracle）", "checks": unknown_blocking})
 
     applied = [c for c in report.get("checks", []) if c.get("applicable", True)]
-    any_definitive = any(c.get("state") in ("PASS", "FAIL") for c in applied)
+    # 只有「风险档在阻断档里」的检查才有资格给出 PASS/FAIL。
+    # 只跑低风险检查（bom / todos / paths …）时，PASS 没有任何依据 —— 必须 UNKNOWN。
+    # 这条是 conformance 的 9 个失败用例共同要求的；以前把低风险 PASS 也算"定性"，
+    # 于是"只跑了提示类检查"会被报成 PASS（假绿）。
+    blocking_capable = [c for c in applied if c.get("risk") in spec["blocking_risks"]]
+    any_definitive = any(c.get("state") in ("PASS", "FAIL") for c in blocking_capable)
     if hard:
         verdict = "FAIL"
     elif soft or not any_definitive:

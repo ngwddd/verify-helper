@@ -9,7 +9,7 @@
 
 既是一个命令行工具，也是一个 MCP 服务器（agent 可以直接调用）。
 
-当前版本 **v1.10.7**（以 `verify_core.py` 的 `VERSION` 为准）；检查项数量以
+当前版本 **v1.10.8**（以 `verify_core.py` 的 `VERSION` 为准）；检查项数量以
 `python verify_core.py --list-checks` 的输出为准。
 
 ---
@@ -43,7 +43,7 @@ python verify_core.py /path/to/project --sarif out.sarif
 ```
 
 退出码：`0 = PASS`，`1 = FAIL / UNKNOWN`，`2 = 参数错误`（argparse 的默认值）。
-`--fail-on <等级>` 能把该等级的提示也算失败（默认 `high`）。
+`--fail-on <等级>` 决定哪个风险等级起算失败（默认 `high`）。
 
 ### 作为 MCP 服务器
 

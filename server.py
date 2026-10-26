@@ -72,7 +72,7 @@ TOOLS = [
                     "items": {"type": "string",
                               "enum": ["syntax", "links", "html", "secrets", "encoding",
                                        "tests", "runtime-web", "browser", "a11y", "bom",
-                                       "paths", "imports", "todos", "custom", "git"]},
+                                       "paths", "imports", "todos", "custom", "git", "interaction", "mutation"]},
                     "description": "只跑指定的检查；省略表示跑默认全部（不含 git）",
                 },
                 "include_git": {"type": "boolean",
