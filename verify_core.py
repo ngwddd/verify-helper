@@ -40,7 +40,7 @@ from pathlib import Path
 import check_specs as S
 import directions as DIR
 
-VERSION = "1.10.1"
+VERSION = "1.10.2"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -1793,6 +1793,41 @@ ORDER = [s.id for s in S.SPECS if s.id in CHECKS]
 # ──────────────────────────────────────────────────────────────────────
 # 入口
 # ──────────────────────────────────────────────────────────────────────
+def _disk_lifecycle_version() -> str:
+    """从磁盘读出 lifecycle.py 声明的版本号（不 import，纯文本）。"""
+    try:
+        src = Path(__file__).with_name("lifecycle.py").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+    m = re.search(r'^VERSION\s*=\s*"([^"]+)"', src, re.M)
+    return m.group(1) if m else ""
+
+
+def _ensure_lifecycle() -> None:
+    """磁盘上的 lifecycle 版本与内存里不一致就 reload。
+
+    为什么用版本号而不是 mtime：
+    第一次实现用「导入时记 mtime、变了再 reload」，结果首调用只记了基线、
+    之后文件没再变 → **永远不 reload**（和 _CORE_MTIME 那次踩的是同一个坑）。
+    版本号比对是幂等的：只要不一致就 reload 一次，一致就什么都不做。
+    """
+    disk = _disk_lifecycle_version()
+    if not disk:
+        return
+    mod = sys.modules.get("lifecycle")
+    if mod is not None and getattr(mod, "VERSION", "") == disk:
+        return
+    try:
+        import importlib
+        if mod is None:
+            import lifecycle as mod          # noqa: F401
+        else:
+            importlib.reload(mod)
+        print(f"[reload] lifecycle → v{getattr(mod, 'VERSION', '?')}", file=sys.stderr)
+    except Exception:
+        pass
+
+
 def verify(project: str, checks: list[str] | None = None,
            include_git: bool = False, fast: bool = False,
            use_cache: bool = True, workers: int = 8,
@@ -1805,6 +1840,7 @@ def verify(project: str, checks: list[str] | None = None,
     stage / tier / accepts / only_new / artifacts / review_md / against
     是 v1.9 的生命周期参数，交给 lifecycle.py 做后处理（见该模块文档）。
     """
+    _ensure_lifecycle()
     root = Path(project).expanduser().resolve()
     if not root.is_dir():
         return {"error": f"不是目录：{root}", "verdict": "UNKNOWN"}
@@ -2026,8 +2062,13 @@ def render(report: dict) -> str:
                              (("：" + "、".join(b.get("checks") or [])) if b.get("checks") else ""))
         if sec.get("count"):
             groups = sec.get("groups") or []
-            lines.append(f"    安全层：{sec['count']} 条 / {len(groups)} 类"
-                         + ("（有阻塞项）" if sec.get("blocked") else ""))
+            if groups:
+                lines.append(f"    安全层：{sec['count']} 条 / {len(groups)} 类"
+                             + ("（有阻塞项）" if sec.get("blocked") else ""))
+            else:
+                # 没有分组信息 = 跑的是旧 lifecycle 模块，别显示成「0 类」误导人
+                lines.append(f"    安全层：{sec['count']} 条（分类信息缺失：lifecycle 模块未更新）"
+                             + ("（有阻塞项）" if sec.get("blocked") else ""))
             for g in groups[:4]:
                 lines.append(f"      · {g['count']}× {g['message']} —— "
                              + "、".join(g.get("files", [])[:2])

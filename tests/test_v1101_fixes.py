@@ -78,6 +78,31 @@ class TestAcceptFile(unittest.TestCase):
                         "accept-file 里的条目应当被合并进 .verify-accept.json")
 
 
+class TestLifecycleHotReload(unittest.TestCase):
+    def test_lifecycle_version_mismatch_reloads(self) -> None:
+        """内存里的 lifecycle 版本与磁盘不一致时，必须 reload（否则 MCP 悄悄跑旧逻辑）。"""
+        import sys as _sys
+        mod = _sys.modules.get("lifecycle")
+        self.assertIsNotNone(mod, "lifecycle 应已导入")
+        disk = V._disk_lifecycle_version()
+        self.assertTrue(disk)
+        original = mod.VERSION
+        try:
+            mod.VERSION = "0.0.0-ancient"
+            V._ensure_lifecycle()
+            self.assertEqual(mod.VERSION, disk, "应当 reload 回磁盘版本")
+        finally:
+            if mod.VERSION != original:
+                mod.VERSION = original
+
+    def test_same_version_is_noop(self) -> None:
+        import sys as _sys
+        mod = _sys.modules["lifecycle"]
+        before = id(mod)
+        V._ensure_lifecycle()
+        self.assertEqual(id(mod), before, "版本一致时不该重建模块")
+
+
 class TestBackupNote(unittest.TestCase):
     def test_note_when_backup_skipped(self) -> None:
         root = Path(tempfile.mkdtemp(prefix="vh-note-"))

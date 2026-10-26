@@ -267,7 +267,10 @@ HANDLERS = {
 # 而重启要靠改 profile 的配置（还不一定触发 respawn）。改成每次调用前
 # 比一下 mtime，变了就 reload —— 开发循环从此不用碰进程。
 # ──────────────────────────────────────────────────────────────────────
-_DEPS = ("check_specs.py", "directions.py", "sarif.py", "verify_core.py")
+# 依赖在前，使用者在后。lifecycle 是 v1.9 起 verify_core 的新依赖 ——
+# 漏了它会出现「内核已更新、但安全层还是旧逻辑」（实测：MCP 报 51 条 / 0 类，
+# 命令行报 48 条 / 3 类）。
+_DEPS = ("lifecycle.py", "check_specs.py", "directions.py", "sarif.py", "verify_core.py")
 
 
 def _stamp() -> int:
