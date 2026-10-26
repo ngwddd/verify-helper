@@ -1355,6 +1355,23 @@ def check_todos(root: Path, files: list[Path], ctx: "Ctx") -> Check:
 # ──────────────────────────────────────────────────────────────────────
 # 7. 测试
 # ──────────────────────────────────────────────────────────────────────
+def _looks_like_tests(p: Path) -> bool:
+    """文件里真的有测试吗？
+
+    为什么需要：`*_test.py` 会匹配到 `_desktop_mcp_test.py` 这类**探针脚本**
+    （里面一个用例都没有，但有 import 副作用）。把它们当测试入口，
+    跑 unittest 只会得到 "NO TESTS RAN"，而且可能执行到脚本里的代码。
+    """
+    try:
+        text = p.read_text(encoding="utf-8", errors="ignore")[:120_000]
+    except OSError:
+        return False
+    if p.suffix == ".py":
+        return bool(re.search(r"^\s*class\s+\w+\s*\(\s*(unittest\.)?TestCase", text, re.M)
+                    or re.search(r"^\s*def\s+test_\w+\s*\(", text, re.M))
+    return bool(re.search(r"\b(?:test|it|describe)\s*\(\s*['\"`]", text))
+
+
 def _detect_test_command(root: Path) -> tuple[list[str] | None, str, int]:
     pkg = root / "package.json"
     if pkg.exists():
@@ -1409,19 +1426,32 @@ def _detect_test_command(root: Path) -> tuple[list[str] | None, str, int]:
     # 命中 root/tests 却用默认 start dir（=root）去 discover，会收集 0 个用例，
     # 得到一个假的 FAIL（实测：工作区根目录 62 个 py、0 个 test_*.py，退出码 5）。
     probe_dirs = [root] + ([root / "tests"] if (root / "tests").is_dir() else [])
+    suspects: list[str] = []
     for d in probe_dirs:
         for pat in ("test_*.py", "*_test.py"):
             try:
-                if next(d.glob(pat), None) is None:
-                    continue
+                hits = [p for p in d.glob(pat) if p.is_file()]
             except OSError:
                 continue
-            if d == root:
-                return ([sys.executable, "-m", "unittest", "discover", "-p", "test_*.py"],
-                        "根目录下的 test_*.py", 300)
-            rel = d.name
-            return ([sys.executable, "-m", "unittest", "discover", "-s", rel, "-p", "test_*.py"],
-                    f"{rel}/ 下的 test_*.py", 300)
+            if not hits:
+                continue
+            real = [p for p in hits if _looks_like_tests(p)]
+            if not real:
+                suspects += [f"{d.name}/{p.name}" if d != root else p.name for p in hits[:3]]
+                continue
+            cmd = [sys.executable, "-m", "unittest", "discover"]
+            if d != root:
+                cmd += ["-s", d.name]
+            # 关键：把**真正命中的模式**带进去。
+            # 之前一律 -p test_*.py，于是 `*_test.py` 命中的文件根本没被跑。
+            cmd += ["-p", pat]
+            where = "根目录" if d == root else f"{d.name}/"
+            return cmd, f"{where}下 {pat}（{len(real)} 个文件含用例）", 300
+
+    if suspects:
+        return None, ("找到疑似测试文件但里面没有用例："
+                      + "、".join(suspects[:4])
+                      + "（是脚本的话改个名，或补上 TestCase）"), 0
 
     return None, ("没有识别到测试入口"
                   "（scripts.test / pytest / tests/*.py / tests/*.mjs / *.test.js / test_*.py）"), 0

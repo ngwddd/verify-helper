@@ -53,6 +53,23 @@ X = 1
 """
 
 
+SCRIPT_NO_CASES = """
+import sys
+print("hi")   # 探针脚本，名字像测试但没有用例
+"""
+
+REAL_STAR_TEST = """
+import unittest
+class T(unittest.TestCase):
+    def test_ok(self):
+        self.assertTrue(True)
+"""
+
+
+def _detect(root):
+    return V._detect_test_command(root)
+
+
 class TestDetection(unittest.TestCase):
     def test_subdir_tests_dir_is_used_as_start_dir(self) -> None:
         """tests/ 下有 test_*.py 时，应当 PASS（而不是在 root 收集 0 个）。"""
@@ -77,6 +94,24 @@ class TestDetection(unittest.TestCase):
         c = _tests_check(root)
         self.assertEqual(c["state"], "FAIL")
         self.assertEqual(c.get("exit_code"), 1)
+
+    def test_script_named_test_is_not_entry(self) -> None:
+        """`_foo_test.py` 这类探针脚本不该被当成测试入口（实测踩过）。"""
+        root = Path(tempfile.mkdtemp(prefix="vh-td-"))
+        _mk(root, {"_desktop_mcp_test.py": SCRIPT_NO_CASES})
+        cmd, why, _ = _detect(root)
+        self.assertIsNone(cmd, f"不该识别出入口，why={why}")
+        self.assertIn("没有用例", why)
+
+    def test_star_test_pattern_is_used(self) -> None:
+        """命中 `*_test.py` 时，命令里的 -p 必须是 `*_test.py`（否则等于没跑）。"""
+        root = Path(tempfile.mkdtemp(prefix="vh-td-"))
+        _mk(root, {"helpers_test.py": REAL_STAR_TEST})
+        cmd, why, _ = _detect(root)
+        self.assertIsNotNone(cmd, f"应识别出入口，why={why}")
+        self.assertIn("*_test.py", cmd, f"命令应为 {cmd}")
+        c = _tests_check(root)
+        self.assertEqual(c["state"], "PASS", f"实际 {c['state']}：{c.get('detail')}")
 
     def test_no_entry_is_unknown_not_applicable(self) -> None:
         root = Path(tempfile.mkdtemp(prefix="vh-td-"))
