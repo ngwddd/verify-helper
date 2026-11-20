@@ -64,11 +64,10 @@ class TestMcp(unittest.IsolatedAsyncioTestCase):
                     return report
                 await asyncio.sleep(0.05)
 
-    def stdio(self, *, trusted=False):
+    def stdio(self):
         return StdioServerParameters(command=sys.executable,
                                      args=[str(SERVER), "--workspace", str(self.root),
-                                           "--evidence-dir", str(self.evidence),
-                                           *(["--trust-project-code"] if trusted else [])])
+                                           "--evidence-dir", str(self.evidence)])
 
     async def test_legacy_stdio(self):
         _, version = await self.call(self.stdio(), "legacy")
@@ -80,7 +79,7 @@ class TestMcp(unittest.IsolatedAsyncioTestCase):
         test = slow / "test_wait.py"
         test.write_text("import time, unittest\nclass T(unittest.TestCase):\n"
                         "    def test_wait(self): time.sleep(90)\n", encoding="utf-8")
-        async with Client(self.stdio(trusted=True)) as client:
+        async with Client(self.stdio()) as client:
             started = await client.call_tool("verify_run_full", {"path": "slow"})
             run_id = started.structured_content["run_id"]
             cancel = await client.call_tool("verify_cancel", {"run_id": run_id})
@@ -88,7 +87,7 @@ class TestMcp(unittest.IsolatedAsyncioTestCase):
             result = await self.wait_for_report(client, run_id)
             self.assertEqual(result["status"], "CANCELLED")
             self.assertFalse(result["releasable"])
-        async with Client(self.stdio(trusted=True)) as client:
+        async with Client(self.stdio()) as client:
             result = await self.wait_for_report(client, run_id)
             self.assertEqual(result["status"], "CANCELLED")
 
@@ -127,7 +126,8 @@ class TestMcp(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(bad_origin.status_code, 403)
                     http, version = await self.call(streamable_http_client(url, http_client=httpx), "auto")
                     self.assertEqual(version, "2026-07-28")
-                    self.assertEqual(stdio["snapshot_sha256"], http["snapshot_sha256"])
+                    self.assertNotIn("snapshot_sha256", stdio)
+                    self.assertNotIn("snapshot_sha256", http)
                     self.assertEqual(stdio["plan"], http["plan"])
                     legacy, version = await self.call(streamable_http_client(url, http_client=httpx), "legacy")
                     self.assertEqual(version, "2025-11-25")

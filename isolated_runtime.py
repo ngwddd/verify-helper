@@ -12,10 +12,12 @@ import tempfile
 import time
 import uuid
 from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
 
 
 IMAGE_VARIABLE = "VERIFY_HELPER_SANDBOX_IMAGE"
+TIME_VARIABLE = "VERIFY_HELPER_SANDBOX_TIMEOUT_SECONDS"
 IMAGE_ID = re.compile(r"sha256:[a-f0-9]{64}")
 PATH = "/usr/local/bin:/usr/bin:/bin"
 SOCKET = "/var/run/docker.sock"
@@ -37,6 +39,7 @@ class BoundaryUnavailable(ValueError):
 class ObservedRun:
     exit_code: int
     engine_version: str
+    time_limit: int
 
 
 def _stage(root: Path, archive) -> None:
@@ -88,20 +91,16 @@ def _check_container(container: dict, image: str) -> str:
     return identity
 
 
-def run_isolated(root: Path, scope: Path, command: list[str], image: str, cancelled) -> ObservedRun:
-    """Return a coarse, daemon-observed exit result without retaining guest output."""
+@contextmanager
+def _local_docker(image: str):
     if sys.platform != "linux" or not IMAGE_ID.fullmatch(image):
         raise BoundaryUnavailable("Isolated execution requires Linux and a local image ID")
-    if scope.is_absolute() or ".." in scope.parts:
-        raise BoundaryUnavailable("Isolated command scope must stay within the snapshot")
     if not stat.S_ISSOCK(Path(SOCKET).stat().st_mode):
         raise BoundaryUnavailable("The local Docker socket is unavailable")
     docker = Path("/usr/bin/docker")
     if not docker.is_file():
         docker = Path("/usr/local/bin/docker")
-    name = "vh-isolated-" + uuid.uuid4().hex
-    with tempfile.TemporaryDirectory(prefix="vh-docker-") as config, tempfile.TemporaryFile() as archive:
-        _stage(root, archive)
+    with tempfile.TemporaryDirectory(prefix="vh-docker-") as config:
         env = {"PATH": PATH, "HOME": config, "LC_ALL": "C"}
         base = [str(docker), "--host", f"unix://{SOCKET}", "--config", config]
 
@@ -124,6 +123,29 @@ def run_isolated(root: Path, scope: Path, command: list[str], image: str, cancel
         metadata, = inspect("image", "inspect", image)
         if metadata["Id"] != image or metadata["Config"].get("Volumes"):
             raise BoundaryUnavailable("The configured image is unsuitable for isolation")
+        yield base, env, config, invoke, inspect, version.group(1)
+
+
+def provider_available(image: str | None) -> bool:
+    if not image:
+        return False
+    try:
+        with _local_docker(image):
+            return True
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        return False
+
+
+def run_isolated(root: Path, scope: Path, command: list[str], image: str, cancelled) -> ObservedRun:
+    """Return a coarse, daemon-observed exit result without retaining guest output."""
+    if scope.is_absolute() or ".." in scope.parts:
+        raise BoundaryUnavailable("Isolated command scope must stay within the snapshot")
+    time_limit = int(os.environ.get(TIME_VARIABLE, "60"))
+    if not 5 <= time_limit <= 180:
+        raise BoundaryUnavailable("Isolated execution time limit is outside the permitted range")
+    name = "vh-isolated-" + uuid.uuid4().hex
+    with _local_docker(image) as (base, env, config, invoke, inspect, version), tempfile.TemporaryFile() as archive:
+        _stage(root, archive)
         if cancelled():
             raise BoundaryUnavailable("Isolated execution was cancelled")
         identity = name
@@ -135,14 +157,14 @@ def run_isolated(root: Path, scope: Path, command: list[str], image: str, cancel
                    "--no-healthcheck", "--runtime=runc", "--tmpfs", WORKSPACE, "--tmpfs", TEMP,
                    "--workdir", "/workspace", "--entrypoint=/usr/bin/env", image,
                    "-i", f"PATH={PATH}", "HOME=/tmp", "TMPDIR=/tmp", "LC_ALL=C.UTF-8",
-                   "PYTHONDONTWRITEBYTECODE=1", "/usr/bin/timeout", "--kill-after=2", "20",
+                   "PYTHONDONTWRITEBYTECODE=1", "/usr/bin/timeout", "--kill-after=2", str(time_limit),
                    "/bin/sh", "-c", ENTRY, "verify-helper", scope.as_posix(), *command)
             container, = inspect("container", "inspect", name)
             identity = _check_container(container, image)
             with subprocess.Popen([*base, "start", "--attach", "--interactive", identity],
                                   cwd=config, env=env, stdin=archive, stdout=subprocess.DEVNULL,
                                   stderr=subprocess.DEVNULL) as process:
-                deadline = time.monotonic() + 25
+                deadline = time.monotonic() + time_limit + 5
                 while process.poll() is None:
                     if cancelled() or time.monotonic() >= deadline:
                         process.kill()
@@ -152,7 +174,7 @@ def run_isolated(root: Path, scope: Path, command: list[str], image: str, cancel
             code = state["ExitCode"]
             if state["Status"] != "exited" or state["OOMKilled"] or process.returncode != code or code not in (0, 1):
                 raise BoundaryUnavailable("The isolated command did not complete normally")
-            return ObservedRun(code, version.group(1))
+            return ObservedRun(code, version, time_limit)
         finally:
             removed = invoke("container", "rm", "--force", "--volumes", identity, check=False)
             if removed.returncode:

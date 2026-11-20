@@ -2,6 +2,7 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ from unittest.mock import patch
 
 from full_verify import full_verify
 from isolated_runtime import IMAGE_VARIABLE, BoundaryUnavailable, run_isolated
+from private_storage import require_private
 from report_export import mcp_report
 from run_evidence import digest, json_bytes, read_evidence
 
@@ -33,7 +35,7 @@ class TestProtectedVerification(unittest.TestCase):
             f"    def test_run(self): Path({str(witness)!r}).touch()\n", encoding="utf-8")
         (self.source / ".env.fixture").write_text("synthetic private input", encoding="utf-8")
         with patch.dict(os.environ, {IMAGE_VARIABLE: "invalid-image"}):
-            report = self.run_protected(trusted=True)
+            report = self.run_protected()
         self.assertFalse(witness.exists())
         self.assertEqual(report["verdict"], "UNKNOWN")
         self.assertFalse(report["releasable"])
@@ -76,7 +78,7 @@ class TestProtectedVerification(unittest.TestCase):
             f"from pathlib import Path\nPath({str(witness)!r}).touch()\n", encoding="utf-8")
         with patch.dict(os.environ):
             os.environ.pop(IMAGE_VARIABLE, None)
-            report = self.run_protected(trusted=True, sealed=True)
+            report = self.run_protected(sealed=True)
         self.assertFalse(witness.exists())
         self.assertEqual(report["verdict"], "UNKNOWN")
 
@@ -137,8 +139,54 @@ class TestProtectedVerification(unittest.TestCase):
             '[verification]\nnetwork = "unrestricted"\nsandbox = "off"\n', encoding="utf-8")
         (self.source / "test_app.py").write_text("import unittest\n", encoding="utf-8")
         with patch.dict(os.environ, {IMAGE_VARIABLE: "invalid-image"}):
-            report = self.run_protected(trusted=True)
+            report = self.run_protected()
         rows = {row["id"]: row for row in report["checks"]}
         self.assertEqual(rows["configuration"]["state"], "FAIL")
         self.assertEqual(rows["tests"]["state"], "UNKNOWN")
+        self.assertFalse(report["releasable"])
+
+    def test_project_ignore_cannot_hide_bad_source_or_test(self):
+        (self.source / ".verifyignore").write_text("hidden.py\ntest_hidden.py\n", encoding="utf-8")
+        (self.source / "hidden.py").write_text("value = @\n", encoding="utf-8")
+        (self.source / "test_hidden.py").write_text("import unittest\n", encoding="utf-8")
+        report = self.run_protected()
+        self.assertEqual(report["verdict"], "FAIL")
+        rows = {row["id"]: row for row in report["checks"]}
+        self.assertIn("tests", report["plan"])
+        self.assertEqual(rows["syntax"]["findings"][0]["line"], 1)
+        self.assertNotIn("hidden.py", json.dumps(report))
+
+    def test_evidence_permissions_under_open_umask(self):
+        (self.source / "app.py").write_text("answer = 42\n", encoding="utf-8")
+        mask = os.umask(0)
+        try:
+            report = self.run_protected()
+        finally:
+            os.umask(mask)
+        run = self.output / report["run_id"]
+        require_private(run, directory=True)
+        for entry in run.iterdir():
+            require_private(entry)
+            if os.name != "nt":
+                self.assertEqual(entry.stat().st_mode & 0o777, 0o600)
+
+    def test_legacy_cli_switch_is_rejected_without_executing(self):
+        witness = self.base / "host-witness"
+        (self.source / "test_app.py").write_text(
+            f"from pathlib import Path\nPath({str(witness)!r}).touch()\n", encoding="utf-8")
+        cli = [sys.executable, str(Path(__file__).resolve().parents[1] / "full_verify.py")]
+        rejected = subprocess.run([*cli, "run", str(self.source), "--trust-project-code"],
+                                  capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("unrecognized arguments", rejected.stderr)
+        self.assertFalse(witness.exists())
+        report = self.run_protected()
+        self.assertFalse(witness.exists())
+        self.assertFalse(report["releasable"])
+
+    def test_unsafe_success_is_not_releasable(self):
+        (self.source / "README.md").write_text("Developer fixture.\n", encoding="utf-8")
+        report = self.run_protected(unsafe_local=True)
+        self.assertEqual(report["verdict"], "PASS")
+        self.assertEqual(report["mode"], "unsafe-local")
         self.assertFalse(report["releasable"])

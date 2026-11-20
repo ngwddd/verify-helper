@@ -23,7 +23,8 @@ from mcp.types import ToolAnnotations
 from starlette.responses import Response
 
 from full_verify import _evidence_root, full_verify
-from isolated_runtime import IMAGE_VARIABLE
+from isolated_runtime import IMAGE_VARIABLE, provider_available
+from private_storage import private_directory, require_private
 from report_export import mcp_report
 from run_evidence import json_bytes, read_evidence
 from verify_core import VERSION
@@ -49,7 +50,7 @@ class StrictServer(MCPServer):
 class RunStore:
     def __init__(self, root: Path):
         self.root = _evidence_root(root)
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        private_directory(self.root, exist_ok=True)
         self.key = self._load_key()
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         self.lock = threading.Lock()
@@ -65,8 +66,7 @@ class RunStore:
         else:
             with os.fdopen(fd, "wb") as stream:
                 stream.write(secrets.token_bytes(32))
-        if key_path.is_symlink():
-            raise ValueError("Evidence key must be a local regular file")
+        require_private(key_path)
         with os.fdopen(os.open(key_path, os.O_RDONLY | flags), "rb") as stream:
             entry = os.fstat(stream.fileno())
             if (not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1
@@ -139,13 +139,14 @@ class RunStore:
         self.pool.shutdown(cancel_futures=True)
 
 
-def create_server(workspace: Path, *, trusted: bool = False, evidence_dir: Path | None = None,
+def create_server(workspace: Path, *, evidence_dir: Path | None = None,
                   owner: str = "local-stdio") -> MCPServer:
     workspace = workspace.resolve(strict=True)
     if not workspace.is_dir():
         raise ValueError("Workspace must be a directory")
-    namespace = hashlib.sha256(json_bytes({"workspace": str(workspace), "owner": owner})).hexdigest()[:32]
-    store_root = (evidence_dir or Path.home() / ".verify-helper" / "runs").resolve()
+    namespace = hashlib.sha256(json_bytes({"workspace": str(workspace), "owner": owner,
+                                          "storage": "private-v1"})).hexdigest()[:32]
+    store_root = _evidence_root(evidence_dir or Path.home() / ".verify-helper" / "runs")
     if store_root.is_relative_to(workspace):
         raise ValueError("MCP evidence storage must be outside the verified workspace")
     runs = RunStore(store_root / namespace)
@@ -156,7 +157,7 @@ def create_server(workspace: Path, *, trusted: bool = False, evidence_dir: Path 
                                             idempotentHint=False, openWorldHint=True))
     def verify_run_full(path: str = ".", policy_path: str | None = None, revision: str | None = None,
                         source_ref: str | None = None) -> dict[str, Any]:
-        """Queue complete verification. Use source_ref as the merge base for the clean checkout."""
+        """Queue full verification of the current project. 验证助手：完整验证指定项目，随后轮询报告。"""
         root = (workspace / path).resolve()
         if not root.is_relative_to(workspace) or not root.is_dir():
             raise ToolError("Project must be a directory in the configured workspace")
@@ -165,7 +166,12 @@ def create_server(workspace: Path, *, trusted: bool = False, evidence_dir: Path 
             raise ToolError("Policy must be a JSON file in the configured workspace")
         if revision is not None and not re.fullmatch(r"(?:[a-f0-9]{40}|[a-f0-9]{64})", revision):
             raise ToolError("Revision must be a full Git SHA")
-        return runs.submit(root, trusted=trusted, against=source_ref, revision=revision, policy_path=policy)
+        if path == "." and not _has_project_anchor(root):
+            candidates = sum(1 for child in root.iterdir() if not child.is_symlink() and child.is_dir()
+                             and _has_project_anchor(child))
+            if candidates > 1:
+                raise ToolError("Multiple projects found. Specify the relative project path.")
+        return runs.submit(root, against=source_ref, revision=revision, policy_path=policy)
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
     def verify_get_report(run_id: str) -> dict[str, Any]:
@@ -175,9 +181,13 @@ def create_server(workspace: Path, *, trusted: bool = False, evidence_dir: Path 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
     def verify_list_capabilities() -> dict[str, Any]:
         """List supported adapters and detected executables without running project code."""
+        image = os.environ.get(IMAGE_VARIABLE)
+        available = provider_available(image)
         return {"scope": "FULL", "trusted_project_execution": False,
-                "isolated_execution_candidate": trusted and IMAGE_VARIABLE in os.environ,
-                "adapters": ["python", "javascript", "typescript", "native", "web", "archives"],
+                "isolation_configured": IMAGE_VARIABLE in os.environ,
+                "isolation_available": available,
+                "isolation_attested": False,
+                "isolated_adapters": ["python-unittest"] if available else [],
                 "tools": {"python": True, **{name: shutil.which(name) is not None for name in
                           ("node", "npm", "cmake", "ctest", "git", "tsc")}}}
 
@@ -187,6 +197,11 @@ def create_server(workspace: Path, *, trusted: bool = False, evidence_dir: Path 
         return runs.report(run_id, cancel=True)
 
     return server
+
+
+def _has_project_anchor(path: Path) -> bool:
+    return any((path / name).exists() for name in (".git", "pyproject.toml", "package.json",
+                                                   "CMakeLists.txt", "verify.toml", "index.html"))
 
 
 def http_app(server: MCPServer, token: str):
@@ -216,7 +231,6 @@ def main(argv=None) -> None:
     parser.add_argument("--host", choices=("127.0.0.1",), default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--evidence-dir", type=Path)
-    parser.add_argument("--trust-project-code", action="store_true")
     args = parser.parse_args(argv)
     token = os.environ.get("VERIFY_HTTP_BEARER_TOKEN") or None
     owner = "local-stdio"
@@ -226,7 +240,7 @@ def main(argv=None) -> None:
         if not token:
             parser.error("Set VERIFY_HTTP_BEARER_TOKEN to enable authenticated HTTP verification")
         owner = "http:" + hashlib.sha256(token.encode()).hexdigest()
-    server = create_server(args.workspace, trusted=args.trust_project_code, evidence_dir=args.evidence_dir,
+    server = create_server(args.workspace, evidence_dir=args.evidence_dir,
                            owner=owner)
     try:
         if args.transport == "stdio":

@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 from pathlib import Path
+from private_storage import private_write, require_private
 
 
 def digest(data: bytes) -> str:
@@ -60,6 +61,7 @@ def set_gate_fields(report: dict) -> None:
     report["releasable"] = (
         verdict == "PASS" and report["status"] == "COMPLETED"
         and report.get("security_status", "ENFORCED") == "ENFORCED"
+        and report.get("mode") != "unsafe-local"
     )
 
 
@@ -77,16 +79,14 @@ def write_manifest(report: dict, output: Path, *, key: bytes | None = None) -> N
                 "policy_digest": report["policy_digest"], "plan_digest": report["plan_digest"], "files": records}
     if key is not None:
         manifest["hmac_sha256"] = hmac.digest(key, json_bytes(manifest), "sha256").hex()
-    pending = output / "report.json.tmp"
-    pending.write_bytes(body)
-    (output / "manifest.json").write_bytes(json_bytes(manifest))
-    pending.replace(output / "report.json")
+    private_write(output / "manifest.json", json_bytes(manifest))
+    private_write(output / "report.json", body)
 
 
 def read_evidence(output: Path, *, key: bytes | None = None) -> dict:
+    require_private(output, directory=True)
     manifest_path = output / "manifest.json"
-    if manifest_path.is_symlink():
-        raise ValueError("Evidence manifest is not a regular file")
+    require_private(manifest_path)
     manifest = json.loads(manifest_path.read_bytes())
     if not isinstance(manifest, dict):
         raise ValueError("Evidence manifest must be an object")
@@ -104,7 +104,8 @@ def read_evidence(output: Path, *, key: bytes | None = None) -> dict:
         if not name or name != Path(name).name or "/" in name or "\\" in name or ":" in name:
             raise ValueError("Evidence manifest contains an invalid path")
         path = output / name
-        if not path.is_file() or path.is_symlink() or digest(path.read_bytes()) != expected:
+        require_private(path)
+        if digest(path.read_bytes()) != expected:
             raise ValueError("Evidence digest mismatch or missing receipt")
     body = (output / "report.json").read_bytes()
     if digest(body) != records["report.json"]:

@@ -8,14 +8,14 @@ Verify Helper 通过 CLI 或 MCP 对项目运行完整验证，输出 PASS、FAI
 
 ```sh
 uv sync --locked
-uv run verify-helper run /path/to/project --trust-project-code --json report.json
+uv run verify-helper run /path/to/project --json report.json
 ```
 
-显式使用 `--trust-project-code` 且未配置隔离镜像时，CLI 在临时副本中以当前系统账户运行已审查项目。默认 CLI 和 MCP 采用受保护的报告出口。适用检查缺少运行环境、断言或完整覆盖时会返回 UNKNOWN。退出码为 0（PASS）、1（FAIL）或 2（UNKNOWN）。
+RC4 是 Linux 隔离执行有限预览。默认 CLI 和 MCP 采用受保护的报告出口；隔离或覆盖证据缺失时返回 UNKNOWN。退出码为 0（PASS）、1（FAIL）或 2（UNKNOWN）。跨平台正式版仍为 NO-GO。 [RC4 整改记录](docs/v2/RC4-AUDIT.md)
 
 | 参数 | 用途 |
 |---|---|
-| --trust-project-code | 运行来自已审查项目的测试、构建、浏览器和契约 |
+| unsafe-local-run PROJECT | 只用于手动调试已审查的自有项目。以宿主身份执行，结果不可发布。 |
 | --against main | 对干净 Git 工作树与指定提交的合并结果运行验证 |
 | --evidence-dir PATH | 指定证据根目录 |
 | --json [FILE] | 把机器可读报告写入文件，省略文件时输出到标准输出 |
@@ -49,7 +49,7 @@ HTTP 服务监听 127.0.0.1，在 /mcp 提供标准接口，拒绝外部 Origin�
 
 ### Linux 隔离候选
 
-操作者可以用 `VERIFY_HELPER_SANDBOX_IMAGE=sha256:<本机镜像 ID>` 配置独立运行环境。候选通过本机 Docker 运行一个断网、无宿主映射的非 root 容器，当前仅支持标准库 unittest。启动 CLI 或 MCP 时仍需显式使用 `--trust-project-code`。MCP 不会回退到宿主执行。Git 修订和合并验证、其他动态适配器以及尚未证明的隔离与测试覆盖均会保留 UNKNOWN。详细边界和发布状态见 [RC3 防外泄记录](docs/v2/RC3-SECURITY.md)。
+操作者可以用 `VERIFY_HELPER_SANDBOX_IMAGE=sha256:<本机镜像 ID>` 配置独立运行环境，服务为每次任务检验可用性。Docker 容器默认断网、无宿主映射并以非 root 运行，目前只调度标准库 unittest。管理员可用 `VERIFY_HELPER_SANDBOX_TIMEOUT_SECONDS` 设置单命令 5 至 180 秒的上限，默认为 60 秒。受保护模式不运行项目的宿主命令，也不采用项目自定义的 `.verifyignore`。目前 Git 修订、合并、其他动态适配器和不完整测试覆盖均保留 UNKNOWN。 [RC4 整改记录](docs/v2/RC4-AUDIT.md)
 
 ## 适用检查
 

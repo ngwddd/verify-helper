@@ -11,7 +11,7 @@ from run_evidence import plan_digest, set_gate_fields
 VERDICTS = {"PASS", "FAIL", "UNKNOWN"}
 REASONS = {"JAVASCRIPT_SYNTAX_UNAVAILABLE", "ISOLATION_UNAVAILABLE",
            "ISOLATED_TEST_ORACLE_UNVERIFIED", "ISOLATED_PROCESS_NONZERO",
-           "UNSUPPORTED_ISOLATED_ADAPTER"}
+           "UNSUPPORTED_ISOLATED_ADAPTER", "CUSTOM_RULE_BUDGET_EXCEEDED"}
 PUBLIC_CHECKS = frozenset(check_specs.ordered_ids()) | {"execution-isolation", "scan-coverage", "configuration"}
 
 
@@ -25,6 +25,7 @@ def project_receipts(report: dict) -> dict:
             ids[identifier] = identifier if identifier in PUBLIC_CHECKS else f"check-{len(ids) + 1:03}"
     public_plan = {ids[key]: "Required verification check" for key in plan}
     public_checks = []
+    aliases = {}
     for row in checks:
         identifier = ids[row["id"]]
         state = row.get("state")
@@ -35,6 +36,17 @@ def project_receipts(report: dict) -> dict:
         reason = row.get("reason_code")
         if reason in REASONS:
             public["reason_code"] = reason
+        if identifier == "syntax" and state == "FAIL":
+            findings = []
+            for finding in (row.get("findings") or [])[:100]:
+                file, line = finding.get("file"), finding.get("line")
+                if isinstance(file, str) and type(line) is int and 0 < line <= 1_000_000:
+                    alias = aliases.setdefault(file, f"source-{len(aliases) + 1:03}")
+                    findings.append({"file": alias, "line": line,
+                                     "message": "SOURCE_SYNTAX_INVALID"})
+            if findings:
+                public["findings"] = findings
+                public["remediation"] = "Check the source syntax at the reported line."
         coverage = row.get("coverage")
         if coverage and all(type(coverage.get(key, 0)) is int and 0 <= coverage.get(key, 0) <= 200_000
                             for key in ("planned", "observed", "skipped")):
@@ -43,11 +55,13 @@ def project_receipts(report: dict) -> dict:
         if isinstance(isolation, dict):
             version = isolation.get("engine_version")
             image = isolation.get("image_digest")
+            time_limit = isolation.get("time_limit_seconds")
             if (isinstance(version, str) and re.fullmatch(r"[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}", version)
-                    and isinstance(image, str) and re.fullmatch(r"sha256:[a-f0-9]{64}", image)):
+                    and isinstance(image, str) and re.fullmatch(r"sha256:[a-f0-9]{64}", image)
+                    and type(time_limit) is int and 5 <= time_limit <= 180):
                 public["isolation_receipt"] = {
                     "provider": "docker-local-linux", "engine_version": version, "image_digest": image,
-                    "uid": 65532, "network": "none", "host_bind_mounts": 0, "time_limit_seconds": 20,
+                    "uid": 65532, "network": "none", "host_bind_mounts": 0, "time_limit_seconds": time_limit,
                     "root_filesystem_read_only": True, "credential_environment": "minimal",
                     "verified": False,
                 }
@@ -74,10 +88,10 @@ def mcp_report(report: dict, run_id: str, version: str) -> dict:
     public["security_status"] = security if security in {"ENFORCED", "VIOLATED"} else "UNAVAILABLE"
     if public["security_status"] == "UNAVAILABLE":
         public["reason_code"] = "ISOLATION_UNAVAILABLE"
-    for key, pattern in (("policy_digest", r"sha256:[a-f0-9]{64}"), ("snapshot_sha256", r"[a-f0-9]{64}")):
-        value = report.get(key)
-        if isinstance(value, str) and re.fullmatch(pattern, value):
-            public[key] = value
+    omitted = report.get("protected_input")
+    if isinstance(omitted, dict) and type(omitted.get("excluded_count")) is int:
+        public["protected_input"] = {"reason_code": "PROTECTED_INPUT_EXCLUDED",
+                                     "excluded_count": min(200_000, max(0, omitted["excluded_count"]))}
     if report.get("evidence_manifest") == "manifest.json":
         public["evidence_manifest"] = "manifest.json"
     set_gate_fields(public)

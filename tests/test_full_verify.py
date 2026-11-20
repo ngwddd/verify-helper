@@ -46,7 +46,7 @@ class FullVerification(unittest.TestCase):
 
     def run_full(self, **options):
         options.setdefault("evidence_dir", self.root / ".verify-artifacts")
-        report = full_verify(self.root, trusted=True, **options)
+        report = full_verify(self.root, unsafe_local=True, **options)
         rows = {row["id"]: row for row in report["checks"]}
         return report, rows
 

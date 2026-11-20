@@ -6,9 +6,10 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from full_verify import full_verify
-from isolated_runtime import IMAGE_VARIABLE, BoundaryUnavailable, run_isolated
+from isolated_runtime import IMAGE_VARIABLE, TIME_VARIABLE, BoundaryUnavailable, run_isolated
 from run_evidence import read_evidence
 
 
@@ -107,8 +108,9 @@ else:
 
     def test_timeout_removes_container(self):
         baseline = self.containers()
-        with self.assertRaises(BoundaryUnavailable):
-            self.protected("import time; time.sleep(60)")
+        with patch.dict(os.environ, {TIME_VARIABLE: "5"}):
+            with self.assertRaises(BoundaryUnavailable):
+                self.protected("import time; time.sleep(60)")
         self.assertEqual(self.containers(), baseline)
 
     @staticmethod
@@ -124,7 +126,7 @@ else:
             "import unittest\nclass TestSuite(unittest.TestCase):\n"
             f"    def test_runtime(self): print({marker!r}); self.assertEqual(2, 2)\n", encoding="utf-8")
         store = self.base / "receipts"
-        report = full_verify(self.source, trusted=True, evidence_dir=store)
+        report = full_verify(self.source, evidence_dir=store)
         self.assertEqual(report["verdict"], "UNKNOWN")
         self.assertFalse(report["releasable"])
         tests = next(row for row in report["checks"] if row["id"] == "tests")

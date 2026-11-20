@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main, 'v2.0/development', 'v2.0/rc3']
+    branches: [main, 'v2.0/development', 'v2.0/rc3', 'v2.0/rc4']
   pull_request:
   workflow_dispatch:
 
@@ -26,8 +26,9 @@ jobs:
         shell: bash
         run: |
           docker info --format '{{.OSType}} {{.DefaultRuntime}} {{json .SecurityOptions}} {{.MemoryLimit}} {{.SwapLimit}} {{.PidsLimit}}'
-          docker pull python:3.12-slim
-          export VERIFY_HELPER_SANDBOX_IMAGE="$(docker image inspect --format '{{.Id}}' python:3.12-slim)"
+          image='python@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b'
+          docker pull "$image"
+          export VERIFY_HELPER_SANDBOX_IMAGE="$(docker image inspect --format '{{.Id}}' "$image")"
           printf 'Acceptance image ID: %s\n' "$VERIFY_HELPER_SANDBOX_IMAGE"
           uv run python -m unittest discover -s tests -p sandbox_acceptance.py -v
 
@@ -107,22 +108,8 @@ jobs:
         run: |
           uv build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $env:VERIFY_HELPER_TEST_PYTHON = uv run python -c "import sys; print(sys.executable)"
-          $env:VERIFY_SCRATCH_DIRECTORY = $env:RUNNER_TEMP
-          $evidence = Join-Path $env:RUNNER_TEMP vh-evidence
-          $json = uv run verify-helper . --trust-project-code --evidence-dir $evidence --json
-          $verdictCode = $LASTEXITCODE
-          $report = $json | ConvertFrom-Json
-          if ($report.git.head -ne $env:GITHUB_SHA -or $report.git.dirty -ne $false -or !$report.releasable) {
-            throw "Self-verification must certify the exact clean CI commit"
-          }
-          if (@($report.checks | Where-Object { $_.id -like 'delivery-*' -and $_.state -eq 'PASS' }).Count -ne 2) {
-            throw "Delivery verification failed"
-          }
-          if ($verdictCode -ne 0) {
-            $report.checks | Where-Object { $_.id -in $report.plan.PSObject.Properties.Name -and $_.state -ne 'PASS' } |
-              Select-Object id, state, detail, output | Format-List
-            throw "Self-verification did not pass"
+          if ((git rev-parse HEAD) -ne $env:GITHUB_SHA -or (git status --porcelain)) {
+            throw "Package must come from the exact clean CI commit"
           }
           $wheel = (Get-ChildItem -LiteralPath dist -Filter '*.whl').FullName
           uv run --no-project --with $wheel verify-helper --list-checks
@@ -132,22 +119,20 @@ jobs:
           $delivery = Join-Path $env:RUNNER_TEMP vh-distribution
           New-Item -ItemType Directory -Path $delivery -Force | Out-Null
           $files = Get-ChildItem -LiteralPath dist -File | Where-Object { $_.Name -like '*.whl' -or $_.Name -like '*.tar.gz' }
+          if (@($files).Count -ne 2) { throw "Expected a wheel and a source archive" }
           $hashes = foreach ($file in $files) {
+            uv run python -c "import sys; from pathlib import Path; from verification_adapters import archive; sys.exit(archive('delivery', Path(sys.argv[1])).state != 'PASS')" $file.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Distribution archive verification failed" }
             $digest = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-            if (-not ($report.checks | Where-Object { $_.id -like 'delivery-*' -and $_.state -eq 'PASS' -and $_.detail.Contains($digest) })) {
-              throw "Distribution file digest not linked to passing evidence: $($file.Name)"
-            }
             Copy-Item -LiteralPath $file.FullName -Destination $delivery
             "$digest *$($file.Name)"
           }
           $hashes | Set-Content -LiteralPath (Join-Path $delivery SHA256SUMS) -Encoding utf8NoBOM
           [ordered]@{
-            version = $report.version
-            commit = $report.git.head
+            version = uv run python -c "from verify_core import VERSION; print(VERSION)"
+            commit = $env:GITHUB_SHA
             workflow_run = $env:GITHUB_RUN_ID
-            snapshot_sha256 = $report.snapshot_sha256
-            plan_digest = $report.plan_digest
-            evidence_manifest_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $report.evidence_dir manifest.json)).Hash.ToLowerInvariant()
+            protected_release_approved = $false
           } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $delivery provenance.json) -Encoding utf8NoBOM
       - name: Retain candidate distribution
         if: matrix.python == '3.12'
@@ -156,10 +141,3 @@ jobs:
           name: distribution-${{ matrix.os }}-py3.12
           path: ${{ runner.temp }}/vh-distribution
           if-no-files-found: error
-      - name: Retain verification evidence
-        if: always() && matrix.python == '3.12'
-        uses: actions/upload-artifact@v4
-        with:
-          name: verification-${{ matrix.os }}-py${{ matrix.python }}
-          path: ${{ runner.temp }}/vh-evidence
-          if-no-files-found: warn

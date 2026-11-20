@@ -24,6 +24,7 @@ import sarif
 import verification_adapters as adapters
 import verify_core as core
 from process_boundary import contain_worker
+from private_storage import private_directory, private_write
 from run_evidence import digest as evidence_digest, plan_digest, read_evidence, set_gate_fields, write_manifest
 
 SCHEMA_VERSION = 2
@@ -35,6 +36,7 @@ EXEC_ENV = {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "LANG", "LC_AL
             "VERIFY_HELPER_TEST_PYTHON", "VERIFY_TSC", "VERIFY_PLAYWRIGHT_ROOT", "PLAYWRIGHT_BROWSERS_PATH",
             "VERIFY_NATIVE_FIXTURE", "VERIFY_SCRATCH_DIRECTORY", "CC", "CXX", "CMAKE_GENERATOR",
             "INCLUDE", "LIB", "LIBPATH",
+            isolated_runtime.TIME_VARIABLE,
             "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "PROGRAMDATA", "SYSTEMDRIVE",
             "PROCESSOR_ARCHITECTURE", "ZIG_GLOBAL_CACHE_DIR"}
 PRIVATE_INPUTS = {".ssh", ".aws", ".azure", ".kube", ".gnupg", ".docker", ".netrc",
@@ -56,7 +58,38 @@ def scrub(value):
     return value
 
 
+def _copy_open_file(fd: int, destination: Path, expected) -> None:
+    actual = os.fstat(fd)
+    if (not stat.S_ISREG(actual.st_mode) or actual.st_nlink != 1 or
+            (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino)):
+        raise ValueError("Snapshot source changed before it could be opened")
+    with os.fdopen(fd, "rb", closefd=False) as stream, destination.open("xb") as target:
+        remaining = expected.st_size
+        while remaining:
+            chunk = stream.read(min(remaining, 256 * 1024))
+            if not chunk:
+                raise ValueError("Snapshot source shrank while being copied")
+            target.write(chunk)
+            remaining -= len(chunk)
+        if stream.read(1):
+            raise ValueError("Snapshot source grew while being copied")
+    destination.chmod(0o700 if actual.st_mode & stat.S_IXUSR else 0o600)
+
+
 def _protected_copy(source: Path, relative: Path, destination: Path, expected) -> None:
+    if os.name == "nt":
+        import msvcrt
+        import win32file
+
+        fd = os.open(source / relative, os.O_RDONLY | os.O_BINARY | os.O_NOINHERIT)
+        try:
+            name = win32file.GetFinalPathNameByHandle(msvcrt.get_osfhandle(fd), 0)
+            if Path(name) != Path("\\\\?\\" + str(source / relative)):
+                raise ValueError("Snapshot file handle resolved outside its expected path")
+            _copy_open_file(fd, destination, expected)
+        finally:
+            os.close(fd)
+        return
     with ExitStack() as handles:
         directory_flags = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_RDONLY
         parent = os.open(source, directory_flags)
@@ -65,22 +98,8 @@ def _protected_copy(source: Path, relative: Path, destination: Path, expected) -
             parent = os.open(name, directory_flags, dir_fd=parent)
             handles.callback(os.close, parent)
         fd = os.open(relative.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
-        with os.fdopen(fd, "rb") as stream:
-            actual = os.fstat(fd)
-            if (not stat.S_ISREG(actual.st_mode) or actual.st_nlink != 1
-                    or (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino)):
-                raise ValueError("Snapshot source changed before it could be opened")
-            with destination.open("xb") as target:
-                remaining = expected.st_size
-                while remaining:
-                    chunk = stream.read(min(remaining, 256 * 1024))
-                    if not chunk:
-                        raise ValueError("Snapshot source shrank while being copied")
-                    target.write(chunk)
-                    remaining -= len(chunk)
-                if stream.read(1):
-                    raise ValueError("Snapshot source grew while being copied")
-            destination.chmod(0o700 if actual.st_mode & stat.S_IXUSR else 0o600)
+        handles.callback(os.close, fd)
+        _copy_open_file(fd, destination, expected)
 
 
 def _snapshot(source: Path, destination: Path, *, protected: bool = False) -> tuple[str, list[str]]:
@@ -117,7 +136,7 @@ def _snapshot(source: Path, destination: Path, *, protected: bool = False) -> tu
                 omitted.append(display)
                 continue
             copied = destination / relative / name
-            if protected and sys.platform == "linux":
+            if protected and (os.name == "nt" or sys.platform == "linux"):
                 _protected_copy(source, relative / name, copied, entry)
             else:
                 shutil.copy2(path, copied)
@@ -148,7 +167,8 @@ def _scope(root: Path, files: list[Path]) -> list[Path]:
 
 def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
               sandbox_image: str | None = None) -> dict:
-    files, _, large, _ = core.scan_files(root)
+    protected = not trusted or sandbox_image is not None
+    files, _, large, _ = core.scan_files(root, project_ignores=not protected)
     ctx = core.Ctx(core.Cache(False))
     config_error = None
     try:
@@ -160,7 +180,7 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
     static = [identifier for identifier in check_specs.ordered_ids()
               if identifier not in DYNAMIC | {"git"}]
     report = core._verify_checks(str(root), checks=static, use_cache=False, artifacts=False,
-                         review_md=False, allow_host_tools=trusted and sandbox_image is None)
+                         review_md=False, allow_host_tools=not protected, project_ignores=not protected)
     required = {}
     tasks = []
     rows = report["checks"]
@@ -352,7 +372,8 @@ def _isolated_unittest(root: Path, scope: Path, identifier: str, image: str) -> 
     else:
         result.reason_code = ("ISOLATED_TEST_ORACLE_UNVERIFIED" if observed.exit_code == 0
                               else "ISOLATED_PROCESS_NONZERO")
-        result.isolation_receipt = {"engine_version": observed.engine_version, "image_digest": image}
+        result.isolation_receipt = {"engine_version": observed.engine_version, "image_digest": image,
+                                    "time_limit_seconds": observed.time_limit}
     return result
 
 
@@ -411,7 +432,7 @@ def decide(report: dict) -> str:
 
 
 def _record_checks(report: dict, output: Path, work: Path) -> None:
-    output.mkdir(parents=True, exist_ok=False)
+    private_directory(output)
     for index, row in enumerate(report["checks"], 1):
         evidence = row.pop("evidence", None)
         if evidence:
@@ -420,13 +441,13 @@ def _record_checks(report: dict, output: Path, work: Path) -> None:
                 row["media"] = []
                 for path in sorted(picture_dir.glob("*.png")):
                     target = output / f"{index:03d}-{path.name}"
-                    shutil.copy2(path, target)
+                    private_write(target, path.read_bytes())
                     with target.open("rb") as stream:
                         row["media"].append({"path": target.name,
                                              "sha256": hashlib.file_digest(stream, "sha256").hexdigest()})
         row["evidence_ref"] = f"check-{index:03d}.json"
         record = json.dumps(row, ensure_ascii=False, indent=2).encode()
-        (output / row["evidence_ref"]).write_bytes(record)
+        private_write(output / row["evidence_ref"], record)
         row["evidence_sha256"] = hashlib.sha256(record).hexdigest()
 
 
@@ -441,7 +462,7 @@ def _finalize(report: dict, output: Path | None, *, evidence_key: bytes | None =
     if output is None:
         report.pop("evidence_manifest", None)
         return
-    (output / "results.sarif").write_text(json.dumps(report["sarif"], ensure_ascii=False), encoding="utf-8")
+    private_write(output / "results.sarif", json.dumps(report["sarif"], ensure_ascii=False).encode())
     write_manifest(report, output, key=evidence_key)
 
 
@@ -463,22 +484,22 @@ class MergeConflict(ValueError):
     """The requested Git merge has a confirmed conflict."""
 
 
-def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Path | None = None,
+def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir: Path | None = None,
                 against: str | None = None, revision: str | None = None,
                 policy_path: Path | None = None, run_id: str | None = None, cancellation=None,
                 sealed: bool = False, evidence_key: bytes | None = None) -> dict:
     root = Path(project).expanduser().resolve()
     run_id = run_id or uuid.uuid4().hex
     image = os.environ.get(isolated_runtime.IMAGE_VARIABLE)
-    host_execution = trusted and image is None and not sealed
+    host_execution = unsafe_local and not sealed and evidence_key is None
     sealed = not host_execution
-    sandbox_image = image if trusted else "" if image is not None else None
+    sandbox_image = None if host_execution else image
     context = {"schema_version": SCHEMA_VERSION, "run_id": run_id, "version": core.VERSION,
-               "mode": "full", "isolation": "linux-container-candidate" if image is not None
+               "mode": "unsafe-local" if host_execution else "full", "isolation": "linux-container-candidate" if sandbox_image is not None
                else "temporary-source-snapshot",
                "trusted_project_code": host_execution, "platform": platform.system(),
                "python": platform.python_version(),
-               "policy_digest": "sha256:" + evidence_digest(f"{core.VERSION}:{trusted}".encode())}
+               "policy_digest": "sha256:" + evidence_digest(f"{core.VERSION}:{host_execution}".encode())}
     if sealed:
         context["export_policy"] = "sealed"
         context["security_status"] = "UNAVAILABLE"
@@ -582,6 +603,9 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
                 report.update(git=git, omitted=omitted)
             if omitted:
                 report["blockers"].append("Source snapshot contains omitted or changed entries")
+                if sealed:
+                    report["protected_input"] = {"reason_code": "PROTECTED_INPUT_EXCLUDED",
+                                                 "excluded_count": len(omitted)}
             if stop_path.exists() or (cancellation is not None and cancellation.is_set()):
                 report["status"] = "CANCELLED"
                 report["blockers"].append("Verification was cancelled")
@@ -652,14 +676,13 @@ def main(argv=None) -> int:
         from server import main as serve
         serve(argv[1:])
         return 0
-    if argv and argv[0] == "run":
+    unsafe = bool(argv and argv[0] == "unsafe-local-run")
+    if argv and argv[0] in {"run", "unsafe-local-run"}:
         argv.pop(0)
     parser = argparse.ArgumentParser(prog="verify-helper", description="Run full project verification")
     if any(arg.split("=", 1)[0] in {"--fast", "--checks", "--stage"} for arg in argv):
         parser.error("Selective and fast verification were removed. Use verify-helper run PROJECT.")
     parser.add_argument("project", nargs="?")
-    parser.add_argument("--trust-project-code", action="store_true",
-                        help="Permit execution of code from a project you trust")
     parser.add_argument("--evidence-dir", type=Path, help="Directory for per-run evidence")
     parser.add_argument("--against", help="Verify the Git merge result against this ref")
     parser.add_argument("--revision", help="Require this exact clean Git checkout")
@@ -673,19 +696,17 @@ def main(argv=None) -> int:
         return 0
     if not options.project:
         parser.error("project is required")
-    report = full_verify(options.project, trusted=options.trust_project_code,
+    report = full_verify(options.project, unsafe_local=unsafe,
                          evidence_dir=options.evidence_dir, against=options.against,
                          revision=options.revision, policy_path=options.policy_path)
     if options.sarif:
-        options.sarif.write_text(json.dumps(report.get("sarif") or
-                                             json.loads(sarif.dumps(report, core.VERSION))),
-                                 encoding="utf-8")
+        private_write(options.sarif, json.dumps(report["sarif"]).encode())
     if options.json:
         encoded = json.dumps(report, ensure_ascii=False, indent=2)
         if options.json == "-":
             print(encoded)
         else:
-            Path(options.json).write_text(encoded + "\n", encoding="utf-8")
+            private_write(Path(options.json), (encoded + "\n").encode())
     else:
         print(f"{report['verdict']}  {report.get('project', 'FULL')}  v{core.VERSION}")
         for row in report["checks"]:

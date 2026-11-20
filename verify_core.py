@@ -44,7 +44,7 @@ import yaml
 import check_specs as S
 import directions as DIR
 
-VERSION = "2.0.0rc3.dev0"
+VERSION = "2.0.0rc4"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -286,7 +286,7 @@ def _ignore_patterns(f: Path) -> list[str]:
 
 
 def scan_files(root: Path, limit: int = 200_000,
-               ignores: list[str] | None = None) -> tuple[list[Path], dict, int, int]:
+               ignores: list[str] | None = None, *, project_ignores: bool = True) -> tuple[list[Path], dict, int, int]:
     """遍历项目。`.verifyignore` 按**目录**生效（像 .gitignore）。
 
     只在根读 ignore 是不够的：对工作区跑的时候，子项目自己的 .verifyignore
@@ -303,7 +303,7 @@ def scan_files(root: Path, limit: int = 200_000,
     for dirpath, dirnames, filenames in os.walk(root):
         d = Path(dirpath)
         if d not in dir_ig:
-            dir_ig[d] = _ignore_patterns(d / ".verifyignore")
+            dir_ig[d] = _ignore_patterns(d / ".verifyignore") if project_ignores else []
         # 该目录所有祖先（含自身）生效的规则
         chain: list[tuple[Path, list[str]]] = []
         cur = d
@@ -337,7 +337,7 @@ def scan_files(root: Path, limit: int = 200_000,
                 continue
             # 备份/草稿目录默认跳过：它们和正本重名，会把同一条 finding 报两遍。
             # （实测：my-site.backup-20260924 让 each finding 翻倍）
-            if BACKUP_DIR_RE.search(name):
+            if project_ignores and BACKUP_DIR_RE.search(name):
                 _SKIPPED_BACKUPS.append(name)
                 ignored += 1
                 continue
@@ -1862,6 +1862,8 @@ def check_git(root: Path, files: list[Path], ctx: "Ctx") -> Check:
 #   risk = "medium"
 # ──────────────────────────────────────────────────────────────────────
 def check_custom(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+    import regex
+
     c = Check("custom", "自定义规则（verify.toml）")
     t0 = time.time()
     cfg = root / "verify.toml"
@@ -1884,7 +1886,15 @@ def check_custom(root: Path, files: list[Path], ctx: "Ctx") -> Check:
         rules = []
     findings = []
     compiled = 0
-    for idx, rule in enumerate(rules):
+    deadline = time.monotonic() + 3
+    incomplete = len(rules) > 128
+    def limit():
+        c.state = "UNKNOWN"
+        c.reason_code = "CUSTOM_RULE_BUDGET_EXCEEDED"
+        c.detail = "Custom rule coverage exceeded the verification budget"
+        return c
+
+    for idx, rule in enumerate(rules[:128]):
         if not isinstance(rule, dict):
             continue
         rid = str(rule.get("id") or f"rule{idx + 1}")
@@ -1893,9 +1903,12 @@ def check_custom(root: Path, files: list[Path], ctx: "Ctx") -> Check:
             findings.append({"file": "verify.toml", "line": 0,
                              "message": f"规则 {rid} 缺 pattern"})
             continue
+        if not isinstance(pat, str) or len(pat) > 2048:
+            incomplete = True
+            continue
         try:
-            rx = re.compile(pat)
-        except re.error as e:
+            rx = regex.compile(pat)
+        except (regex.error, RecursionError) as e:
             findings.append({"file": "verify.toml", "line": 0,
                              "message": f"规则 {rid} 的正则无效：{e}"})
             continue
@@ -1908,6 +1921,8 @@ def check_custom(root: Path, files: list[Path], ctx: "Ctx") -> Check:
         # 静默忽略会让规则「看起来配了等级、实际没生效」，所以两个都收。
         sev = str(rule.get("risk") or rule.get("severity") or "medium").lower()
         for p in files:
+            if time.monotonic() >= deadline:
+                return limit()
             if p.suffix.lower() not in TEXT_EXT:
                 continue
             rel = _rel(root, p)
@@ -1917,9 +1932,21 @@ def check_custom(root: Path, files: list[Path], ctx: "Ctx") -> Check:
             if not t:
                 continue
             for i, line in enumerate(t.splitlines(), 1):
-                if rx.search(line):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or len(findings) >= 1000:
+                    return limit()
+                if len(line) > 32_768:
+                    incomplete = True
+                    continue
+                try:
+                    match = rx.search(line, timeout=min(remaining, 0.05))
+                except TimeoutError:
+                    return limit()
+                if match:
                     findings.append({"file": rel, "line": i,
                                      "message": f"[{rid}] {msg}", "severity": sev})
+    if incomplete:
+        return limit()
     c.findings = findings
     c.state = "FAIL" if findings else "PASS"
     c.detail = f"{len(rules)} 条规则（{compiled} 条可用），命中 {len(findings)} 处"
@@ -2017,7 +2044,7 @@ def _verify_checks(project: str, checks: list[str] | None = None,
            accepts: list[dict] | None = None, only_new: bool = False,
            artifacts: bool = True, review_md: bool = True,
            against: str | None = None, artifacts_dir: str | None = None,
-           allow_host_tools: bool = True) -> dict:
+           allow_host_tools: bool = True, project_ignores: bool = True) -> dict:
     """跑一轮验证。
 
     stage / tier / accepts / only_new / artifacts / review_md / against
@@ -2031,8 +2058,7 @@ def _verify_checks(project: str, checks: list[str] | None = None,
     t_all = time.time()
     _SKIPPED_BACKUPS.clear()
     global _READER
-    ignores = _ignore_patterns(root / ".verifyignore")
-    files, by_ext, skipped_big, ignored = scan_files(root, ignores=ignores)
+    files, by_ext, skipped_big, ignored = scan_files(root, project_ignores=project_ignores)
     _READER = _Reader()
 
     if checks:

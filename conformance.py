@@ -326,8 +326,8 @@ def run_extra(verbose: bool):
         r = subprocess.run([sys.executable, str(ROOT / "verify_core.py"), str(tmp / "valid")],
                            capture_output=True, text=True, encoding="utf-8")
         check("受保护模式缺少隔离证明时退出码 2", r.returncode == 2, f"exit={r.returncode}")
-        r = subprocess.run([sys.executable, str(ROOT / "verify_core.py"), str(tmp / "valid"),
-                            "--trust-project-code"], capture_output=True, text=True, encoding="utf-8")
+        r = subprocess.run([sys.executable, str(ROOT / "verify_core.py"), "unsafe-local-run", str(tmp / "valid")],
+                           capture_output=True, text=True, encoding="utf-8")
         check("显式可信 CLI 全过时退出码 0", r.returncode == 0, f"exit={r.returncode}")
 
         # --json 输出可被解析
@@ -367,8 +367,7 @@ def run_extra(verbose: bool):
         try:
             make_case(low, {"a.py": f'X = r"{W}{CUR_USER}\\proj"\n',
                             "ok.py": "y = 1\n"})
-            r = subprocess.run([sys.executable, str(ROOT / "verify_core.py"), str(low),
-                                "--trust-project-code"],
+            r = subprocess.run([sys.executable, str(ROOT / "verify_core.py"), "unsafe-local-run", str(low)],
                                capture_output=True, text=True, encoding="utf-8")
             check("缺少测试证据时退出码为 2", r.returncode == 2, f"exit={r.returncode}")
             r = subprocess.run([sys.executable, str(ROOT / "verify_core.py"), str(low),
