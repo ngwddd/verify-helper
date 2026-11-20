@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Verify Helper v2 Full Verification",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "status",
+    "scope",
+    "verdict",
+    "releasable",
+    "policy_digest",
+    "coverage",
+    "ledger"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "scope": {
+      "const": "FULL"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^(vh2_)?[a-f0-9]{32}$"
+    },
+    "status": {
+      "enum": [
+        "COMPLETED",
+        "CANCELLED",
+        "ERROR"
+      ]
+    },
+    "verdict": {
+      "enum": [
+        "PASS",
+        "FAIL",
+        "UNKNOWN"
+      ]
+    },
+    "releasable": {
+      "type": "boolean"
+    },
+    "policy_digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "snapshot_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "evidence_manifest": {
+      "const": "manifest.json"
+    },
+    "coverage": {
+      "type": "object",
+      "required": [
+        "required",
+        "passed",
+        "failed",
+        "unknown"
+      ],
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "ledger": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "check_id",
+          "required",
+          "applicability",
+          "execution",
+          "verdict",
+          "reason_code",
+          "oracle",
+          "eligible",
+          "executed",
+          "skipped",
+          "not_run",
+          "evidence_refs"
+        ],
+        "properties": {
+          "check_id": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "applicability": {
+            "enum": [
+              "APPLICABLE",
+              "NOT_APPLICABLE"
+            ]
+          },
+          "execution": {
+            "enum": [
+              "EXECUTED",
+              "PARTIAL",
+              "NOT_RUN",
+              "UNAVAILABLE",
+              "ERROR"
+            ]
+          },
+          "verdict": {
+            "enum": [
+              "PASS",
+              "FAIL",
+              "UNKNOWN"
+            ]
+          },
+          "reason_code": {
+            "type": "string"
+          },
+          "oracle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "eligible": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "executed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "skipped": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "not_run": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "evidence_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "releasable": {
+            "const": true
+          }
+        },
+        "required": [
+          "releasable"
+        ]
+      },
+      "then": {
+        "properties": {
+          "verdict": {
+            "const": "PASS"
+          },
+          "status": {
+            "const": "COMPLETED"
+          }
+        },
+        "required": [
+          "evidence_manifest",
+          "snapshot_sha256"
+        ]
+      }
+    }
+  ]
+}
