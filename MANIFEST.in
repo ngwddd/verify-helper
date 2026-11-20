@@ -1,0 +1,3 @@
+include CHANGELOG.md REVIEW.md conformance.py verification_resources.test.mjs uv.lock
+recursive-include tests *.py
+recursive-include examples *.yml *.toml

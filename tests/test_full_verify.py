@@ -10,7 +10,6 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
-from unittest.mock import patch
 
 from full_verify import decide, full_verify
 
@@ -180,7 +179,14 @@ members = ["README.md"]
         self.file("index.html", """<!doctype html>
 <html lang="en"><head><title>Fixture</title></head><body>
 <h1>Start</h1><button onclick="this.textContent='Save restored'">Restore</button>
+<a href="/docs/en/404.html">English</a>
+<script src="/docs/app.mjs" type="module"></script>
+<link rel="stylesheet" href="/docs/site.css">
 </body></html>""")
+        self.file("en/404.html", """<!doctype html>
+<html lang="en"><head><title>Not found</title></head><body><h1>Not found</h1></body></html>""")
+        self.file("site.css", "body { color: black; }\n")
+        self.file("app.mjs", "document.body.dataset.ready = 'yes';\n")
         self.file("verify.toml", '''[[flows]]
 name = "Restore saved session"
 steps = [{goto="index.html"}, {click="button"}, {expect={selector="button", text_contains="Save restored"}}]
@@ -190,6 +196,7 @@ steps = [{goto="index.html"}, {click="button"}, {expect={selector="button", text
         self.assertEqual(rows["interaction"]["state"], "PASS", rows["interaction"])
         self.assertEqual(report["verdict"], "PASS")
         self.assertTrue(rows["browser"]["media"])
+        self.assertEqual(rows["browser"]["coverage"]["observed"], 2)
 
     @unittest.skipUnless(os.environ.get("VERIFY_TSC") and shutil.which("node"),
                          "Requires a configured TypeScript compiler")
@@ -199,19 +206,29 @@ steps = [{goto="index.html"}, {click="button"}, {expect={selector="button", text
         report, rows = self.run_full()
         self.assertEqual(rows["typescript"]["state"], "FAIL", rows["typescript"])
         self.assertEqual(report["verdict"], "FAIL")
+        self.file("sample.ts", "const state: number = 42;\n")
+        self.file("excluded.ts", "const uncompiled: number = 42;\n")
+        report, rows = self.run_full()
+        self.assertEqual(rows["typescript"]["state"], "UNKNOWN", rows["typescript"])
+        self.assertEqual(rows["typescript"]["coverage"], {"planned": 2, "observed": 1})
+        self.assertEqual(report["verdict"], "UNKNOWN")
 
     @unittest.skipUnless(shutil.which("cmake") and shutil.which("ctest")
                          and os.environ.get("VERIFY_NATIVE_FIXTURE"), "Requires native toolchain")
-    def test_cmake_build_and_ctest_execute_real_binary(self):
+    def test_cmake_build_and_ctest_execute_real_binaries(self):
         self.file("CMakeLists.txt", """cmake_minimum_required(VERSION 3.16)
-project(verification_fixture C)
+project(verification_fixture C CXX)
 enable_testing()
 add_executable(state main.c)
+add_executable(compatibility compatibility.cpp)
 add_test(NAME state_machine COMMAND state)
+add_test(NAME compatibility COMMAND compatibility)
 """)
         self.file("main.c", "int main(void) { return 0; }\n")
+        self.file("compatibility.cpp", "int main() { const bool compatible = true; return !compatible; }\n")
         report, rows = self.run_full()
         self.assertEqual(rows["build-native"]["state"], "PASS", rows["build-native"])
         self.assertEqual(rows["tests-native"]["state"], "PASS", rows["tests-native"])
+        self.assertEqual(rows["tests-native"]["coverage"], {"planned": 2, "observed": 2})
         self.assertEqual(report["verdict"], "PASS")
         self.assertNotIn("browser", report["plan"])

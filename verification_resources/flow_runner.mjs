@@ -20,11 +20,7 @@
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-
-function arg(name, fallback = '') {
-  const i = process.argv.indexOf('--' + name);
-  return i >= 0 ? process.argv[i + 1] : fallback;
-}
+import { arg, flowUrl, screenshotName } from './probe_helpers.mjs';
 
 const moduleDir = arg('module');
 const specFile = arg('spec');
@@ -60,12 +56,6 @@ if (shotsDir) mkdirSync(shotsDir, { recursive: true });
 
 const browser = await playwright.chromium.launch({ headless: true });
 const results = [];
-
-function baseUrl(path) {
-  if (!path) return spec.base + '/';
-  if (/^https?:/i.test(path)) return path;
-  return spec.base.replace(/\/$/, '') + '/' + String(path).replace(/^\//, '');
-}
 
 function describe(step) {
   if (step.goto !== undefined) return `打开 ${step.goto}`;
@@ -156,7 +146,8 @@ for (const flow of spec.flows || []) {
       let outcome = { ok: true, detail: '' };
       try {
         if (step.goto !== undefined) {
-          const r = await page.goto(baseUrl(step.goto), { waitUntil: 'networkidle', timeout: STEP_TIMEOUT });
+          const r = await page.goto(flowUrl(spec.base, step.goto),
+                                    { waitUntil: 'networkidle', timeout: STEP_TIMEOUT });
           if (r && r.status() >= 400) outcome = { ok: false, detail: `HTTP ${r.status()}` };
         } else if (step.click !== undefined) {
           await page.click(step.click, { timeout: STEP_TIMEOUT });
@@ -201,8 +192,7 @@ for (const flow of spec.flows || []) {
     rec.pageErrors = pageErrors.slice(0, 8);
     if (!rec.passed && shotsDir) {
       try {
-        const safe = name.replace(/[\\/:*?"<>|]/g, '_').slice(0, 60);
-        const file = join(shotsDir, `${results.length + 1}-${safe}.png`);
+        const file = join(shotsDir, screenshotName(`${results.length + 1}:${name}`));
         await page.screenshot({ path: file, fullPage: false });
         rec.shot = file;
       } catch { /* 截图失败不影响结论 */ }
