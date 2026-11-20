@@ -27,6 +27,7 @@ SOCKET = "/var/run/docker.sock"
 UID = "65532"
 MEMORY = 384 * 1024 ** 2
 WORKSPACE = "/workspace:rw,nosuid,nodev,size=192m,mode=0700,uid=65532,gid=65532"
+NATIVE_WORKSPACE = WORKSPACE.replace(",nosuid", ",exec,nosuid")
 TEMP = "/tmp:rw,noexec,nosuid,nodev,size=32m,mode=0700,uid=65532,gid=65532"
 ENTRY = (
     'cd /workspace && /bin/tar --no-same-owner --no-same-permissions -xf - '
@@ -66,7 +67,7 @@ def _stage(root: Path, archive) -> None:
     archive.seek(0)
 
 
-def _check_container(container: dict, image: str) -> str:
+def _check_container(container: dict, image: str, workspace: str = WORKSPACE) -> str:
     host = container["HostConfig"]
     config = container["Config"]
     mode = host.get("PidMode")
@@ -84,7 +85,7 @@ def _check_container(container: dict, image: str) -> str:
             or host["PidsLimit"] != 64 or host["Memory"] != MEMORY
             or host["MemorySwap"] != MEMORY or host["NanoCpus"] != 1_000_000_000
             or host["Init"] is not True or host["RestartPolicy"]["Name"] != "no"
-            or host["Tmpfs"] != dict(item.split(":", 1) for item in (WORKSPACE, TEMP))
+            or host["Tmpfs"] != dict(item.split(":", 1) for item in (workspace, TEMP))
             or any(mount["Type"] != "tmpfs" or mount["Destination"] not in {"/workspace", "/tmp"}
                    for mount in container["Mounts"])
             or set(container["NetworkSettings"]["Networks"]) != {"none"}):
@@ -176,7 +177,7 @@ def _observe(process, deadline, cancelled, expected_output):
 
 
 def run_isolated(root: Path, scope: Path, command: list[str], image: str, cancelled,
-                 *, expected_output: bytes | None = None) -> ObservedRun:
+                 *, expected_output: bytes | None = None, allow_guest_executable: bool = False) -> ObservedRun:
     """Return a coarse, daemon-observed exit result without retaining guest output."""
     if scope.is_absolute() or ".." in scope.parts:
         raise BoundaryUnavailable("Isolated command scope must stay within the snapshot")
@@ -184,6 +185,7 @@ def run_isolated(root: Path, scope: Path, command: list[str], image: str, cancel
     if not 5 <= time_limit <= 180:
         raise BoundaryUnavailable("Isolated execution time limit is outside the permitted range")
     name = "vh-isolated-" + uuid.uuid4().hex
+    workspace = NATIVE_WORKSPACE if allow_guest_executable else WORKSPACE
     with _local_docker(image) as (base, env, config, invoke, inspect, version), tempfile.TemporaryFile() as archive:
         _stage(root, archive)
         if cancelled():
@@ -194,13 +196,13 @@ def run_isolated(root: Path, scope: Path, command: list[str], image: str, cancel
                    "--ipc=none", "--cgroupns=private", "--cap-drop=ALL", "--security-opt=no-new-privileges=true",
                    f"--user={UID}:{UID}", "--read-only", "--pids-limit=64", "--cpus=1",
                    f"--memory={MEMORY}", f"--memory-swap={MEMORY}", "--log-driver=none", "--restart=no",
-                   "--no-healthcheck", "--runtime=runc", "--tmpfs", WORKSPACE, "--tmpfs", TEMP,
+                   "--no-healthcheck", "--runtime=runc", "--tmpfs", workspace, "--tmpfs", TEMP,
                    "--workdir", "/workspace", "--entrypoint=/usr/bin/env", image,
                    "-i", f"PATH={PATH}", "HOME=/tmp", "TMPDIR=/tmp", "LC_ALL=C.UTF-8",
                    "PYTHONDONTWRITEBYTECODE=1", "/usr/bin/timeout", "--kill-after=2", str(time_limit),
                    "/bin/sh", "-c", ENTRY, "verify-helper", scope.as_posix(), *command)
             container, = inspect("container", "inspect", name)
-            identity = _check_container(container, image)
+            identity = _check_container(container, image, workspace)
             with subprocess.Popen([*base, "start", "--attach", "--interactive", identity],
                                   cwd=config, env=env, stdin=archive,
                                   stdout=subprocess.PIPE if expected_output is not None else subprocess.DEVNULL,
@@ -208,6 +210,8 @@ def run_isolated(root: Path, scope: Path, command: list[str], image: str, cancel
                 output_matches = _observe(process, time.monotonic() + time_limit + 5, cancelled, expected_output)
             state = inspect("container", "inspect", "--format", "{{json .State}}", identity)
             code = state["ExitCode"]
+            if type(code) is int and code in (125, 126, 127):
+                raise BoundaryUnavailable(f"Isolated command could not launch (exit {code})")
             if state["Status"] != "exited" or state["OOMKilled"] or process.returncode != code or code not in (0, 1):
                 raise BoundaryUnavailable("The isolated command did not complete normally")
             return ObservedRun(code, version, time_limit, output_matches)

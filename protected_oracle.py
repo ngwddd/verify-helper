@@ -59,6 +59,7 @@ def run(root, policy, image, cancelled):
     """Return only counts and fixed status codes to the evidence writer."""
     entry = PurePosixPath(policy["entry"])
     suffix = entry.suffix
+    native = suffix in {".c", ".cc", ".cpp", ".cxx"}
     if suffix == ".py":
         runner = ["/usr/local/bin/python", "-I", "-S"]
     elif suffix in {".js", ".mjs", ".cjs"}:
@@ -74,7 +75,7 @@ def run(root, policy, image, cancelled):
         command = [*runner, "/workspace/" + entry.as_posix(), *case["argv"]]
         try:
             result = run_isolated(root, Path("."), command, image, cancelled,
-                                  expected_output=case["stdout"].encode("utf-8"))
+                                  expected_output=case["stdout"].encode("utf-8"), allow_guest_executable=native)
         except (OSError, ValueError, subprocess.SubprocessError, KeyError, TypeError):
             break
         completed += 1

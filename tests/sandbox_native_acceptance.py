@@ -7,11 +7,20 @@ from pathlib import Path
 from unittest.mock import patch
 
 from full_verify import _snapshot, full_verify
+from isolated_runtime import IMAGE_VARIABLE, run_isolated
 from private_storage import private_write
 from protected_oracle import POLICY_VARIABLE
 
 
 class TestNativeGuest(unittest.TestCase):
+    def test_native_toolchain_starts_inside_boundary(self):
+        with tempfile.TemporaryDirectory() as root:
+            for compiler in ("/usr/local/bin/gcc", "/usr/local/bin/g++"):
+                observation = run_isolated(
+                    Path(root), Path("."), [compiler, "--version"], os.environ[IMAGE_VARIABLE], lambda: False,
+                )
+                self.assertEqual(observation.exit_code, 0)
+
     def test_native_single_source_matches_only_the_reviewed_behavior(self):
         examples = {
             "entry.c": '#include <stdio.h>\nint main(int n, char **a) { puts(n > 1 ? a[1] : "empty"); }\n',
