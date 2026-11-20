@@ -70,6 +70,7 @@ jobs:
           uv build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:VERIFY_TEST_PYTHON = uv run python -c "import sys; print(sys.executable)"
+          $env:VERIFY_SCRATCH_DIRECTORY = $env:RUNNER_TEMP
           $evidence = Join-Path $env:RUNNER_TEMP vh-evidence
           $json = uv run verify-helper . --trust-project-code --evidence-dir $evidence --json
           $verdictCode = $LASTEXITCODE

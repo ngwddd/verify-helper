@@ -27,7 +27,8 @@ SNAPSHOT_EXCLUDES = {".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__
                      ".verify-python", ".pytest_cache", ".mypy_cache", ".tox"}
 EXEC_ENV = {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "LANG", "LC_ALL",
             "VERIFY_TEST_PYTHON", "VERIFY_TSC", "VERIFY_PLAYWRIGHT_ROOT", "PLAYWRIGHT_BROWSERS_PATH",
-            "VERIFY_NATIVE_FIXTURE", "CC", "CXX", "CMAKE_GENERATOR", "INCLUDE", "LIB", "LIBPATH",
+            "VERIFY_NATIVE_FIXTURE", "VERIFY_SCRATCH_DIRECTORY", "CC", "CXX", "CMAKE_GENERATOR",
+            "INCLUDE", "LIB", "LIBPATH",
             "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "PROGRAMDATA", "SYSTEMDRIVE",
             "PROCESSOR_ARCHITECTURE"}
 
@@ -348,7 +349,8 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
     git = _source_git(root)
     run_output = None
     try:
-        with tempfile.TemporaryDirectory(prefix="verify-helper-") as directory:
+        scratch = Path(os.environ.get("VERIFY_SCRATCH_DIRECTORY", tempfile.gettempdir())).resolve()
+        with tempfile.TemporaryDirectory(prefix="vh-", dir=scratch) as directory:
             work = Path(directory).resolve()
             snapshot = work / "project"
             source = root
@@ -364,7 +366,8 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
             env = {key: value for key, value in os.environ.items() if key.upper() in EXEC_ENV}
             env.update({"HOME": str(home), "USERPROFILE": str(home), "LOCALAPPDATA": str(home),
                         "APPDATA": str(home), "TEMP": str(work), "TMP": str(work),
-                        "TMPDIR": str(work), "PYTHONUTF8": "1", "PYTHONNOUSERSITE": "1",
+                        "TMPDIR": str(work), "VERIFY_SCRATCH_DIRECTORY": str(scratch),
+                        "PYTHONUTF8": "1", "PYTHONNOUSERSITE": "1",
                         "PYTHONDONTWRITEBYTECODE": "1", "GIT_CONFIG_NOSYSTEM": "1",
                         "NPM_CONFIG_OFFLINE": "true", "NPM_CONFIG_AUDIT": "false"})
             if "PLAYWRIGHT_BROWSERS_PATH" not in env:

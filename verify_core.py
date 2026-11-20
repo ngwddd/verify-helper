@@ -1546,7 +1546,9 @@ def check_tests(root: Path, files: list[Path], ctx: "Ctx", language: str | None 
     code, out = _run(cmd, root, min(timeout, ctx.test_timeout))
     c.command = " ".join(cmd)
     c.exit_code = code
-    c.output = _tail(out, 2000)
+    failure = re.search(r"^(?:FAIL|ERROR):\s+\S+", out, re.M)
+    c.output = (out[failure.start():failure.start() + 12000] if code and failure
+                else _tail(out, 12000))
     ran, skipped = _test_counts(out)
     c.coverage = {"planned": ran, "observed": max(0, ran - skipped), "skipped": skipped}
     if code in (124, 125, 126, 127) or code < 0:
