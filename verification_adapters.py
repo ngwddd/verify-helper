@@ -12,7 +12,11 @@ import shutil
 import stat
 import tarfile
 import zipfile
+from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
+
+from packaging.utils import canonicalize_name, parse_sdist_filename, parse_wheel_filename
+from packaging.version import Version
 
 import verify_core as core
 
@@ -140,10 +144,14 @@ def _validate_names(names: list[str]) -> None:
     if not names:
         raise ValueError("Archive is empty")
     normalized = set()
+    reserved = {"con", "prn", "aux", "nul",
+                *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
     for name in names:
         path = PurePosixPath(name)
         if (not name or path == PurePosixPath(".") or path.is_absolute() or
-                ".." in path.parts or "\\" in name or ":" in name):
+                ".." in path.parts or "\\" in name or ":" in name or
+                any(part.rstrip(" .") != part or part.split(".")[0].casefold() in reserved
+                    for part in path.parts) or any(ord(char) < 32 for char in name)):
             raise ValueError("Archive contains an unsafe path")
         canonical = path.as_posix().casefold()
         if canonical in normalized:
@@ -151,7 +159,14 @@ def _validate_names(names: list[str]) -> None:
         normalized.add(canonical)
 
 
-def _check_wheel(archive: zipfile.ZipFile, files: set[str]) -> None:
+def _metadata_identity(data: bytes) -> tuple[str, Version]:
+    metadata = BytesParser().parsebytes(data, headersonly=True)
+    if not metadata["Name"] or not metadata["Version"]:
+        raise ValueError("Delivery metadata has no project name or version")
+    return canonicalize_name(metadata["Name"]), Version(metadata["Version"])
+
+
+def _check_wheel(archive: zipfile.ZipFile, files: set[str], path: Path) -> None:
     records = [name for name in files if name.endswith(".dist-info/RECORD")]
     if len(records) != 1:
         raise ValueError("Wheel requires exactly one RECORD")
@@ -159,6 +174,10 @@ def _check_wheel(archive: zipfile.ZipFile, files: set[str]) -> None:
     directory = record.rsplit("/", 1)[0]
     if not {f"{directory}/METADATA", f"{directory}/WHEEL"}.issubset(files):
         raise ValueError("Wheel metadata is incomplete")
+    expected_name, expected_version, _, _ = parse_wheel_filename(path.name)
+    actual_name, actual_version = _metadata_identity(archive.read(f"{directory}/METADATA"))
+    if (actual_name, actual_version) != (expected_name, expected_version):
+        raise ValueError("Wheel name or version differs from METADATA")
     seen = set()
     rows = csv.reader(io.TextIOWrapper(archive.open(record), encoding="utf-8", newline=""))
     for path, digest, size in rows:
@@ -207,20 +226,31 @@ def archive(identifier: str, path: Path, expected: object = None) -> core.Check:
                     raise ValueError("ZIP CRC verification failed")
                 names = {entry.filename for entry in members if not entry.is_dir()}
                 if path.suffix.lower() == ".whl":
-                    _check_wheel(package, names)
+                    _check_wheel(package, names, path)
         elif path.name.endswith((".tar.gz", ".tgz")):
             with tarfile.open(path, "r:gz") as package:
-                members = package.getmembers()
+                members = []
+                total = 0
+                for entry in package:
+                    total += entry.size
+                    if total > 512 * 1024 * 1024 or len(members) >= 200_000:
+                        return check(identifier, "Tar exceeds verified size or member limit")
+                    members.append(entry)
                 _validate_names([entry.name for entry in members])
                 if any(not (e.isfile() or e.isdir()) for e in members):
                     raise ValueError("Tar contains a link or special file")
-                if sum(entry.size for entry in members) > 512 * 1024 * 1024:
-                    return check(identifier, "Tar exceeds verified uncompressed size limit")
                 names = {entry.name for entry in members if entry.isfile()}
                 for entry in members:
                     if entry.isfile():
                         with package.extractfile(entry) as stream:
                             hashlib.file_digest(stream, "sha256")
+                metadata = sorted(name for name in names if PurePosixPath(name).match("*/PKG-INFO")
+                                  and len(PurePosixPath(name).parts) == 2)
+                if metadata and path.name.endswith(".tar.gz"):
+                    with package.extractfile(metadata[0]) as stream:
+                        identity = _metadata_identity(stream.read())
+                    if len(metadata) != 1 or identity != parse_sdist_filename(path.name):
+                        raise ValueError("Source distribution name or version differs from PKG-INFO")
         else:
             return check(identifier, "Delivery format is unsupported")
         if not names or (expected and not set(expected["members"]).issubset(names)):

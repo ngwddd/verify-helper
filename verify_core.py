@@ -39,10 +39,12 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from urllib.parse import quote
 
+import yaml
+
 import check_specs as S
 import directions as DIR
 
-VERSION = "2.0.0rc1"
+VERSION = "2.0.0rc2"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -575,9 +577,11 @@ def check_syntax(root: Path, files: list[Path], ctx: "Ctx") -> Check:
     jss = [p for p in files if p.suffix.lower() in {".js", ".mjs", ".cjs"}]
     jsonf = [p for p in files if p.suffix.lower() in JSON_EXT]
     tomlf = [p for p in files if p.suffix.lower() == ".toml"]
-    if not (pys or jss or jsonf or tomlf):
+    yamlf = [p for p in files if p.suffix.lower() in {".yaml", ".yml"}]
+    eligible = len(pys) + len(jss) + len(jsonf) + len(tomlf) + len(yamlf)
+    if not eligible:
         c.state, c.applicable = "UNKNOWN", False
-        c.detail = "项目里没有 .py / .js / .json / .toml 文件"
+        c.detail = "No supported source or configuration files"
         return c
 
     bad: list[dict] = []
@@ -600,6 +604,18 @@ def check_syntax(root: Path, files: list[Path], ctx: "Ctx") -> Check:
             tomllib.loads(_strip_bom(_read(p) or ""))
         except Exception as e:
             bad.append({"file": _rel(root, p), "line": 0, "message": f"TOML: {e}"[:160]})
+    for p in yamlf:
+        try:
+            source = _read(p)
+            if source is None:
+                raise ValueError("Cannot read YAML file")
+            loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+            for _ in yaml.compose_all(_strip_bom(source), Loader=loader):
+                pass
+        except (yaml.YAMLError, ValueError) as error:
+            mark = getattr(error, "problem_mark", None)
+            bad.append({"file": _rel(root, p), "line": mark.line + 1 if mark else 0,
+                        "message": getattr(error, "problem", None) or "YAML syntax is invalid"})
 
     # JS：先查缓存，只对没命中/变了的文件起 node --check，并行
     todo: list[Path] = []
@@ -612,18 +628,16 @@ def check_syntax(root: Path, files: list[Path], ctx: "Ctx") -> Check:
             continue
         todo.append(p)
 
-    capped = todo
-    js_skipped = 0
-    no_node = False
-    if capped:
+    unavailable = 0
+    if todo:
         def one(p: Path):
             code, out = _run(["node", "--check", str(p)], root, 30)
             return p, code, out
 
         with ThreadPoolExecutor(max_workers=ctx.workers) as ex:
-            for p, code, out in ex.map(one, capped):
-                if code in (124, 126, 127):
-                    no_node = True
+            for p, code, out in ex.map(one, todo):
+                if code in (124, 125, 126, 127) or code < 0:
+                    unavailable += 1
                     continue
                 if code == 0:
                     ctx.cache.put(p, True)
@@ -631,19 +645,16 @@ def check_syntax(root: Path, files: list[Path], ctx: "Ctx") -> Check:
                     msg = _node_error_line(out)
                     ctx.cache.put(p, False, msg)
                     bad.append({"file": _rel(root, p), "line": 0, "message": msg})
-        if no_node:
-            c.state, c.applicable = "UNKNOWN", False
-            c.detail = "这台机器上没有 node，JS 语法无法检查"
-            c.seconds = time.time() - t0
-            return c
-
     c.findings = bad
-    c.state = "FAIL" if bad else "PASS"
+    c.state = "FAIL" if bad else "UNKNOWN" if unavailable else "PASS"
+    c.coverage = {"planned": eligible, "observed": eligible - unavailable}
+    if unavailable:
+        c.reason_code = "JAVASCRIPT_SYNTAX_UNAVAILABLE"
     c.detail = (f"py {len(pys)} / js {len(jss)}（缓存命中 {ctx.cache.hits}）/ "
-                f"json {len(jsonf)} / toml {len(tomlf)}；失败 {len(bad)}"
-                + (f"；另有 {js_skipped} 个 js 超出单次上限未查" if js_skipped else ""))
-    c.command = "ast.parse + node --check + json.loads + tomllib"
-    c.exit_code = 0 if not bad else 1
+                f"json {len(jsonf)} / toml {len(tomlf)} / yaml {len(yamlf)}；失败 {len(bad)}"
+                + (f"；{unavailable} 个 JS 文件未完成语法检查" if unavailable else ""))
+    c.command = "ast.parse + node --check + json.loads + tomllib + YAML compose"
+    c.exit_code = {"PASS": 0, "FAIL": 1, "UNKNOWN": None}[c.state]
     c.seconds = time.time() - t0
     return c
 
@@ -1127,15 +1138,19 @@ def check_browser(root: Path, files: list[Path], ctx: "Ctx") -> Check:
             c.findings = findings
             actual = [p.get("rel") for p in data.get("pages", [])]
             expected = [p["rel"] for p in entries]
-            complete = (set(actual) == set(expected) and len(actual) == len(entries) == len(htmls)
+            blocked = sum(bool(pg.get("blocked")) for pg in data.get("pages", []))
+            complete = (not blocked and set(actual) == set(expected) and len(actual) == len(entries) == len(htmls)
                         and all(pg.get("status") == 200 for pg in data.get("pages", [])))
             c.state = "FAIL" if findings else ("PASS" if complete else "UNKNOWN")
-            c.coverage = {"planned": len(htmls), "observed": len(set(actual)), "subjects": actual}
+            c.coverage = {"planned": len(htmls), "observed": max(0, len(set(actual)) - blocked), "subjects": actual}
+            if blocked:
+                c.reason_code = "PREVIEW_EXTERNAL_NETWORK_BLOCKED"
             shots_n = len(data.get("shots", []))
             c.detail = (f"站点根 {_rel(root, site_root) or '.'}"
                         + (f"（部署前缀 {base}）" if base else "")
                         + f"，真跑 {len(data.get('pages', []))} 页，"
-                        f"问题 {len(findings)} 处" + (f"，截图 {shots_n} 张" if shots_n else ""))
+                        f"问题 {len(findings)} 处" + (f"，截图 {shots_n} 张" if shots_n else "")
+                        + (f"，{blocked} 页请求了预览站点外的资源" if blocked else ""))
             c.command = f"playwright(chromium) + http.server:{port}"
             c.exit_code = 0 if not findings else 1
     except Exception as e:
@@ -1209,7 +1224,14 @@ def _load_flows(root: Path) -> tuple[list[dict], str]:
                 if set(exp) & {"visible", "text_contains", "input_value"} and not exp.get("selector"):
                     return [], f"「{name}」第 {j} 步的元素断言缺少 selector"
             clean.append(s)
-        flows.append({"name": name, "steps": clean})
+        flow = {"name": name, "steps": clean}
+        if "viewport" in f:
+            viewport = f["viewport"]
+            if (not isinstance(viewport, dict) or set(viewport) != {"width", "height"}
+                    or any(type(value) is not int or not 200 <= value <= 3000 for value in viewport.values())):
+                return [], f"「{name}」viewport 必须包含 200–3000 范围内的整数 width 和 height"
+            flow["viewport"] = viewport
+        flows.append(flow)
     return flows, ""
 
 
@@ -1260,7 +1282,8 @@ def check_interaction(root: Path, files: list[Path], ctx: "Ctx") -> Check:
         else:
             data = json.loads(out_file.read_text(encoding="utf-8"))
             results = data.get("flows", [])
-            failed = [r for r in results if not r.get("passed")]
+            blocked = sum(bool(r.get("blocked")) for r in results)
+            failed = [r for r in results if not r.get("passed") and not r.get("blocked")]
             findings = []
             for r in failed:
                 fs = r.get("failedStep") or {}
@@ -1270,15 +1293,18 @@ def check_interaction(root: Path, files: list[Path], ctx: "Ctx") -> Check:
                                  "message": msg[:400],
                                  "shot": r.get("shot")})
             c.findings = findings
-            complete = [r.get("name") for r in results] == [f.get("name") for f in flows]
+            complete = not blocked and [r.get("name") for r in results] == [f.get("name") for f in flows]
             c.state = "FAIL" if failed else ("PASS" if complete else "UNKNOWN")
-            c.coverage = {"planned": len(flows), "observed": len(results)}
+            c.coverage = {"planned": len(flows), "observed": len(results) - blocked}
+            if blocked:
+                c.reason_code = "PREVIEW_EXTERNAL_NETWORK_BLOCKED"
             if shots.is_dir() and any(shots.iterdir()):
                 saved = Path(tempfile.mkdtemp(prefix="vh-evidence-")) / "interaction"
                 shutil.move(shots, saved)
                 c.evidence = {"dir": str(saved), "kind": "interaction-screenshots",
                               "count": len(list(saved.glob("*.png")))}
-            c.detail = f"{len(flows)} 条流程，通过 {len(results) - len(failed)}，失败 {len(failed)}"
+            c.detail = (f"{len(flows)} 条流程，通过 {len(results) - len(failed) - blocked}，失败 {len(failed)}"
+                        + (f"，{blocked} 条流程请求了预览站点外的资源" if blocked else ""))
             if base:
                 c.detail += f"（部署前缀 {base}）"
             c.command = f"playwright(chromium) 逐条执行 verify.toml [[flows]]"
@@ -1336,13 +1362,15 @@ def _changed_lines(root: Path) -> dict[str, set[int]]:
 def check_mutation(root: Path, files: list[Path], ctx: "Ctx") -> Check:
     c = Check("mutation", "变异门：测试能不能发现改坏的行")
     t0 = time.time()
-    cmd, why, _ = _detect_test_command(root)
+    cmd, _, _ = _detect_test_command(root, "python")
     if cmd is None:
         c.state, c.applicable = "UNKNOWN", False
         c.detail = "没有测试入口，变异门无从判定"
         return c
 
-    pys = [p for p in files if p.suffix.lower() in PY_EXT]
+    pys = [p for p in files if p.suffix.lower() in PY_EXT
+           and not ({"tests", "test"} & set(p.relative_to(root).parts[:-1]))
+           and not p.name.startswith("test_") and not p.name.endswith("_test.py")]
     if not pys:
         c.state, c.applicable = "UNKNOWN", False
         c.detail = "没有 .py 文件，变异门目前只支持 Python"
@@ -1387,13 +1415,14 @@ def check_mutation(root: Path, files: list[Path], ctx: "Ctx") -> Check:
             lines[lineno - 1] = lines[lineno - 1].replace(src_tok.encode(), dst_tok.encode(), 1)
             mutated.write_bytes(b"".join(lines))
             code, out = _run(cmd, candidate, ctx.mutation_timeout)
-        if code == 0:
+        ran, skipped = _test_counts(out)
+        if code == 0 and ran > skipped:
             survivors.append({
                 "file": _rel(root, p), "line": lineno,
                 "message": f"把 {src_tok.strip()} 改成 {dst_tok.strip()} 后测试仍然通过 —— 这行没有有效断言",
                 "severity": "medium",
             })
-        elif code in (124, 125, 126, 127) or code < 0 or not _test_counts(out)[0]:
+        elif code in (0, 124, 125, 126, 127) or code < 0 or ran <= skipped:
             errors.append(f"{_rel(root, p)}:{lineno} 运行时出错（{code}）")
         else:
             killed += 1
@@ -1404,9 +1433,10 @@ def check_mutation(root: Path, files: list[Path], ctx: "Ctx") -> Check:
         c.detail = f"试了 {total} 个变异，存活 {len(survivors)}（另有 {len(errors)} 个跑不起来）"
     else:
         c.detail = f"试了 {total} 个变异，被杀 {killed}，存活 {len(survivors)}"
-    c.state = "FAIL" if survivors else ("PASS" if total and not errors else "UNKNOWN")
-    c.coverage = {"planned": min(budget, len(candidates)), "observed": total,
-                  "candidate_count": len(candidates)}
+    c.state = "FAIL" if survivors else ("PASS" if total == len(candidates) else "UNKNOWN")
+    c.coverage = {"planned": len(candidates), "observed": total}
+    if len(candidates) > budget:
+        c.detail += f"；预算 {budget} / 候选 {len(candidates)}"
     c.command = " ".join(cmd) + "（逐个变异重跑）"
     c.exit_code = 0 if not survivors else 1
     c.seconds = time.time() - t0

@@ -13,3 +13,18 @@ export function flowUrl(base, path) {
 export function screenshotName(subject) {
   return createHash('sha256').update(subject).digest('hex') + '.png';
 }
+
+export async function restrictPreviewNetwork(context, base, blocked) {
+  const origin = new URL(base).origin;
+  await context.route('**/*', route => {
+    const url = new URL(route.request().url());
+    if (url.origin === origin) return route.continue();
+    blocked.add(url.href);
+    return route.abort('blockedbyclient');
+  });
+  await context.routeWebSocket('**/*', socket => {
+    // Static previews have no declared WebSocket service.
+    blocked.add(socket.url());
+    return socket.close();
+  });
+}

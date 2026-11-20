@@ -40,7 +40,7 @@ class CheckSpec:
 SPECS: tuple[CheckSpec, ...] = (
     CheckSpec(
         "syntax", "语法解析", "high", "语法",
-        "每个 .py / .js / .json / .toml 文件都要能被对应的解析器接受。",
+        "每个 .py / .js / .json / .toml / .yaml 文件都要能被对应的解析器接受。",
         "按报错的行号修掉；JS 可用 node --check 单文件复现。",
     ),
     CheckSpec(

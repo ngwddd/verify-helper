@@ -20,7 +20,7 @@
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { arg, flowUrl, screenshotName } from './probe_helpers.mjs';
+import { arg, flowUrl, restrictPreviewNetwork, screenshotName } from './probe_helpers.mjs';
 
 const moduleDir = arg('module');
 const specFile = arg('spec');
@@ -118,7 +118,10 @@ async function runExpect(page, expect, consoleErrors) {
 for (const flow of spec.flows || []) {
   const name = flow.name || '(未命名流程)';
   const rec = { name, passed: false, failedStep: null, error: null, console: [], shot: null };
-  const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  const viewport = flow.viewport || { width: 1280, height: 900 };
+  const ctx = await browser.newContext({ viewport, serviceWorkers: 'block' });
+  const blocked = new Set();
+  await restrictPreviewNetwork(ctx, spec.base, blocked);
   const page = await ctx.newPage();
   const consoleErrors = [];
   const pageErrors = [];
@@ -189,6 +192,7 @@ for (const flow of spec.flows || []) {
     await ctx.close();
   }
 
+  rec.blocked = blocked.size;
   results.push(rec);
 }
 

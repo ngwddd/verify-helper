@@ -1,6 +1,7 @@
 """Acceptance evidence for full verification and cross-project fixture classes."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ import tempfile
 import threading
 import unittest
 import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 from jsonschema import Draft202012Validator
@@ -18,6 +20,7 @@ from full_verify import decide, full_verify
 import full_verify as engine
 import lifecycle
 import verify_core as core
+from process_boundary import contain_worker
 
 
 PASSING_TEST = """import unittest
@@ -143,6 +146,80 @@ class FullVerification(unittest.TestCase):
         self.assertTrue(row["required"])
         self.assertEqual(row["not_run"], 1)
         self.assertEqual(report["verdict"], "UNKNOWN")
+
+    def test_rc2_invalid_yaml_is_a_required_syntax_failure(self):
+        self.file("workflow.yaml", "jobs: [\n")
+        report, rows = self.run_full()
+        self.assertEqual(report["verdict"], "FAIL")
+        self.assertEqual(rows["syntax"]["findings"][0]["file"], "workflow.yaml")
+
+    def test_rc2_missing_node_is_applicable_and_preserves_other_failures(self):
+        js = self.file("sample.mjs", "const state = 1;")
+        py = self.file("broken.py", "def broken(:\n")
+        with patch.object(core, "_run", return_value=(127, "")):
+            ctx = core.Ctx(core.Cache(False))
+            unavailable = core.check_syntax(self.root, [js], ctx)
+            known_failure = core.check_syntax(self.root, [js, py], ctx)
+        self.assertTrue(unavailable.applicable)
+        self.assertEqual(unavailable.state, "UNKNOWN")
+        self.assertEqual(unavailable.coverage, {"planned": 1, "observed": 0})
+        self.assertEqual(known_failure.state, "FAIL")
+
+    def test_rc2_project_cannot_be_its_own_scratch_directory(self):
+        self.file("README.md", "Documentation.")
+        with patch.dict(os.environ, {"VERIFY_SCRATCH_DIRECTORY": str(self.root)}):
+            report, _ = self.run_full()
+        self.assertEqual(report["verdict"], "UNKNOWN")
+        self.assertEqual([item.name for item in self.root.iterdir()], ["README.md"])
+
+    def test_rc2_manifest_binds_the_frozen_check_plan(self):
+        self.file("README.md", "Documentation.")
+        report, _ = self.run_full()
+        manifest = json.loads((Path(report["evidence_dir"]) / "manifest.json").read_bytes())
+        self.assertEqual(report["plan_digest"], manifest["plan_digest"])
+        self.assertEqual(set(report["plan"]), {row["check_id"] for row in report["ledger"] if row["required"]})
+
+    def test_rc2_worker_process_boundary_is_applied(self):
+        if os.name != "nt":
+            self.file("README.md", "Documentation.")
+            report, _ = self.run_full()
+            self.assertEqual(report["process_boundary"], "process")
+            return
+        import win32api
+        import win32con
+        import win32event
+
+        go, receipt = self.root / "go", self.root / "pid"
+        worker_code = (
+            "from pathlib import Path\nimport sys,time,subprocess\n"
+            f"while not Path({str(go)!r}).exists(): time.sleep(.02)\n"
+            "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(90)'],"
+            "creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)\n"
+            f"Path({str(receipt)!r}).write_text(str(p.pid))\n"
+        )
+        with subprocess.Popen([core.sys.executable, "-c", worker_code]) as worker:
+            with contain_worker(worker) as boundary:
+                self.assertEqual(boundary, "windows-job")
+                go.touch()
+                worker.wait(timeout=15)
+                child = win32api.OpenProcess(win32con.SYNCHRONIZE, False, int(receipt.read_text()))
+            try:
+                self.assertEqual(win32event.WaitForSingleObject(child, 5000), win32event.WAIT_OBJECT_0)
+            finally:
+                child.Close()
+
+    def test_rc2_mutation_budget_preserves_missing_coverage(self):
+        source = self.file("calc.py", "".join(f"def value_{n}():\n    return {n} + 1\n"
+                                             for n in range(6)))
+        tests = self.file("tests/test_calc.py", "import unittest, calc\nclass Check(unittest.TestCase):\n" +
+                          "".join(f"    def test_value_{n}(self): self.assertEqual(calc.value_{n}(), {n+1})\n"
+                                  for n in range(6)))
+        original = source.read_bytes()
+        ctx = core.Ctx(core.Cache(False), mutation_max=2)
+        result = core.check_mutation(self.root, [source, tests], ctx)
+        self.assertEqual(result.state, "UNKNOWN", result.detail)
+        self.assertEqual(result.coverage, {"planned": 6, "observed": 2})
+        self.assertEqual(source.read_bytes(), original)
 
     def test_v2_p0_02_finds_js_syntax_error_past_previous_cap(self):
         if not shutil.which("node"):
@@ -272,6 +349,25 @@ members = ["README.md"]
         self.assertEqual(rows["delivery-1"]["state"], "FAIL")
         self.assertEqual(report["verdict"], "FAIL")
 
+    def test_rc2_package_name_and_version_must_match_metadata(self):
+        self.file("README.md", "Delivery.")
+        (self.root / "dist").mkdir()
+        path = self.root / "dist/fixture-2.0-py3-none-any.whl"
+        folder = "fixture-2.0.dist-info"
+        members = {f"{folder}/METADATA": b"Name: fixture\nVersion: 1.0\n",
+                   f"{folder}/WHEEL": b"Wheel-Version: 1.0\n"}
+        with zipfile.ZipFile(path, "w") as archive:
+            record = []
+            for name, data in members.items():
+                archive.writestr(name, data)
+                value = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip("=")
+                record.append(f"{name},sha256={value},{len(data)}")
+            entry = f"{folder}/RECORD"
+            archive.writestr(entry, "\n".join([*record, f"{entry},,"]) + "\n")
+        report, rows = self.run_full()
+        self.assertEqual(report["verdict"], "FAIL")
+        self.assertIn("version differs", rows["delivery-1"]["detail"])
+
     @unittest.skipUnless(shutil.which("git"), "Requires Git")
     def test_unresolved_merge_never_falls_back_to_head(self):
         self.file("README.md", "Valid.")
@@ -320,10 +416,11 @@ members = ["README.md"]
         self.file("en/404.html", """<!doctype html>
 <html lang="en"><head><title>Not found</title></head><body><h1>Not found</h1></body></html>""")
         self.file("site.css", "body { color: black; }\n")
-        self.file("app.mjs", "document.body.dataset.ready = 'yes';\n")
+        self.file("app.mjs", "document.body.dataset.ready = innerWidth === 390 ? 'mobile' : 'yes';\n")
         self.file("verify.toml", '''[[flows]]
 name = "Restore saved session"
-steps = [{goto="index.html"}, {expect={selector="body[data-ready='yes']", visible=true}}, {click="button"}, {expect={selector="button", text_contains="Save restored"}}]
+viewport = {width=390, height=844}
+steps = [{goto="index.html"}, {expect={selector="body[data-ready='mobile']", visible=true}}, {click="button"}, {expect={selector="button", text_contains="Save restored"}}]
 ''')
         report, rows = self.run_full()
         self.assertEqual(rows["browser"]["state"], "PASS", rows["browser"])
@@ -357,6 +454,34 @@ steps = [{goto="index.html"}, {expect={no_console_error=true, url_contains="inde
         self.assertEqual(rows["browser"]["coverage"]["observed"], 31)
         self.assertEqual(report["verdict"], "FAIL")
         self.assertTrue(any(item["file"] == "page-030.html" for item in rows["browser"]["findings"]))
+
+    @unittest.skipUnless(os.environ.get("VERIFY_PLAYWRIGHT_ROOT") and shutil.which("node"),
+                         "Requires a configured Chromium installation")
+    def test_rc2_browser_refuses_cross_origin_network(self):
+        received = []
+
+        class Witness(BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.append(self.path)
+                self.send_response(204)
+                self.end_headers()
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Witness) as server:
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            try:
+                port = server.server_address[1]
+                self.file("index.html", "<!doctype html><html><head><title>Fixture</title>"
+                          f'<script src="http://127.0.0.1:{port}/external.js"></script>'
+                          "</head><body><p>Fixture</p></body></html>")
+                report, rows = self.run_full()
+                self.assertEqual(received, [])
+                self.assertEqual(rows["browser"]["state"], "UNKNOWN", rows["browser"])
+                self.assertEqual(rows["browser"]["reason_code"], "PREVIEW_EXTERNAL_NETWORK_BLOCKED")
+                self.assertFalse(report["releasable"])
+            finally:
+                server.shutdown()
+                thread.join()
 
     @unittest.skipUnless(os.environ.get("VERIFY_TSC") and shutil.which("node"),
                          "Requires a configured TypeScript compiler")

@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install the approved Verify Helper candidate
-        run: python -m pip install verify_helper-2.0.0rc1-py3-none-any.whl
+        run: python -m pip install verify_helper-2.0.0rc2-py3-none-any.whl
       - name: Full verification
         run: verify-helper run . --trust-project-code --sarif verify.sarif --evidence-dir .verify-artifacts
       - name: Retain evidence

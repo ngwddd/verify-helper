@@ -16,7 +16,7 @@
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { writeFileSync, mkdirSync } from 'node:fs';
-import { arg, screenshotName } from './probe_helpers.mjs';
+import { arg, restrictPreviewNetwork, screenshotName } from './probe_helpers.mjs';
 
 const moduleDir = arg('module');
 const base = arg('base');
@@ -63,12 +63,15 @@ if (shotsDir) mkdirSync(shotsDir, { recursive: true });
 const CONCURRENCY = Math.max(1, Math.min(6, Number(arg('concurrency', '4')) || 4));
 
 async function visit(p) {
-  const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, serviceWorkers: 'block' });
+  const blocked = new Set();
+  await restrictPreviewNetwork(ctx, base, blocked);
   const page = await ctx.newPage();
   const rec = { rel: p.rel, status: 0, console: [], pageerrors: [], failed: [] };
 
   page.on('console', (m) => {
     if (m.type() === 'error' || m.type() === 'warning') {
+      if (blocked.has(m.location().url)) return;
       rec.console.push({ type: m.type(), text: m.text().slice(0, 300) });
     }
   });
@@ -76,6 +79,7 @@ async function visit(p) {
     rec.pageerrors.push(String(e && e.message ? e.message : e).slice(0, 300));
   });
   page.on('requestfailed', (r) => {
+    if (blocked.has(r.url())) return;
     rec.failed.push({ url: r.url().slice(0, 200), reason: (r.failure()?.errorText || 'failed').slice(0, 120) });
   });
   page.on('response', (r) => {
@@ -96,6 +100,7 @@ async function visit(p) {
   } finally {
     await ctx.close();
   }
+  rec.blocked = blocked.size;
   return rec;
 }
 

@@ -53,6 +53,7 @@ HTTP 服务监听 127.0.0.1，在 /mcp 提供标准接口，拒绝外部 Origin�
 |---|---|
 | Python | 语法、编码、测试，及项目显式声明的变异和业务契约 |
 | JavaScript | Node 语法、npm 或 Node 测试及运行契约 |
+| 配置文件 | JSON、TOML 与 YAML 语法 |
 | TypeScript 与 JSX | TypeScript 编译器及测试入口，项目须提供 tsconfig.json |
 | C/C++ | CMake 构建与 CTest，或项目声明的构建与运行契约 |
 | Web | HTML 与链接、HTTP 页面、Chromium 及已声明的交互流程 |
@@ -65,6 +66,8 @@ Windows 工具链受路径长度限制时，可以用 VERIFY_SCRATCH_DIRECTORY �
 ## 项目规则
 
 在项目根放置 verify.toml。交互步骤与静态正则可参考 examples 下的配置。声明的运行命令需要返回退出码 0，并输出一行精确匹配的断言文本。
+
+浏览器仅访问验证器启动的预览站点。跨站请求或 WebSocket 被阻断时，相应覆盖记为缺失。浏览器流程可以声明 viewport，例如 `{width=390, height=844}`。
 
 ```toml
 [verification]
@@ -79,6 +82,6 @@ expect_output = "Save migration verified"
 
 ## 裁决与证据
 
-每次运行的 UUID 对应一个证据目录，默认位于用户的 `.verify-helper` 目录。report.json 包含项目提交、源快照 SHA-256、策略摘要、覆盖率账本及总裁决。manifest.json 绑定报告、逐项收据与 SARIF。重取报告时会重新校验证据摘要。缺少必检项、写证据失败或只执行部分用例会阻止 PASS。发布验证另有跨平台和独立审计要求。
+每次运行的 UUID 对应一个证据目录，默认位于用户的 `.verify-helper` 目录。report.json 包含项目提交、源快照 SHA-256、策略与冻结计划摘要、覆盖率账本及裁决。manifest.json 绑定报告、逐项收据与 SARIF。重取报告时会重新校验其摘要。缺少必检项、写证据失败或只执行部分用例会阻止 PASS。Windows Worker 使用 Job Object 收尾子进程。对不受信任的项目，动态执行需要另外验证过的系统级隔离。
 
 从 1.x 升级请参阅 [迁移指南](docs/MIGRATION-v1-to-v2.md)。

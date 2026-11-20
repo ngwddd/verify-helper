@@ -92,6 +92,9 @@ jobs:
           $json = uv run verify-helper . --trust-project-code --evidence-dir $evidence --json
           $verdictCode = $LASTEXITCODE
           $report = $json | ConvertFrom-Json
+          if ($report.git.head -ne $env:GITHUB_SHA -or $report.git.dirty -ne $false -or !$report.releasable) {
+            throw "Self-verification must certify the exact clean CI commit"
+          }
           if (@($report.checks | Where-Object { $_.id -like 'delivery-*' -and $_.state -eq 'PASS' }).Count -ne 2) {
             throw "Delivery verification failed"
           }
@@ -104,6 +107,34 @@ jobs:
           uv run --no-project --with $wheel verify-helper --list-checks
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           uv run --no-project --with $wheel verify-helper-mcp --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $delivery = Join-Path $env:RUNNER_TEMP vh-distribution
+          New-Item -ItemType Directory -Path $delivery -Force | Out-Null
+          $files = Get-ChildItem -LiteralPath dist -File | Where-Object { $_.Name -like '*.whl' -or $_.Name -like '*.tar.gz' }
+          $hashes = foreach ($file in $files) {
+            $digest = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            if (-not ($report.checks | Where-Object { $_.id -like 'delivery-*' -and $_.state -eq 'PASS' -and $_.detail.Contains($digest) })) {
+              throw "Distribution file digest not linked to passing evidence: $($file.Name)"
+            }
+            Copy-Item -LiteralPath $file.FullName -Destination $delivery
+            "$digest *$($file.Name)"
+          }
+          $hashes | Set-Content -LiteralPath (Join-Path $delivery SHA256SUMS) -Encoding utf8NoBOM
+          [ordered]@{
+            version = $report.version
+            commit = $report.git.head
+            workflow_run = $env:GITHUB_RUN_ID
+            snapshot_sha256 = $report.snapshot_sha256
+            plan_digest = $report.plan_digest
+            evidence_manifest_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $report.evidence_dir manifest.json)).Hash.ToLowerInvariant()
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $delivery provenance.json) -Encoding utf8NoBOM
+      - name: Retain candidate distribution
+        if: matrix.python == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: distribution-${{ matrix.os }}-py3.12
+          path: ${{ runner.temp }}/vh-distribution
+          if-no-files-found: error
       - name: Retain verification evidence
         if: always() && matrix.python == '3.12'
         uses: actions/upload-artifact@v4

@@ -14,13 +14,15 @@ import sys
 import tempfile
 import time
 import uuid
+from contextlib import ExitStack
 from pathlib import Path
 
 import check_specs
 import sarif
 import verification_adapters as adapters
 import verify_core as core
-from run_evidence import digest as evidence_digest, read_evidence, set_gate_fields, write_manifest
+from process_boundary import contain_worker
+from run_evidence import digest as evidence_digest, plan_digest, read_evidence, set_gate_fields, write_manifest
 
 SCHEMA_VERSION = 2
 DYNAMIC = {"tests", "browser", "interaction", "mutation", "runtime-web"}
@@ -109,7 +111,7 @@ def _scope(root: Path, files: list[Path]) -> list[Path]:
                            if file.name in manifests and file.parent != root})]
 
 
-def _run_plan(root: Path, trusted: bool) -> dict:
+def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = ()) -> dict:
     files, _, large, _ = core.scan_files(root)
     ctx = core.Ctx(core.Cache(False))
     config_error = None
@@ -124,19 +126,27 @@ def _run_plan(root: Path, trusted: bool) -> dict:
     report = core._verify_checks(str(root), checks=static, use_cache=False, artifacts=False,
                          review_md=False)
     required = {}
+    tasks = []
     rows = report["checks"]
     for row in rows:
         if row["applicable"] and (row["blocking"] or row["id"] == "custom"):
             required[row["id"]] = "Applicable source and configuration checks"
 
-    def add(result: core.Check, reason: str, identifier: str | None = None):
+    def record(result: core.Check, identifier: str | None = None):
         if identifier is not None:
             result.id = identifier
         result.applicable = True
-        required[result.id] = reason
         rows.append(result.as_dict())
 
+    def add(result: core.Check, reason: str):
+        required[result.id] = reason
+        record(result)
+
     def run(identifier: str, description: str, action, *, requires_trust: bool = True):
+        required[identifier] = description
+        tasks.append((identifier, action, requires_trust))
+
+    def execute(identifier, action, requires_trust):
         if core._worker_cancelled():
             result = adapters.check(identifier, "Verification was cancelled")
         elif requires_trust and (not trusted or any(
@@ -153,7 +163,7 @@ def _run_plan(root: Path, trusted: bool) -> dict:
                     result = action(root)
             except (OSError, ValueError) as error:
                 result = adapters.check(identifier, f"{type(error).__name__}: {error}")
-        add(result, description, identifier)
+        record(result, identifier)
 
     if config_error is not None:
         add(config_error, "Verification configuration must parse")
@@ -190,8 +200,9 @@ def _run_plan(root: Path, trusted: bool) -> dict:
         relative_files = [path.relative_to(root) for path in subfiles]
         if cmake:
             native_tests = prefix + "tests-native"
+            required[native_tests] = "Native runtime and tests must execute"
 
-            def native(target):
+            def native(target, relative_scope=relative_scope, native_tests=native_tests):
                 source = target / relative_scope
                 build = target.parent / "native-build"
                 result = adapters.chain("build-native", [
@@ -202,13 +213,10 @@ def _run_plan(root: Path, trusted: bool) -> dict:
                     result.state = "UNKNOWN"
                     result.detail = "CMake could not locate the required compiler or build tool"
                 if result.state == "PASS":
-                    add(adapters.ctest(source, build), "Native runtime and tests must execute", native_tests)
+                    record(adapters.ctest(source, build), native_tests)
                 return result
 
             run(prefix + "build-native", "CMake sources must compile", native)
-            if native_tests not in required:
-                add(adapters.check(native_tests, "Native build is unavailable"),
-                    "Native runtime and tests must execute")
         elif has_native and (scope != root or "build" not in config):
             add(adapters.check(prefix + "build-native", "Configure a native build contract or CMake"),
                 "Native sources must compile")
@@ -220,53 +228,70 @@ def _run_plan(root: Path, trusted: bool) -> dict:
             sources = [file.relative_to(scope) for file in subfiles
                        if file.suffix.lower() in adapters.TYPESCRIPT]
             run(prefix + "typescript", "TypeScript and JSX require a compiler check",
-                lambda target: adapters.typescript(target / relative_scope, configs, sources))
+                lambda target, scope=relative_scope, configs=configs, sources=sources:
+                adapters.typescript(target / scope, configs, sources))
         languages = []
         if has_python:
             languages.append("python")
-        if has_js and (not html or (scope / "package.json").is_file()):
+        if has_js and (not html or (scope / "package.json").is_file()
+                       or core._detect_test_command(scope, "javascript")[0] is not None):
             languages.append("javascript")
         for language in languages:
             suffix = f"tests-{language}" if len(languages) > 1 else "tests"
             run(prefix + suffix, f"{language} code requires test evidence",
-                lambda target: core.check_tests(target / relative_scope,
-                                                [target / p for p in relative_files], ctx, language))
+                lambda target, scope=relative_scope, files=relative_files, language=language:
+                core.check_tests(target / scope, [target / p for p in files], ctx, language))
 
     if config.get("mutation"):
-        tests = next((row for row in rows if row["id"] in {"tests", "tests-python"}), None)
-        if tests and tests["state"] == "PASS":
-            run("mutation", "Project requires mutation checks",
-                lambda target: core.check_mutation(target, [target / p.relative_to(root) for p in files], ctx))
-        else:
-            add(adapters.check("mutation", "Passing baseline test evidence is unavailable"),
-                "Project requires mutation checks")
+        def mutation(target):
+            tests = next((row for row in rows if row["id"] in {"tests", "tests-python"}
+                          and row.get("reason_code") != "NOT_APPLICABLE"), None)
+            coverage = tests.get("coverage") if tests else None
+            if not tests or tests["state"] != "PASS" or not coverage or coverage["planned"] != coverage["observed"]:
+                return adapters.check("mutation", "Passing baseline test evidence is unavailable")
+            return core.check_mutation(target, [target / p.relative_to(root) for p in files], ctx)
+
+        run("mutation", "Project requires mutation checks", mutation)
     for name in ("build", "runtime"):
         if name in config:
             run(name, f"Project {name} assertion",
-                lambda target: adapters.contract(name, config[name], target))
+                lambda target, name=name: adapters.contract(name, config[name], target))
     for index, row in enumerate(config.get("contracts", []), 1):
         identifier = f"contract-{index}"
         run(identifier, "Project business contract assertion",
-            lambda target: adapters.contract(identifier, row, target))
+            lambda target, identifier=identifier, row=row: adapters.contract(identifier, row, target))
     for index, row in enumerate(config.get("delivery", []), 1):
         identifier = f"delivery-{index}"
         run(identifier, "Delivery archive contents and digest",
-            lambda target: adapters.archive(identifier, adapters.relative_path(target, row.get("path")), row),
+            lambda target, identifier=identifier, row=row:
+            adapters.archive(identifier, adapters.relative_path(target, row.get("path")), row),
             requires_trust=False)
     if not config.get("delivery") and (root / "dist").is_dir():
         for index, path in enumerate(sorted((root / "dist").iterdir()), 1):
             if not path.is_file() or path.name.startswith("."):
                 continue
             identifier = f"delivery-{index}"
-            run(identifier, "Detected delivery file", lambda target: adapters.archive(identifier, path),
+            run(identifier, "Detected delivery file", lambda target, identifier=identifier, path=path:
+                adapters.archive(identifier, path),
                 requires_trust=False)
 
+    for identifier in policy_required:
+        required.setdefault(identifier, "Required by operator policy")
     report["plan"] = required
+    report["plan_digest"] = plan_digest(required)
+    for identifier, action, requires_trust in tasks:
+        execute(identifier, action, requires_trust)
+    by_id = {row["id"]: row for row in rows}
+    for identifier in required:
+        if identifier in by_id:
+            by_id[identifier]["applicable"] = True
+        else:
+            record(adapters.check(identifier, "Required check unavailable"))
     return report
 
 
-def _worker(root: Path, trusted: bool, result_path: Path) -> None:
-    report = _run_plan(root, trusted)
+def _worker(root: Path, trusted: bool, result_path: Path, policy_required: tuple[str, ...] = ()) -> None:
+    report = _run_plan(root, trusted, policy_required)
     for row in report["checks"]:
         evidence = row.get("evidence") or {}
         source = evidence.get("dir")
@@ -282,6 +307,14 @@ def _worker(root: Path, trusted: bool, result_path: Path) -> None:
     result_path.write_text(json.dumps(scrub(report), ensure_ascii=False), encoding="utf-8")
 
 
+def _wait_for_launch(marker: Path) -> None:
+    deadline = time.monotonic() + 30
+    while not marker.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Process containment was not established")
+        time.sleep(0.05)
+
+
 def decide(report: dict) -> str:
     """Compute the independent verdict from a required-check ledger and evidence."""
     rows = {row["id"]: row for row in report["checks"]}
@@ -290,7 +323,8 @@ def decide(report: dict) -> str:
             report.get("lifecycle", {}).get("security", {}).get("blocked") or
             any(rows.get(key, {}).get("state") == "FAIL" for key in required)):
         return "FAIL"
-    if not required or report.get("blockers") or report.get("lifecycle_error"):
+    if (not required or report.get("blockers") or report.get("lifecycle_error")
+            or report.get("plan_digest") != plan_digest(required)):
         return "UNKNOWN"
     for key in required:
         row = rows.get(key, {})
@@ -326,6 +360,7 @@ def _record_checks(report: dict, output: Path, work: Path) -> None:
 
 
 def _finalize(report: dict, output: Path | None) -> None:
+    report.setdefault("plan_digest", plan_digest(report["plan"]))
     report["verdict"] = decide(report)
     set_gate_fields(report)
     lifecycle = report.get("lifecycle")
@@ -377,6 +412,8 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
     run_output = None
     try:
         scratch = Path(os.environ.get("VERIFY_SCRATCH_DIRECTORY", tempfile.gettempdir())).resolve()
+        if scratch.is_relative_to(root):
+            raise ValueError("Scratch directory must be outside the project")
         with tempfile.TemporaryDirectory(prefix="vh-", dir=scratch) as directory:
             work = Path(directory).resolve()
             snapshot = work / "project"
@@ -398,7 +435,9 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
                 policy = json.loads(policy_bytes)
                 if (not isinstance(policy, dict) or set(policy) != {"required_checks"}
                         or not isinstance(policy["required_checks"], list)
-                        or any(not isinstance(item, str) or not item for item in policy["required_checks"])):
+                        or len(policy["required_checks"]) > 128
+                        or any(not isinstance(item, str) or not item or len(item) > 128
+                               for item in policy["required_checks"])):
                     raise ValueError("Policy must declare a required_checks list")
                 policy_required = policy["required_checks"]
                 policy_material["policy"] = evidence_digest(policy_bytes)
@@ -421,13 +460,20 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
                            Path.home() / ".cache" / "ms-playwright")
                 if default.is_dir():
                     env["PLAYWRIGHT_BROWSERS_PATH"] = str(default)
-            with subprocess.Popen([sys.executable, "-I", "-c",
-                            "import sys; sys.path.insert(0,sys.argv[1]); "
-                            "from pathlib import Path; from full_verify import _worker; "
-                            "_worker(Path(sys.argv[2]),sys.argv[3]=='True',Path(sys.argv[4]))",
-                            str(Path(__file__).resolve().parent), str(snapshot), str(trusted), str(result_path)],
+            launch = work / "launch"
+            with ExitStack() as stack:
+                worker = stack.enter_context(subprocess.Popen([sys.executable, "-I", "-c",
+                            "import json,sys; sys.path.insert(0,sys.argv[1]); "
+                            "from pathlib import Path; from full_verify import _wait_for_launch,_worker; "
+                            "_wait_for_launch(Path(sys.argv[6])); "
+                            "_worker(Path(sys.argv[2]),sys.argv[3]=='True',Path(sys.argv[4]),json.loads(sys.argv[5]))",
+                            str(Path(__file__).resolve().parent), str(snapshot), str(trusted), str(result_path),
+                            json.dumps(policy_required), str(launch)],
                            cwd=work, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as worker:
+                           start_new_session=os.name != "nt",
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))
+                context["process_boundary"] = stack.enter_context(contain_worker(worker))
+                launch.touch()
                 deadline = time.monotonic() + 1800
                 while worker.poll() is None:
                     if cancellation is not None and cancellation.is_set() and not stop_path.exists():
@@ -437,21 +483,12 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
                         worker.wait(timeout=min(0.25, max(0, deadline - time.monotonic())))
                     except subprocess.TimeoutExpired:
                         if time.monotonic() >= deadline:
-                            core._terminate_process(worker, process_group=False)
+                            core._terminate_process(worker)
                             raise
                 if worker.returncode:
                     raise subprocess.CalledProcessError(worker.returncode, worker.args)
             report.update(json.loads(result_path.read_text(encoding="utf-8")))
             report.update(context, git=git, snapshot_sha256=digest, omitted=omitted)
-            by_id = {row["id"]: row for row in report["checks"]}
-            for identifier in policy_required:
-                report["plan"].setdefault(identifier, "Required by operator policy")
-                if identifier in by_id:
-                    by_id[identifier]["applicable"] = True
-                else:
-                    check = adapters.check(identifier, "Required check unavailable")
-                    by_id[identifier] = check.as_dict()
-                    report["checks"].append(by_id[identifier])
             if omitted:
                 report["blockers"].append("Source snapshot contains omitted or changed entries")
             if stop_path.exists() or (cancellation is not None and cancellation.is_set()):

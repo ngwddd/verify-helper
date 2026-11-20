@@ -45,6 +45,10 @@
       "type": "string",
       "pattern": "^sha256:[a-f0-9]{64}$"
     },
+    "plan_digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
     "snapshot_sha256": {
       "type": "string",
       "pattern": "^[a-f0-9]{64}$"

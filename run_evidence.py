@@ -14,6 +14,10 @@ def json_bytes(value: dict) -> bytes:
     return json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
 
 
+def plan_digest(plan: dict) -> str:
+    return "sha256:" + digest(json.dumps(plan, sort_keys=True, ensure_ascii=True).encode("ascii"))
+
+
 def set_gate_fields(report: dict) -> None:
     verdict = report["verdict"]
     report["scope"] = "FULL"
@@ -66,7 +70,7 @@ def write_manifest(report: dict, output: Path) -> None:
     body = json_bytes(report)
     records["report.json"] = digest(body)
     manifest = {"run_id": report["run_id"], "snapshot_sha256": report.get("snapshot_sha256"),
-                "policy_digest": report["policy_digest"], "files": records}
+                "policy_digest": report["policy_digest"], "plan_digest": report["plan_digest"], "files": records}
     pending = output / "report.json.tmp"
     pending.write_bytes(body)
     (output / "manifest.json").write_bytes(json_bytes(manifest))
@@ -94,6 +98,10 @@ def read_evidence(output: Path) -> dict:
     if (report["run_id"] != manifest["run_id"] or report.get("snapshot_sha256") != manifest["snapshot_sha256"]
             or report["policy_digest"] != manifest["policy_digest"]):
         raise ValueError("Evidence manifest is bound to a different run")
+    if "plan_digest" in manifest and (
+            report.get("plan_digest") != manifest["plan_digest"]
+            or plan_digest(report["plan"]) != manifest["plan_digest"]):
+        raise ValueError("Evidence manifest does not match the verification plan")
     for row in report["checks"]:
         name = row.get("evidence_ref")
         if row.get("evidence_sha256") and records.get(name) != row["evidence_sha256"]:
