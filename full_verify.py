@@ -339,6 +339,20 @@ def _finalize(report: dict, output: Path | None) -> None:
     write_manifest(report, output)
 
 
+def _evidence_root(path: Path) -> Path:
+    path = path.absolute()
+    for part in (path, *path.parents):
+        try:
+            entry = part.lstat()
+        except FileNotFoundError:
+            continue
+        if (stat.S_ISLNK(entry.st_mode) or
+                getattr(entry, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+            raise ValueError("Evidence directory may not traverse a link or junction")
+    # A Windows short name can resolve to the same directory under a longer spelling.
+    return path.resolve()
+
+
 class MergeConflict(ValueError):
     """The requested Git merge has a confirmed conflict."""
 
@@ -445,9 +459,7 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
                 report["blockers"].append("Verification was cancelled")
             if report.get("notes"):
                 report["notes"] = [note.replace(str(snapshot), str(root)) for note in report["notes"]]
-            output = (evidence_dir or Path.home() / ".verify-helper" / "cli-runs").absolute()
-            if output.resolve() != output:
-                raise ValueError("Evidence directory may not traverse a symbolic link")
+            output = _evidence_root(evidence_dir or Path.home() / ".verify-helper" / "cli-runs")
             run_output = output / run_id
             report["evidence_dir"] = str(run_output)
             report = scrub(report)
