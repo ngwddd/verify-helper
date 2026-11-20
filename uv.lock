@@ -968,6 +968,11 @@ dependencies = [
     { name = "regex" },
 ]
 
+[package.dev-dependencies]
+release = [
+    { name = "cryptography" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "mcp", specifier = ">=2.3,<3" },
@@ -976,3 +981,6 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.3,<7" },
     { name = "regex", specifier = ">=2024.11.6" },
 ]
+
+[package.metadata.requires-dev]
+release = [{ name = "cryptography", specifier = ">=45" }]

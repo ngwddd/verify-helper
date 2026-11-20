@@ -15,6 +15,9 @@ dependencies = ["mcp>=2.3,<3", "pyyaml>=6.0.3,<7", "packaging>=25", "regex>=2024
 verify-helper = "full_verify:main"
 verify-helper-mcp = "server:main"
 
+[dependency-groups]
+release = ["cryptography>=45"]
+
 [tool.setuptools]
 py-modules = ["verify_core", "full_verify", "run_evidence", "process_boundary", "verification_adapters", "server", "lifecycle", "check_specs", "directions", "sarif", "isolated_runtime", "report_export", "private_storage", "protected_oracle", "protected_git"]
 

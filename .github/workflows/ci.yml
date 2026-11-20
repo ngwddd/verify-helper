@@ -60,7 +60,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: uv sync --locked
       - name: Unit and MCP protocol tests
-        run: uv run python -m unittest discover -s tests -v
+        run: uv run --group release python -m unittest discover -s tests -v
       - name: Conformance
         run: uv run python conformance.py
       - name: Language and browser acceptance
@@ -125,6 +125,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $delivery = Join-Path $env:RUNNER_TEMP vh-distribution
           New-Item -ItemType Directory -Path $delivery -Force | Out-Null
+          $sbom = Join-Path $delivery sbom.cdx.json
+          uv export --locked --no-dev --format cyclonedx1.5 --output-file $sbom --quiet
+          if ($LASTEXITCODE -ne 0) { throw "Could not generate the locked-dependency SBOM" }
+          $sbomHash = (Get-FileHash -LiteralPath $sbom -Algorithm SHA256).Hash.ToLowerInvariant()
           $files = Get-ChildItem -LiteralPath dist -File | Where-Object { $_.Name -like '*.whl' -or $_.Name -like '*.tar.gz' }
           if (@($files).Count -ne 2) { throw "Expected a wheel and a source archive" }
           $hashes = foreach ($file in $files) {
@@ -134,11 +138,13 @@ jobs:
             Copy-Item -LiteralPath $file.FullName -Destination $delivery
             "$digest *$($file.Name)"
           }
+          $hashes += "$sbomHash *sbom.cdx.json"
           $hashes | Set-Content -LiteralPath (Join-Path $delivery SHA256SUMS) -Encoding utf8NoBOM
           [ordered]@{
             version = uv run python -c "from verify_core import VERSION; print(VERSION)"
             commit = $env:GITHUB_SHA
             workflow_run = $env:GITHUB_RUN_ID
+            sbom_sha256 = $sbomHash
             protected_release_approved = $false
           } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $delivery provenance.json) -Encoding utf8NoBOM
       - name: Retain candidate distribution
