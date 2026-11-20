@@ -18,6 +18,8 @@ from contextlib import ExitStack
 from pathlib import Path
 
 import check_specs
+import isolated_runtime
+import report_export
 import sarif
 import verification_adapters as adapters
 import verify_core as core
@@ -35,6 +37,8 @@ EXEC_ENV = {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "LANG", "LC_AL
             "INCLUDE", "LIB", "LIBPATH",
             "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "PROGRAMDATA", "SYSTEMDRIVE",
             "PROCESSOR_ARCHITECTURE", "ZIG_GLOBAL_CACHE_DIR"}
+PRIVATE_INPUTS = {".ssh", ".aws", ".azure", ".kube", ".gnupg", ".docker", ".netrc",
+                  ".git-credentials", ".npmrc", ".pypirc", ".env"}
 
 
 def scrub(value):
@@ -52,7 +56,34 @@ def scrub(value):
     return value
 
 
-def _snapshot(source: Path, destination: Path) -> tuple[str, list[str]]:
+def _protected_copy(source: Path, relative: Path, destination: Path, expected) -> None:
+    with ExitStack() as handles:
+        directory_flags = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_RDONLY
+        parent = os.open(source, directory_flags)
+        handles.callback(os.close, parent)
+        for name in relative.parent.parts:
+            parent = os.open(name, directory_flags, dir_fd=parent)
+            handles.callback(os.close, parent)
+        fd = os.open(relative.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        with os.fdopen(fd, "rb") as stream:
+            actual = os.fstat(fd)
+            if (not stat.S_ISREG(actual.st_mode) or actual.st_nlink != 1
+                    or (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino)):
+                raise ValueError("Snapshot source changed before it could be opened")
+            with destination.open("xb") as target:
+                remaining = expected.st_size
+                while remaining:
+                    chunk = stream.read(min(remaining, 256 * 1024))
+                    if not chunk:
+                        raise ValueError("Snapshot source shrank while being copied")
+                    target.write(chunk)
+                    remaining -= len(chunk)
+                if stream.read(1):
+                    raise ValueError("Snapshot source grew while being copied")
+            destination.chmod(0o700 if actual.st_mode & stat.S_IXUSR else 0o600)
+
+
+def _snapshot(source: Path, destination: Path, *, protected: bool = False) -> tuple[str, list[str]]:
     digest = hashlib.sha256()
     omitted = []
     total = 0
@@ -71,7 +102,8 @@ def _snapshot(source: Path, destination: Path) -> tuple[str, list[str]]:
             path = current / name
             entry = path.lstat()
             display = (relative / name).as_posix()
-            if stat.S_ISLNK(entry.st_mode) or getattr(entry, "st_file_attributes", 0) & 1024:
+            private = protected and (name.lower() in PRIVATE_INPUTS or name.lower().startswith(".env."))
+            if private or stat.S_ISLNK(entry.st_mode) or getattr(entry, "st_file_attributes", 0) & 1024:
                 omitted.append(display)
                 if name in dirs:
                     dirs.remove(name)
@@ -81,11 +113,14 @@ def _snapshot(source: Path, destination: Path) -> tuple[str, list[str]]:
             total += entry.st_size
             if total > 1024 ** 3:
                 raise ValueError("Snapshot exceeds the 1 GiB verification limit")
-            if not stat.S_ISREG(entry.st_mode):
+            if not stat.S_ISREG(entry.st_mode) or (protected and entry.st_nlink != 1):
                 omitted.append(display)
                 continue
             copied = destination / relative / name
-            shutil.copy2(path, copied)
+            if protected and sys.platform == "linux":
+                _protected_copy(source, relative / name, copied, entry)
+            else:
+                shutil.copy2(path, copied)
             with copied.open("rb") as stream:
                 checksum = hashlib.file_digest(stream, "sha256").hexdigest()
             latest = path.lstat()
@@ -111,7 +146,8 @@ def _scope(root: Path, files: list[Path]) -> list[Path]:
                            if file.name in manifests and file.parent != root})]
 
 
-def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = ()) -> dict:
+def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
+              sandbox_image: str | None = None) -> dict:
     files, _, large, _ = core.scan_files(root)
     ctx = core.Ctx(core.Cache(False))
     config_error = None
@@ -124,7 +160,7 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = ()) 
     static = [identifier for identifier in check_specs.ordered_ids()
               if identifier not in DYNAMIC | {"git"}]
     report = core._verify_checks(str(root), checks=static, use_cache=False, artifacts=False,
-                         review_md=False)
+                         review_md=False, allow_host_tools=trusted and sandbox_image is None)
     required = {}
     tasks = []
     rows = report["checks"]
@@ -142,16 +178,21 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = ()) 
         required[result.id] = reason
         record(result)
 
-    def run(identifier: str, description: str, action, *, requires_trust: bool = True):
+    def run(identifier: str, description: str, action, *, requires_trust: bool = True, isolated=None):
         required[identifier] = description
-        tasks.append((identifier, action, requires_trust))
+        tasks.append((identifier, action, requires_trust, isolated))
 
-    def execute(identifier, action, requires_trust):
+    def execute(identifier, action, requires_trust, isolated):
         if core._worker_cancelled():
             result = adapters.check(identifier, "Verification was cancelled")
         elif requires_trust and (not trusted or any(
                 row["id"] == "secrets" and row["state"] == "FAIL" for row in rows)):
             result = adapters.check(identifier, "Project code execution is unavailable")
+        elif requires_trust and sandbox_image is not None:
+            result = adapters.check(identifier, "Adapter is unavailable under the isolated execution policy")
+            result.reason_code = "UNSUPPORTED_ISOLATED_ADAPTER"
+            if isolated is not None:
+                result = _isolated_unittest(root, isolated, identifier, sandbox_image)
         else:
             try:
                 if requires_trust:
@@ -167,6 +208,10 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = ()) 
 
     if config_error is not None:
         add(config_error, "Verification configuration must parse")
+    if sandbox_image is not None:
+        boundary = adapters.check("execution-isolation", "Isolation requires platform attestation")
+        boundary.reason_code = "ISOLATION_UNAVAILABLE"
+        add(boundary, "The configured isolation boundary must be independently attested")
     if large or len(files) >= 200_000:
         add(adapters.check("scan-coverage", "The source scan reached a size or file count limit"),
             "All applicable project inputs must be inventoried")
@@ -240,7 +285,8 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = ()) 
             suffix = f"tests-{language}" if len(languages) > 1 else "tests"
             run(prefix + suffix, f"{language} code requires test evidence",
                 lambda target, scope=relative_scope, files=relative_files, language=language:
-                core.check_tests(target / scope, [target / p for p in files], ctx, language))
+                core.check_tests(target / scope, [target / p for p in files], ctx, language),
+                isolated=relative_scope if language == "python" else None)
 
     if config.get("mutation"):
         def mutation(target):
@@ -279,8 +325,8 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = ()) 
         required.setdefault(identifier, "Required by operator policy")
     report["plan"] = required
     report["plan_digest"] = plan_digest(required)
-    for identifier, action, requires_trust in tasks:
-        execute(identifier, action, requires_trust)
+    for identifier, action, requires_trust, isolated in tasks:
+        execute(identifier, action, requires_trust, isolated)
     by_id = {row["id"]: row for row in rows}
     for identifier in required:
         if identifier in by_id:
@@ -290,8 +336,28 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = ()) 
     return report
 
 
-def _worker(root: Path, trusted: bool, result_path: Path, policy_required: tuple[str, ...] = ()) -> None:
-    report = _run_plan(root, trusted, policy_required)
+def _isolated_unittest(root: Path, scope: Path, identifier: str, image: str) -> core.Check:
+    command, _, _ = core._detect_test_command(root / scope, "python")
+    result = adapters.check(identifier, "A supported isolated test adapter is required")
+    result.reason_code = "UNSUPPORTED_ISOLATED_ADAPTER"
+    if not command or command[1:3] != ["-m", "unittest"]:
+        return result
+    try:
+        code = isolated_runtime.run_isolated(root, scope, ["/usr/local/bin/python", *command[1:]],
+                                             image, core._worker_cancelled)
+    except (OSError, ValueError, subprocess.SubprocessError, KeyError, TypeError):
+        result.reason_code = "ISOLATION_UNAVAILABLE"
+    else:
+        result.reason_code = "ISOLATED_TEST_ORACLE_UNVERIFIED" if code == 0 else "ISOLATED_PROCESS_NONZERO"
+    return result
+
+
+def _worker(root: Path, trusted: bool, result_path: Path, policy_required: tuple[str, ...] = (),
+            sandbox_image: str | None = None, sealed: bool = False) -> None:
+    report = _run_plan(root, trusted, policy_required, sandbox_image)
+    if sealed:
+        result_path.write_text(json.dumps(report_export.project_receipts(report)), encoding="utf-8")
+        return
     for row in report["checks"]:
         evidence = row.get("evidence") or {}
         source = evidence.get("dir")
@@ -394,21 +460,31 @@ class MergeConflict(ValueError):
 
 def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Path | None = None,
                 against: str | None = None, revision: str | None = None,
-                policy_path: Path | None = None, run_id: str | None = None, cancellation=None) -> dict:
+                policy_path: Path | None = None, run_id: str | None = None, cancellation=None,
+                sealed: bool = False) -> dict:
     root = Path(project).expanduser().resolve()
     run_id = run_id or uuid.uuid4().hex
+    image = os.environ.get(isolated_runtime.IMAGE_VARIABLE)
+    host_execution = trusted and image is None and not sealed
+    sealed = not host_execution
+    sandbox_image = image if trusted else None
     context = {"schema_version": SCHEMA_VERSION, "run_id": run_id, "version": core.VERSION,
-               "project": str(root), "mode": "full", "isolation": "temporary-source-snapshot",
-               "trusted_project_code": trusted, "platform": platform.system(),
+               "mode": "full", "isolation": "linux-container-candidate" if image is not None
+               else "temporary-source-snapshot",
+               "trusted_project_code": host_execution, "platform": platform.system(),
                "python": platform.python_version(),
                "policy_digest": "sha256:" + evidence_digest(f"{core.VERSION}:{trusted}".encode())}
+    if sealed:
+        context["export_policy"] = "sealed"
+    else:
+        context["project"] = str(root)
     report = {**context, "checks": [], "plan": {}, "blockers": []}
     if not root.is_dir():
         report["blockers"].append("Project directory is unavailable")
         _finalize(report, None)
         return report
 
-    git = _source_git(root)
+    git = _source_git(root) if host_execution else {}
     run_output = None
     try:
         scratch = Path(os.environ.get("VERIFY_SCRATCH_DIRECTORY", tempfile.gettempdir())).resolve()
@@ -418,6 +494,8 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
             work = Path(directory).resolve()
             snapshot = work / "project"
             source = root
+            if (revision or against) and not host_execution:
+                raise ValueError("Git verification is unavailable under the protected execution policy")
             if revision and (revision != git.get("head") or git.get("dirty") is not False):
                 raise ValueError("Requested revision does not match a clean Git checkout")
             if against:
@@ -425,9 +503,10 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
                     raise ValueError("Merge verification requires a clean Git worktree")
                 source, merge = _merge_snapshot(root, against, work)
                 context["merge"] = merge
-            digest, omitted = _snapshot(source, snapshot)
+            digest, omitted = _snapshot(source, snapshot, protected=not host_execution)
             config = snapshot / "verify.toml"
-            policy_material = {"engine": core.VERSION, "trusted": trusted,
+            policy_material = {"engine": core.VERSION, "trusted": host_execution,
+                               "sandbox_image": image if image and isolated_runtime.IMAGE_ID.fullmatch(image) else None,
                                "project_contract": evidence_digest(config.read_bytes()) if config.is_file() else None}
             policy_required = []
             if policy_path is not None:
@@ -466,9 +545,12 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
                             "import json,sys; sys.path.insert(0,sys.argv[1]); "
                             "from pathlib import Path; from full_verify import _wait_for_launch,_worker; "
                             "_wait_for_launch(Path(sys.argv[6])); "
-                            "_worker(Path(sys.argv[2]),sys.argv[3]=='True',Path(sys.argv[4]),json.loads(sys.argv[5]))",
-                            str(Path(__file__).resolve().parent), str(snapshot), str(trusted), str(result_path),
-                            json.dumps(policy_required), str(launch)],
+                            "_worker(Path(sys.argv[2]),sys.argv[3]=='True',Path(sys.argv[4]),json.loads(sys.argv[5]),"
+                            "json.loads(sys.argv[7]),sys.argv[8]=='True')",
+                            str(Path(__file__).resolve().parent), str(snapshot),
+                            str(host_execution or sandbox_image is not None), str(result_path),
+                            json.dumps(policy_required), str(launch),
+                            json.dumps("" if omitted and sandbox_image is not None else sandbox_image), str(sealed)],
                            cwd=work, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            start_new_session=os.name != "nt",
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))
@@ -488,7 +570,9 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
                 if worker.returncode:
                     raise subprocess.CalledProcessError(worker.returncode, worker.args)
             report.update(json.loads(result_path.read_text(encoding="utf-8")))
-            report.update(context, git=git, snapshot_sha256=digest, omitted=omitted)
+            report.update(context, snapshot_sha256=digest)
+            if not sealed:
+                report.update(git=git, omitted=omitted)
             if omitted:
                 report["blockers"].append("Source snapshot contains omitted or changed entries")
             if stop_path.exists() or (cancellation is not None and cancellation.is_set()):
@@ -498,8 +582,9 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
                 report["notes"] = [note.replace(str(snapshot), str(root)) for note in report["notes"]]
             output = _evidence_root(evidence_dir or Path.home() / ".verify-helper" / "cli-runs")
             run_output = output / run_id
-            report["evidence_dir"] = str(run_output)
-            report = scrub(report)
+            if not sealed:
+                report["evidence_dir"] = str(run_output)
+                report = scrub(report)
             _record_checks(report, run_output, work)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         if isinstance(error, MergeConflict):
@@ -594,10 +679,10 @@ def main(argv=None) -> int:
         else:
             Path(options.json).write_text(encoded + "\n", encoding="utf-8")
     else:
-        print(f"{report['verdict']}  {report['project']}  v{core.VERSION}")
+        print(f"{report['verdict']}  {report.get('project', 'FULL')}  v{core.VERSION}")
         for row in report["checks"]:
             if row["id"] in report["plan"]:
-                print(f"  {row['state']:7} {row['id']} — {row['detail']}")
+                print(f"  {row['state']:7} {row['id']} — {row.get('detail') or row.get('reason_code') or row['title']}")
         for reason in report["blockers"]:
             print(f"  {reason}")
         if report.get("evidence_dir"):

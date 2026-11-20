@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main, 'v2.0/development']
+    branches: [main, 'v2.0/development', 'v2.0/rc3']
   pull_request:
   workflow_dispatch:
 
@@ -10,6 +10,26 @@ permissions:
   contents: read
 
 jobs:
+  linux-isolation:
+    name: Linux isolation acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+      - run: uv sync --locked
+      - name: Run offline guest boundary checks
+        shell: bash
+        run: |
+          docker pull python:3.12-slim
+          export VERIFY_HELPER_SANDBOX_IMAGE="$(docker image inspect --format '{{.Id}}' python:3.12-slim)"
+          printf 'Acceptance image ID: %s\n' "$VERIFY_HELPER_SANDBOX_IMAGE"
+          uv run python -m unittest discover -s tests -p sandbox_acceptance.py -v
+
   verification:
     name: Test Python ${{ matrix.python }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}

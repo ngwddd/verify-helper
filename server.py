@@ -21,6 +21,8 @@ from mcp.types import ToolAnnotations
 from starlette.responses import Response
 
 from full_verify import full_verify
+from isolated_runtime import IMAGE_VARIABLE
+from report_export import mcp_report
 from run_evidence import json_bytes, read_evidence
 from verify_core import VERSION
 
@@ -63,7 +65,7 @@ class RunStore:
             run_id = "vh2_" + uuid.uuid4().hex
             cancellation = threading.Event()
             (self.root / f"{run_id}.pending").touch(exist_ok=False)
-            future = self.pool.submit(full_verify, project, evidence_dir=self.root,
+            future = self.pool.submit(full_verify, project, evidence_dir=self.root, sealed=True,
                                       run_id=run_id, cancellation=cancellation, **options)
             self.jobs[run_id] = (future, cancellation)
         return {"run_id": run_id, "status": "QUEUED", "scope": "FULL", "releasable": False}
@@ -89,14 +91,14 @@ class RunStore:
                 evidence = read_evidence(directory)
                 if evidence["run_id"] != run_id:
                     raise ValueError("Evidence is bound to another run")
-                return evidence
+                return mcp_report(evidence, run_id, VERSION)
             except (OSError, ValueError, TypeError, KeyError):
                 return self._failed(run_id, "Evidence is missing or no longer matches its manifest")
         if job:
             try:
                 report = job[0].result()
                 if report.get("verdict") != "PASS":
-                    return report
+                    return mcp_report(report, run_id, VERSION)
             except Exception:
                 pass
         if (self.root / f"{run_id}.pending").is_file():
@@ -144,9 +146,10 @@ def create_server(workspace: Path, *, trusted: bool = False, evidence_dir: Path 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
     def verify_list_capabilities() -> dict[str, Any]:
         """List supported adapters and detected executables without running project code."""
-        return {"scope": "FULL", "trusted_project_execution": trusted,
+        return {"scope": "FULL", "trusted_project_execution": False,
+                "isolated_execution_candidate": trusted and IMAGE_VARIABLE in os.environ,
                 "adapters": ["python", "javascript", "typescript", "native", "web", "archives"],
-                "tools": {"python": sys.executable, **{name: shutil.which(name) for name in
+                "tools": {"python": True, **{name: shutil.which(name) is not None for name in
                           ("node", "npm", "cmake", "ctest", "git", "tsc")}}}
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))

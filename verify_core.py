@@ -44,7 +44,7 @@ import yaml
 import check_specs as S
 import directions as DIR
 
-VERSION = "2.0.0rc2"
+VERSION = "2.0.0rc3.dev0"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -619,7 +619,7 @@ def check_syntax(root: Path, files: list[Path], ctx: "Ctx") -> Check:
 
     # JS：先查缓存，只对没命中/变了的文件起 node --check，并行
     todo: list[Path] = []
-    for p in jss:
+    for p in jss if ctx.allow_host_tools else ():
         hit = ctx.cache.get(p)
         if hit is not None:
             if not hit.get("ok"):
@@ -628,7 +628,7 @@ def check_syntax(root: Path, files: list[Path], ctx: "Ctx") -> Check:
             continue
         todo.append(p)
 
-    unavailable = 0
+    unavailable = 0 if ctx.allow_host_tools else len(jss)
     if todo:
         def one(p: Path):
             code, out = _run(["node", "--check", str(p)], root, 30)
@@ -1941,6 +1941,7 @@ class Ctx:
     flow_total_timeout: int = 180      # 整个交互检查的墙钟上限（秒）
     bundle: dict | None = None       # 一次扫描的结果，五个检查共用
     bundle_lock: threading.Lock = field(default_factory=threading.Lock)
+    allow_host_tools: bool = True
 
 
 # 函数表；标题 / 风险 / 说明 / 修复建议全部来自 check_specs.py，这里只负责「怎么跑」。
@@ -2014,7 +2015,8 @@ def _verify_checks(project: str, checks: list[str] | None = None,
            stage: str | None = None, tier: str = "auto",
            accepts: list[dict] | None = None, only_new: bool = False,
            artifacts: bool = True, review_md: bool = True,
-           against: str | None = None, artifacts_dir: str | None = None) -> dict:
+           against: str | None = None, artifacts_dir: str | None = None,
+           allow_host_tools: bool = True) -> dict:
     """跑一轮验证。
 
     stage / tier / accepts / only_new / artifacts / review_md / against
@@ -2041,7 +2043,7 @@ def _verify_checks(project: str, checks: list[str] | None = None,
     if include_git and "git" not in selected:
         selected.append("git")
 
-    ctx = Ctx(cache=Cache(use_cache), workers=max(1, min(workers, 16)))
+    ctx = Ctx(cache=Cache(use_cache), workers=max(1, min(workers, 16)), allow_host_tools=allow_host_tools)
 
     # 这五项共用一次逐行扫描：先在这里算好（一次），再并行跑其余检查。
     # 不预计算的话，五个线程会各自从头扫一遍，反而更慢。
@@ -2109,7 +2111,7 @@ def _verify_checks(project: str, checks: list[str] | None = None,
                                             ("PASS" if passed else "UNKNOWN"))
 
     git_info = {}
-    if (root / ".git").exists():
+    if allow_host_tools and (root / ".git").exists():
         code, out = _run(["git", "rev-parse", "--short", "HEAD"], root, 30)
         git_info["head"] = out.strip() if code == 0 else ""
         code, out = _run(["git", "status", "--porcelain"], root, 30)
