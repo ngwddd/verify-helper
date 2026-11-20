@@ -46,7 +46,7 @@ class TestCardShape(unittest.TestCase):
                 self.assertTrue(card["action"])
                 self.assertTrue(card["must_not_touch"])
                 # 验证方式必须同时给 MCP 调用与命令行两种
-                self.assertIn("verify_start(", card["verify"])
+                self.assertIn("verify_run_full(", card["verify"])
                 self.assertIn(cid, card["verify"])
                 self.assertIn("verify-helper . --json", card["verify"])
 

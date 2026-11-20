@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -19,14 +20,15 @@ import check_specs
 import sarif
 import verification_adapters as adapters
 import verify_core as core
+from run_evidence import digest as evidence_digest, read_evidence, set_gate_fields, write_manifest
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DYNAMIC = {"tests", "browser", "interaction", "mutation", "runtime-web"}
 SNAPSHOT_EXCLUDES = {".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__pycache__",
                      ".verify-artifacts", ".verify-noise.json", ".verify-accept.json",
                      ".verify-python", ".pytest_cache", ".mypy_cache", ".tox"}
 EXEC_ENV = {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "LANG", "LC_ALL",
-            "VERIFY_TEST_PYTHON", "VERIFY_TSC", "VERIFY_PLAYWRIGHT_ROOT", "PLAYWRIGHT_BROWSERS_PATH",
+            "VERIFY_HELPER_TEST_PYTHON", "VERIFY_TSC", "VERIFY_PLAYWRIGHT_ROOT", "PLAYWRIGHT_BROWSERS_PATH",
             "VERIFY_NATIVE_FIXTURE", "VERIFY_SCRATCH_DIRECTORY", "CC", "CXX", "CMAKE_GENERATOR",
             "INCLUDE", "LIB", "LIBPATH",
             "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "PROGRAMDATA", "SYSTEMDRIVE",
@@ -135,7 +137,9 @@ def _run_plan(root: Path, trusted: bool) -> dict:
         rows.append(result.as_dict())
 
     def run(identifier: str, description: str, action, *, requires_trust: bool = True):
-        if requires_trust and (not trusted or any(
+        if core._worker_cancelled():
+            result = adapters.check(identifier, "Verification was cancelled")
+        elif requires_trust and (not trusted or any(
                 row["id"] == "secrets" and row["state"] == "FAIL" for row in rows)):
             result = adapters.check(identifier, "Project code execution is unavailable")
         else:
@@ -282,14 +286,16 @@ def decide(report: dict) -> str:
     """Compute the independent verdict from a required-check ledger and evidence."""
     rows = {row["id"]: row for row in report["checks"]}
     required = report["plan"]
-    if (report.get("lifecycle", {}).get("security", {}).get("blocked") or
+    if (report.get("merge_conflict") or
+            report.get("lifecycle", {}).get("security", {}).get("blocked") or
             any(rows.get(key, {}).get("state") == "FAIL" for key in required)):
         return "FAIL"
-    if not required or report.get("blockers"):
+    if not required or report.get("blockers") or report.get("lifecycle_error"):
         return "UNKNOWN"
     for key in required:
         row = rows.get(key, {})
-        if row.get("state") != "PASS" or not row.get("applicable") or not row.get("evidence_ref"):
+        if (row.get("state") != "PASS" or not row.get("applicable")
+                or not row.get("evidence_ref") or not row.get("evidence_sha256")):
             return "UNKNOWN"
         coverage = row.get("coverage")
         if coverage and (coverage["planned"] <= 0 or coverage["observed"] != coverage["planned"]):
@@ -321,29 +327,36 @@ def _record_checks(report: dict, output: Path, work: Path) -> None:
 
 def _finalize(report: dict, output: Path | None) -> None:
     report["verdict"] = decide(report)
+    set_gate_fields(report)
     lifecycle = report.get("lifecycle")
     if lifecycle and "stage" in lifecycle:
         lifecycle["stage"]["verdict"] = report["verdict"]
     report["sarif"] = json.loads(sarif.dumps(report, core.VERSION))
     if output is None:
+        report.pop("evidence_manifest", None)
         return
     (output / "results.sarif").write_text(json.dumps(report["sarif"], ensure_ascii=False), encoding="utf-8")
-    pending = output / "report.json.tmp"
-    pending.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    pending.replace(output / "report.json")
+    write_manifest(report, output)
+
+
+class MergeConflict(ValueError):
+    """The requested Git merge has a confirmed conflict."""
 
 
 def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Path | None = None,
-                against: str | None = None) -> dict:
+                against: str | None = None, revision: str | None = None,
+                policy_path: Path | None = None, run_id: str | None = None, cancellation=None) -> dict:
     root = Path(project).expanduser().resolve()
-    run_id = uuid.uuid4().hex
+    run_id = run_id or uuid.uuid4().hex
     context = {"schema_version": SCHEMA_VERSION, "run_id": run_id, "version": core.VERSION,
                "project": str(root), "mode": "full", "isolation": "temporary-source-snapshot",
                "trusted_project_code": trusted, "platform": platform.system(),
-               "python": platform.python_version()}
+               "python": platform.python_version(),
+               "policy_digest": "sha256:" + evidence_digest(f"{core.VERSION}:{trusted}".encode())}
     report = {**context, "checks": [], "plan": {}, "blockers": []}
     if not root.is_dir():
-        report.update(verdict="UNKNOWN", blockers=["Project directory is unavailable"])
+        report["blockers"].append("Project directory is unavailable")
+        _finalize(report, None)
         return report
 
     git = _source_git(root)
@@ -354,19 +367,37 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
             work = Path(directory).resolve()
             snapshot = work / "project"
             source = root
+            if revision and (revision != git.get("head") or git.get("dirty") is not False):
+                raise ValueError("Requested revision does not match a clean Git checkout")
             if against:
                 if not git.get("head") or git.get("dirty") is not False:
                     raise ValueError("Merge verification requires a clean Git worktree")
                 source, merge = _merge_snapshot(root, against, work)
                 context["merge"] = merge
             digest, omitted = _snapshot(source, snapshot)
+            config = snapshot / "verify.toml"
+            policy_material = {"engine": core.VERSION, "trusted": trusted,
+                               "project_contract": evidence_digest(config.read_bytes()) if config.is_file() else None}
+            policy_required = []
+            if policy_path is not None:
+                policy_bytes = policy_path.read_bytes()
+                policy = json.loads(policy_bytes)
+                if (not isinstance(policy, dict) or set(policy) != {"required_checks"}
+                        or not isinstance(policy["required_checks"], list)
+                        or any(not isinstance(item, str) or not item for item in policy["required_checks"])):
+                    raise ValueError("Policy must declare a required_checks list")
+                policy_required = policy["required_checks"]
+                policy_material["policy"] = evidence_digest(policy_bytes)
+            context["policy_digest"] = "sha256:" + evidence_digest(json.dumps(policy_material, sort_keys=True).encode())
             result_path = work / "result.json"
+            stop_path = work / "cancel"
             home = work / "home"
             home.mkdir()
             env = {key: value for key, value in os.environ.items() if key.upper() in EXEC_ENV}
             env.update({"HOME": str(home), "USERPROFILE": str(home), "LOCALAPPDATA": str(home),
                         "APPDATA": str(home), "TEMP": str(work), "TMP": str(work),
                         "TMPDIR": str(work), "VERIFY_SCRATCH_DIRECTORY": str(scratch),
+                        "VERIFY_HELPER_CANCEL_FILE": str(stop_path),
                         "PYTHONUTF8": "1", "PYTHONNOUSERSITE": "1",
                         "PYTHONDONTWRITEBYTECODE": "1", "GIT_CONFIG_NOSYSTEM": "1",
                         "NPM_CONFIG_OFFLINE": "true", "NPM_CONFIG_AUDIT": "false"})
@@ -376,21 +407,45 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
                            Path.home() / ".cache" / "ms-playwright")
                 if default.is_dir():
                     env["PLAYWRIGHT_BROWSERS_PATH"] = str(default)
-            subprocess.run([sys.executable, "-I", "-c",
+            with subprocess.Popen([sys.executable, "-I", "-c",
                             "import sys; sys.path.insert(0,sys.argv[1]); "
                             "from pathlib import Path; from full_verify import _worker; "
                             "_worker(Path(sys.argv[2]),sys.argv[3]=='True',Path(sys.argv[4]))",
                             str(Path(__file__).resolve().parent), str(snapshot), str(trusted), str(result_path)],
                            cwd=work, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                           check=True, timeout=1800)
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as worker:
+                deadline = time.monotonic() + 1800
+                while worker.poll() is None:
+                    if cancellation is not None and cancellation.is_set() and not stop_path.exists():
+                        stop_path.touch()
+                        deadline = min(deadline, time.monotonic() + 30)
+                    try:
+                        worker.wait(timeout=min(0.25, max(0, deadline - time.monotonic())))
+                    except subprocess.TimeoutExpired:
+                        if time.monotonic() >= deadline:
+                            core._terminate_process(worker, process_group=False)
+                            raise
+                if worker.returncode:
+                    raise subprocess.CalledProcessError(worker.returncode, worker.args)
             report.update(json.loads(result_path.read_text(encoding="utf-8")))
             report.update(context, git=git, snapshot_sha256=digest, omitted=omitted)
+            by_id = {row["id"]: row for row in report["checks"]}
+            for identifier in policy_required:
+                report["plan"].setdefault(identifier, "Required by operator policy")
+                if identifier in by_id:
+                    by_id[identifier]["applicable"] = True
+                else:
+                    check = adapters.check(identifier, "Required check unavailable")
+                    by_id[identifier] = check.as_dict()
+                    report["checks"].append(by_id[identifier])
             if omitted:
                 report["blockers"].append("Source snapshot contains omitted or changed entries")
+            if stop_path.exists() or (cancellation is not None and cancellation.is_set()):
+                report["status"] = "CANCELLED"
+                report["blockers"].append("Verification was cancelled")
             if report.get("notes"):
                 report["notes"] = [note.replace(str(snapshot), str(root)) for note in report["notes"]]
-            output = (evidence_dir or root / ".verify-artifacts").absolute()
+            output = (evidence_dir or Path.home() / ".verify-helper" / "cli-runs").absolute()
             if output.resolve() != output:
                 raise ValueError("Evidence directory may not traverse a symbolic link")
             run_output = output / run_id
@@ -398,10 +453,12 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
             report = scrub(report)
             _record_checks(report, run_output, work)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
+        if isinstance(error, MergeConflict):
+            report["merge_conflict"] = True
         report["blockers"].append(f"Verification infrastructure failed ({type(error).__name__})")
     try:
         _finalize(report, run_output if run_output and run_output.is_dir() else None)
-    except OSError as error:
+    except (OSError, ValueError) as error:
         report["blockers"].append(f"Cannot finalize evidence ({type(error).__name__})")
         _finalize(report, None)
     return scrub(report)
@@ -414,7 +471,12 @@ def _merge_snapshot(root: Path, base: str, work: Path) -> tuple[Path, dict]:
         return subprocess.run(["git", *arguments], cwd=root, capture_output=True, timeout=60, check=True)
 
     commit = git("rev-parse", "--verify", "--end-of-options", base + "^{commit}").stdout.decode().strip()
-    tree = git("merge-tree", "--write-tree", "HEAD", commit).stdout.decode().splitlines()[0]
+    try:
+        tree = git("merge-tree", "--write-tree", "HEAD", commit).stdout.decode().splitlines()[0]
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 1:
+            raise MergeConflict("Git reported a merge conflict") from error
+        raise
     archive = work / "merge.tar"
     with archive.open("wb") as stream:
         subprocess.run(["git", "archive", tree], cwd=root, stdout=stream,
@@ -443,13 +505,24 @@ def _merge_snapshot(root: Path, base: str, work: Path) -> tuple[Path, dict]:
 
 
 def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "serve":
+        from server import main as serve
+        serve(argv[1:])
+        return 0
+    if argv and argv[0] == "run":
+        argv.pop(0)
     parser = argparse.ArgumentParser(prog="verify-helper", description="Run full project verification")
+    if any(arg.split("=", 1)[0] in {"--fast", "--checks", "--stage"} for arg in argv):
+        parser.error("Selective and fast verification were removed. Use verify-helper run PROJECT.")
     parser.add_argument("project", nargs="?")
     parser.add_argument("--trust-project-code", action="store_true",
                         help="Permit execution of code from a project you trust")
     parser.add_argument("--evidence-dir", type=Path, help="Directory for per-run evidence")
     parser.add_argument("--against", help="Verify the Git merge result against this ref")
-    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--revision", help="Require this exact clean Git checkout")
+    parser.add_argument("--policy-path", type=Path, help="JSON policy that can add required checks")
+    parser.add_argument("--json", nargs="?", const="-", metavar="FILE")
     parser.add_argument("--sarif", type=Path)
     parser.add_argument("--list-checks", action="store_true")
     options = parser.parse_args(argv)
@@ -459,13 +532,18 @@ def main(argv=None) -> int:
     if not options.project:
         parser.error("project is required")
     report = full_verify(options.project, trusted=options.trust_project_code,
-                         evidence_dir=options.evidence_dir, against=options.against)
+                         evidence_dir=options.evidence_dir, against=options.against,
+                         revision=options.revision, policy_path=options.policy_path)
     if options.sarif:
         options.sarif.write_text(json.dumps(report.get("sarif") or
                                              json.loads(sarif.dumps(report, core.VERSION))),
                                  encoding="utf-8")
     if options.json:
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+        encoded = json.dumps(report, ensure_ascii=False, indent=2)
+        if options.json == "-":
+            print(encoded)
+        else:
+            Path(options.json).write_text(encoded + "\n", encoding="utf-8")
     else:
         print(f"{report['verdict']}  {report['project']}  v{core.VERSION}")
         for row in report["checks"]:

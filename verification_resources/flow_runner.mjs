@@ -87,43 +87,32 @@ async function until(fn, timeout, what) {
 
 async function runExpect(page, expect, consoleErrors) {
   const timeout = expect.timeout || EXPECT_TIMEOUT;
+  const selector = expect.selector;
 
-  if (expect.no_console_error) {
-    if (consoleErrors.length === 0) return { ok: true };
-    return { ok: false, detail: `出现 ${consoleErrors.length} 条 console 错误：${consoleErrors[0].slice(0, 160)}` };
-  }
+  return until(async () => {
+    if (expect.no_console_error && consoleErrors.length) {
+      return 'Console reported an error';
+    }
+    if (expect.url_contains && !page.url().includes(expect.url_contains)) {
+      return 'URL did not match';
+    }
+    if (!selector) return true;
 
-  if (expect.url_contains) {
-    return await until(async () => {
-      const u = page.url();
-      return u.includes(expect.url_contains) ? true : `当前 URL 是 ${u}`;
-    }, timeout, `URL 含 ${expect.url_contains}`);
-  }
-
-  const sel = expect.selector;
-  if (!sel) return { ok: false, detail: 'expect 里缺少 selector / url_contains / no_console_error' };
-
-  if (expect.input_value !== undefined) {
-    return await until(async () => {
-      const v = await page.inputValue(sel, { timeout: 1000 });
-      return v === String(expect.input_value) ? true : `实际值是 ${JSON.stringify(v)}`;
-    }, timeout, `输入框 ${sel} 的值`);
-  }
-
-  if (expect.text_contains !== undefined) {
-    return await until(async () => {
-      const t = await page.textContent(sel, { timeout: 1000 });
-      return (t || '').includes(expect.text_contains) ? true : `实际文本是 ${JSON.stringify((t || '').slice(0, 120))}`;
-    }, timeout, `${sel} 的文本`);
-  }
-
-  // 默认：元素可见
-  return await until(async () => {
-    const n = await page.locator(sel).count();
-    if (n === 0) return `页面上找不到 ${sel}`;
-    const visible = await page.locator(sel).first().isVisible();
-    return visible ? true : `${sel} 存在但不可见`;
-  }, timeout, `${sel} 可见`);
+    const element = page.locator(selector).first();
+    if (expect.input_value !== undefined &&
+        await element.inputValue({ timeout: 1000 }) !== String(expect.input_value)) {
+      return 'Input value did not match';
+    }
+    if (expect.text_contains !== undefined &&
+        !(await element.textContent({ timeout: 1000 }) || '').includes(expect.text_contains)) {
+      return 'Text did not match';
+    }
+    const visible = expect.visible ?? (expect.input_value === undefined && expect.text_contains === undefined);
+    if ((expect.visible !== undefined || visible) && await element.isVisible() !== visible) {
+      return 'Element visibility did not match';
+    }
+    return true;
+  }, timeout, 'Combined browser assertion');
 }
 
 for (const flow of spec.flows || []) {

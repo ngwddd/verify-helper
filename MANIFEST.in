@@ -1,3 +1,4 @@
 include CHANGELOG.md REVIEW.md conformance.py verification_resources.test.mjs uv.lock
+include docs/MIGRATION-v1-to-v2.md docs/v2/SCHEMA-v2.json
 recursive-include tests *.py
 recursive-include examples *.yml *.toml

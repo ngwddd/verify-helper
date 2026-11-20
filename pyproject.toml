@@ -16,7 +16,7 @@ verify-helper = "full_verify:main"
 verify-helper-mcp = "server:main"
 
 [tool.setuptools]
-py-modules = ["verify_core", "full_verify", "verification_adapters", "server", "lifecycle", "check_specs", "directions", "sarif"]
+py-modules = ["verify_core", "full_verify", "run_evidence", "verification_adapters", "server", "lifecycle", "check_specs", "directions", "sarif"]
 
 [tool.setuptools.package-data]
 verification_resources = ["*.mjs"]

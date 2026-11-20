@@ -307,7 +307,7 @@ def run_extra(verbose: bool):
         check("方向卡四段齐全",
               all(k in d for k in ("class", "root_cause", "action", "must_not_touch", "verify")))
         check("方向卡引用了位置", bool(d.get("evidence")) and d["evidence"] in d.get("root_cause", ""))
-        check("方向卡给了可执行验证", "verify_start(" in d.get("verify", "") and "verify-helper ." in d.get("verify", ""))
+        check("方向卡给了可执行验证", "verify_run_full(" in d.get("verify", "") and "verify-helper ." in d.get("verify", ""))
 
         # 幂等：同目录跑两次签名一致
         r2 = V._verify_checks(str(tmp), checks=["links", "imports"], use_cache=False)

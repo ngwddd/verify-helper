@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -214,6 +215,7 @@ class Check:
     # 有 artifacts 就复制进去再删，没 artifacts 就直接删 —— 两头都不留垃圾。
     evidence: dict | None = None
     coverage: dict | None = None
+    reason_code: str = ""
 
     def as_dict(self) -> dict:
         d = asdict(self)
@@ -436,30 +438,54 @@ def _which(cmd: str) -> str:
     return cmd
 
 
+def _worker_cancelled() -> bool:
+    marker = os.environ.get("VERIFY_HELPER_CANCEL_FILE")
+    return bool(marker and Path(marker).exists())
+
+
+def _terminate_process(proc: subprocess.Popen, *, process_group: bool = True) -> None:
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill.exe", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    elif process_group:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if proc.poll() is None:
+        proc.kill()
+
+
 def _run(cmd: list[str], cwd: Path, timeout: int) -> tuple[int, str]:
+    if _worker_cancelled():
+        return 125, "Verification was cancelled"
     argv = [_which(cmd[0])] + list(cmd[1:])
     try:
         with subprocess.Popen(argv, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               text=True, encoding="utf-8", errors="replace",
                               start_new_session=os.name != "nt",
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as proc:
-            try:
-                output, _ = proc.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired as error:
-                if os.name == "nt":
-                    subprocess.run(["taskkill.exe", "/PID", str(proc.pid), "/T", "/F"],
-                                   capture_output=True, timeout=10, check=False)
-                else:
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                proc.kill()
-                partial = error.output or ""
-                if isinstance(partial, bytes):
-                    partial = partial.decode("utf-8", "replace")
-                return 124, f"超时（>{timeout}s）：{' '.join(cmd)}\n{_tail(partial, 12000)}"
-            return proc.returncode, output or ""
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    remaining = max(0, deadline - time.monotonic())
+                    window = min(0.25, remaining) if os.environ.get("VERIFY_HELPER_CANCEL_FILE") else remaining
+                    output, _ = proc.communicate(timeout=window)
+                    return proc.returncode, output or ""
+                except subprocess.TimeoutExpired as error:
+                    if _worker_cancelled():
+                        _terminate_process(proc)
+                        return 125, "Verification was cancelled"
+                    if time.monotonic() < deadline:
+                        continue
+                    _terminate_process(proc)
+                    partial = error.output or ""
+                    if isinstance(partial, bytes):
+                        partial = partial.decode("utf-8", "replace")
+                    return 124, f"超时（>{timeout}s）：{' '.join(cmd)}\n{_tail(partial, 12000)}"
     except FileNotFoundError:
         return 127, f"命令不存在：{cmd[0]}"
     except subprocess.TimeoutExpired:
@@ -487,6 +513,7 @@ class Cache:
         self.data: dict[str, dict] = {}
         self.hits = 0
         self.misses = 0
+        self.node_version = None
         if enabled:
             try:
                 self.data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -495,17 +522,23 @@ class Cache:
 
     def key(self, p: Path) -> tuple[str, dict]:
         try:
-            st = p.stat()
+            with p.open("rb") as source:
+                content = hashlib.file_digest(source, "sha256").hexdigest()
         except OSError:
             return "", {}
-        return str(p.resolve()), {"mtime": st.st_mtime_ns, "size": st.st_size}
+        if self.node_version is None:
+            code, version = _run(["node", "--version"], Path.cwd(), 10)
+            self.node_version = version.strip() if code == 0 else ""
+        if not self.node_version:
+            return "", {}
+        return str(p.resolve()), {"content": content, "oracle": [_which("node"), self.node_version, "--check"]}
 
     def get(self, p: Path) -> dict | None:
         if not self.enabled:
             return None
         k, meta = self.key(p)
         hit = self.data.get(k)
-        if hit and hit.get("mtime") == meta["mtime"] and hit.get("size") == meta["size"]:
+        if hit and hit.get("key") == meta:
             self.hits += 1
             return hit
         return None
@@ -515,8 +548,7 @@ class Cache:
             return
         k, meta = self.key(p)
         if k:
-            self.data[k] = {"mtime": meta["mtime"], "size": meta["size"],
-                            "ok": ok, "msg": msg}
+            self.data[k] = {"key": meta, "ok": ok, "msg": msg}
 
     def save(self):
         if not self.enabled:
@@ -1009,6 +1041,7 @@ def check_browser(root: Path, files: list[Path], ctx: "Ctx") -> Check:
     if pw_dir is None:
         c.state, c.applicable = "UNKNOWN", False
         c.detail = "没找到 playwright（npm i -D playwright && npx playwright install chromium）"
+        c.reason_code = "MISSING_BROWSER_DEPENDENCY"
         return c
     node = shutil.which("node")
     if not node:
@@ -1173,6 +1206,8 @@ def _load_flows(root: Path) -> tuple[list[dict], str]:
                 if not (exp.get("no_console_error") or exp.get("url_contains")
                         or exp.get("selector")):
                     return [], f"「{name}」第 {j} 步的 expect 缺少 selector / url_contains / no_console_error"
+                if set(exp) & {"visible", "text_contains", "input_value"} and not exp.get("selector"):
+                    return [], f"「{name}」第 {j} 步的元素断言缺少 selector"
             clean.append(s)
         flows.append({"name": name, "steps": clean})
     return flows, ""
@@ -1193,6 +1228,7 @@ def check_interaction(root: Path, files: list[Path], ctx: "Ctx") -> Check:
     if pw_dir is None:
         c.state, c.applicable = "UNKNOWN", False
         c.detail = "没找到 playwright，交互测试跑不了"
+        c.reason_code = "MISSING_BROWSER_DEPENDENCY"
         return c
     node = shutil.which("node")
     if not node:
@@ -1411,7 +1447,7 @@ def _py_for(root: Path) -> str:
     跑测试会 import 失败 → 全部用例被跳过 → 看着"绿"其实什么都没验）。
     """
     # ① 显式指定（环境变量）—— 用来对付「仓库里没有 venv，但本机有」的情况
-    env = os.environ.get("VERIFY_TEST_PYTHON")
+    env = os.environ.get("VERIFY_HELPER_TEST_PYTHON")
     if env and Path(env).is_file():
         return env
     # ② 项目根的 .verify-python 文件：一行路径，适合本机配置且可 .gitignore
@@ -2133,8 +2169,11 @@ def _verify_checks(project: str, checks: list[str] | None = None,
             "artifacts_dir": artifacts_dir,
         })
     except Exception as _e:
+        _report["lifecycle_error"] = type(_e).__name__
+        if _report["verdict"] != "FAIL":
+            _report["verdict"] = "UNKNOWN"
         _report.setdefault("notes", []).append(
-            f"lifecycle 后处理失败（不影响检查结果）：{type(_e).__name__}: {_e}")
+            f"lifecycle 后处理失败：{type(_e).__name__}")
     return _report
 
 

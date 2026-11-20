@@ -53,7 +53,7 @@ def _where(f: dict) -> str:
 
 def _verify_text(check_id: str, blocking: bool) -> str:
     expectation = "应 PASS" if blocking else "应 0 处提示"
-    return f'verify_start(path=".") 或 verify-helper . --json，确认 {check_id} {expectation}'
+    return f'verify_run_full(path=".") 或 verify-helper . --json，确认 {check_id} {expectation}'
 
 
 def _card(f: dict, cls, cause, action, must_not, check_id, scale="low", cite=True):
@@ -338,7 +338,7 @@ def _gate(card: dict, finding: dict) -> bool:
         return False
     # ② 可验证：必须同时给出 MCP 调用与命令行两种形式
     verify = card.get("verify") or ""
-    if "verify_start(" not in verify or "verify-helper ." not in verify:
+    if "verify_run_full(" not in verify or "verify-helper ." not in verify:
         return False
     # ③ 有边界：至少一条「不要动」
     must_not = card.get("must_not_touch") or []

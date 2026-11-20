@@ -7,12 +7,17 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
+from jsonschema import Draft202012Validator
 
 from full_verify import decide, full_verify
+import full_verify as engine
+import lifecycle
+import verify_core as core
 
 
 PASSING_TEST = """import unittest
@@ -37,6 +42,7 @@ class FullVerification(unittest.TestCase):
         return path
 
     def run_full(self, **options):
+        options.setdefault("evidence_dir", self.root / ".verify-artifacts")
         report = full_verify(self.root, trusted=True, **options)
         rows = {row["id"]: row for row in report["checks"]}
         return report, rows
@@ -108,6 +114,78 @@ class FullVerification(unittest.TestCase):
         self.assertEqual(report["verdict"], "UNKNOWN")
         self.assertTrue(report["blockers"])
 
+    def test_v2_evidence_retrieval_rejects_changed_receipt(self):
+        self.file("README.md", "Documentation.")
+        report, rows = self.run_full()
+        directory = Path(report["evidence_dir"])
+        self.assertEqual(engine.read_evidence(directory)["verdict"], "PASS")
+        (directory / rows["encoding"]["evidence_ref"]).write_text("changed", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "digest"):
+            engine.read_evidence(directory)
+
+    def test_v2_full_report_has_explicit_releasability_and_ledger(self):
+        self.file("app.py", "def value(): return 42\n")
+        report, _ = self.run_full()
+        schema_path = Path(__file__).resolve().parents[1] / "docs/v2/SCHEMA-v2.json"
+        Draft202012Validator(json.loads(schema_path.read_bytes())).validate(report)
+        self.assertEqual(report["scope"], "FULL")
+        self.assertFalse(report["releasable"])
+        tests = next(row for row in report["ledger"] if row["check_id"] == "tests")
+        self.assertEqual(tests["applicability"], "APPLICABLE")
+        self.assertEqual(tests["eligible"], tests["executed"] + tests["skipped"] + tests["not_run"])
+        self.assertGreater(tests["not_run"], 0)
+
+    def test_v2_policy_records_unavailable_explicit_check(self):
+        self.file("README.md", "Documentation.")
+        policy = self.file("policy.json", '{"required_checks":["physical-oracle"]}')
+        report, _ = self.run_full(policy_path=policy)
+        row = next(item for item in report["ledger"] if item["check_id"] == "physical-oracle")
+        self.assertTrue(row["required"])
+        self.assertEqual(row["not_run"], 1)
+        self.assertEqual(report["verdict"], "UNKNOWN")
+
+    def test_v2_p0_02_finds_js_syntax_error_past_previous_cap(self):
+        if not shutil.which("node"):
+            self.skipTest("Requires Node")
+        for index in range(121):
+            self.file(f"module-{index:03}.mjs", "const = ;\n" if index == 120 else "const x = 1;\n")
+        report, rows = self.run_full()
+        self.assertEqual(report["verdict"], "FAIL")
+        self.assertEqual(rows["syntax"]["findings"][-1]["file"], "module-120.mjs")
+
+    def test_v2_cancels_an_already_started_command(self):
+        ready = self.root / "started"
+        stop = self.root / "cancel"
+        source = self.file("fixture.py", f"from pathlib import Path\nimport time\n"
+                           f"Path({str(ready)!r}).touch()\ntime.sleep(90)\n")
+        answers = []
+        with patch.dict(os.environ, {"VERIFY_HELPER_CANCEL_FILE": str(stop)}):
+            worker = threading.Thread(target=lambda: answers.append(
+                core._run([core.sys.executable, str(source)], self.root, 15)))
+            worker.start()
+            try:
+                for _ in range(100):
+                    if ready.exists():
+                        break
+                    threading.Event().wait(0.05)
+                self.assertTrue(ready.exists())
+            finally:
+                stop.touch()
+                worker.join(12)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(answers[0][0], 125)
+
+    def test_v2_p0_06_browser_absence_remains_required(self):
+        self.file("index.html", "<!doctype html><html><body><p>Fixture</p></body></html>")
+        with patch.object(core, "_find_playwright", return_value=None):
+            report = engine._run_plan(self.root, trusted=True)
+        engine._finalize(report, None)
+        browser = next(row for row in report["ledger"] if row["check_id"] == "browser")
+        self.assertTrue(browser["required"])
+        self.assertEqual(browser["applicability"], "APPLICABLE")
+        self.assertEqual(browser["reason_code"], "MISSING_BROWSER_DEPENDENCY")
+        self.assertEqual(report["verdict"], "UNKNOWN")
+
     def test_cleanup_failure_changes_the_archived_and_returned_verdict(self):
         self.file("README.md", "Documentation.")
 
@@ -131,6 +209,24 @@ class FullVerification(unittest.TestCase):
         row["evidence_ref"] = "tests.json"
         row["coverage"] = {"planned": 4, "observed": 3}
         self.assertEqual(decide(report), "UNKNOWN")
+
+    def test_v2_p0_05_lifecycle_failure_blocks_full_pass(self):
+        self.file("README.md", "Documentation.")
+        with patch.object(lifecycle, "apply", side_effect=RuntimeError("worker failure")):
+            report = engine._run_plan(self.root, trusted=False)
+        for row in report["checks"]:
+            row["evidence_ref"] = row["id"] + ".json"
+        self.assertEqual(decide(report), "UNKNOWN")
+
+    def test_v2_p1_03_same_metadata_changed_bytes_miss_syntax_cache(self):
+        source = self.file("module.js", "let x = 1;\n")
+        before = source.stat()
+        cache = core.Cache()
+        cache.put(source, True)
+        source.write_text("let = x 1;\n", encoding="utf-8")
+        os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.assertEqual(source.stat().st_size, before.st_size)
+        self.assertIsNone(cache.get(source))
 
     def test_secret_does_not_appear_in_report_or_artifacts(self):
         sentinel = "sk-" + "X" * 28
@@ -190,6 +286,27 @@ members = ["README.md"]
         self.assertEqual(report["verdict"], "PASS")
         self.assertIn("tree", report["merge"])
 
+    @unittest.skipUnless(shutil.which("git"), "Requires Git")
+    def test_v2_p0_04_known_merge_conflict_is_fail(self):
+        self.file("README.md", "Original\n")
+
+        def git(*args):
+            subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                            *args], cwd=self.root, check=True, capture_output=True)
+
+        git("init", "-qb", "main")
+        git("add", "README.md")
+        git("commit", "-qm", "base")
+        git("switch", "-qc", "other")
+        file = self.file("README.md", "Other\n")
+        git("commit", "-qam", "other")
+        git("switch", "-q", "main")
+        self.file("README.md", "Main\n")
+        git("commit", "-qam", "main")
+        report, _ = self.run_full(against="other")
+        self.assertEqual(report["verdict"], "FAIL")
+        self.assertEqual(file.read_text(), "Main\n")
+
     @unittest.skipUnless(os.environ.get("VERIFY_PLAYWRIGHT_ROOT") and shutil.which("node"),
                          "Requires a configured Chromium installation")
     def test_real_browser_and_click_flow(self):
@@ -214,6 +331,32 @@ steps = [{goto="index.html"}, {expect={selector="body[data-ready='yes']", visibl
         self.assertEqual(report["verdict"], "PASS")
         self.assertTrue(rows["browser"]["media"])
         self.assertEqual(rows["browser"]["coverage"]["observed"], 2)
+
+    @unittest.skipUnless(os.environ.get("VERIFY_PLAYWRIGHT_ROOT") and shutil.which("node"),
+                         "Requires a configured Chromium installation")
+    def test_v2_p1_02_combined_browser_conditions_are_all_required(self):
+        self.file("index.html", '<!doctype html><html><head><title>Fixture</title></head>'
+                  '<body><p id="state">Actual</p></body></html>')
+        self.file("verify.toml", """[[flows]]
+name = "Combined assertions"
+steps = [{goto="index.html"}, {expect={no_console_error=true, url_contains="index.html", selector="#state", text_contains="Expected", timeout=250}}]
+""")
+        report, rows = self.run_full()
+        self.assertEqual(rows["interaction"]["state"], "FAIL", rows["interaction"])
+        self.assertEqual(report["verdict"], "FAIL")
+
+    @unittest.skipUnless(os.environ.get("VERIFY_PLAYWRIGHT_ROOT") and shutil.which("node"),
+                         "Requires a configured Chromium installation")
+    def test_v2_p0_02_browser_reaches_page_beyond_previous_cap(self):
+        for index in range(31):
+            script = "<script>throw new Error('last page')</script>" if index == 30 else ""
+            name = "index.html" if index == 0 else f"page-{index:03}.html"
+            self.file(name, "<!doctype html><html><head><title>Fixture</title></head>"
+                      f"<body><p>Fixture</p>{script}</body></html>")
+        report, rows = self.run_full()
+        self.assertEqual(rows["browser"]["coverage"]["observed"], 31)
+        self.assertEqual(report["verdict"], "FAIL")
+        self.assertTrue(any(item["file"] == "page-030.html" for item in rows["browser"]["findings"]))
 
     @unittest.skipUnless(os.environ.get("VERIFY_TSC") and shutil.which("node"),
                          "Requires a configured TypeScript compiler")
