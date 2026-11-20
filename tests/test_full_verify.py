@@ -153,7 +153,7 @@ sha256 = "{digest}"
 members = ["README.md"]
 ''')
         report, rows = self.run_full()
-        self.assertEqual(rows["delivery-1"]["state"], "PASS")
+        self.assertEqual(rows["delivery-1"]["state"], "PASS", rows["delivery-1"])
         self.assertEqual(report["verdict"], "PASS")
         config.write_text(config.read_text().replace('["README.md"]', '["LICENSE"]'), encoding="utf-8")
         report, rows = self.run_full()

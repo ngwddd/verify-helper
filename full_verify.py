@@ -41,7 +41,7 @@ def scrub(value):
     if isinstance(value, list):
         return [scrub(item) for item in value]
     if isinstance(value, dict):
-        return {key: scrub(item) for key, item in value.items()}
+        return {scrub(key): scrub(item) for key, item in value.items()}
     return value
 
 
@@ -266,7 +266,8 @@ def _worker(root: Path, trusted: bool, result_path: Path) -> None:
         destination.mkdir(parents=True, exist_ok=True)
         for path in Path(source).glob("*.png"):
             if path.is_file() and not path.is_symlink():
-                shutil.copy2(path, destination / path.name)
+                name = hashlib.sha256(path.name.encode()).hexdigest() + ".png"
+                shutil.copy2(path, destination / name)
         row["evidence"] = {"dir": str(destination), "count": len(list(destination.iterdir()))}
     result_path.write_text(json.dumps(scrub(report), ensure_ascii=False), encoding="utf-8")
 
@@ -316,7 +317,9 @@ def _record(report: dict, output: Path, work: Path) -> None:
         lifecycle["stage"]["verdict"] = report["verdict"]
     report["sarif"] = json.loads(sarif.dumps(report, core.VERSION))
     (output / "results.sarif").write_text(json.dumps(report["sarif"], ensure_ascii=False), encoding="utf-8")
-    (output / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    pending = output / "report.json.tmp"
+    pending.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    pending.replace(output / "report.json")
 
 
 def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Path | None = None,
@@ -335,7 +338,7 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
     git = _source_git(root)
     try:
         with tempfile.TemporaryDirectory(prefix="verify-helper-") as directory:
-            work = Path(directory)
+            work = Path(directory).resolve()
             snapshot = work / "project"
             source = root
             if against:
@@ -376,10 +379,14 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
             if output.resolve() != output:
                 raise ValueError("Evidence directory may not traverse a symbolic link")
             report["evidence_dir"] = str(output / run_id)
+            report = scrub(report)
             _record(report, output / run_id, work)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         report["blockers"].append(f"Verification infrastructure failed ({type(error).__name__})")
         report["verdict"] = decide(report)
+        lifecycle = report.get("lifecycle")
+        if lifecycle and "stage" in lifecycle:
+            lifecycle["stage"]["verdict"] = report["verdict"]
     return scrub(report)
 
 
@@ -399,6 +406,22 @@ def _merge_snapshot(root: Path, base: str, work: Path) -> tuple[Path, dict]:
     destination.mkdir()
     with tarfile.open(archive) as package:
         package.extractall(destination, filter="data")
+    entries = git("ls-tree", "-r", "-z", tree).stdout.split(b"\0")
+    for entry in filter(None, entries):
+        meta, filename = entry.split(b"\t", 1)
+        mode, kind, digest = meta.decode("ascii").split()
+        file = destination / os.fsdecode(filename)
+        if mode == "120000":
+            continue  # Snapshot validation records symbolic links as omissions.
+        if kind != "blob" or not file.is_file():
+            raise ValueError("Git archive did not provide every merged file")
+        with file.open("rb") as stream:
+            hash_ = hashlib.new("sha1" if len(digest) == 40 else "sha256")
+            hash_.update(f"blob {file.stat().st_size}\0".encode())
+            while chunk := stream.read(256 * 1024):
+                hash_.update(chunk)
+        if hash_.hexdigest() != digest:
+            raise ValueError("Git archive changed a file from the merged tree")
     return destination, {"base_commit": commit, "tree": tree}
 
 
