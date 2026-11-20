@@ -46,13 +46,20 @@ jobs:
           & (Join-Path $toolchain "node_modules/.bin/playwright$suffix") @browserArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ($IsWindows) {
-            $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
-            $vsVersion = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion
-            $env:CMAKE_GENERATOR = switch (([version]$vsVersion).Major) {
-              17 { 'Visual Studio 17 2022' }
-              18 { 'Visual Studio 18 2026' }
-              default { throw "Unsupported Visual Studio version: $vsVersion" }
-            }
+            $native = Join-Path $env:RUNNER_TEMP vh-native
+            uv venv --python 3.12 $native
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            uv pip install --python (Join-Path $native 'Scripts/python.exe') cmake==4.4.5 ninja==1.13.2 ziglang==0.17.1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $scripts = Join-Path $native Scripts
+            $zig = (Join-Path $native 'Lib/site-packages/ziglang/zig.exe').Replace('\', '/')
+            $env:Path = $scripts + [IO.Path]::PathSeparator + $env:Path
+            $env:CC = "$zig cc"
+            $env:CXX = "$zig c++"
+            $env:CMAKE_GENERATOR = 'Ninja'
+            $scripts >> $env:GITHUB_PATH
+            "CC=$env:CC" >> $env:GITHUB_ENV
+            "CXX=$env:CXX" >> $env:GITHUB_ENV
             "CMAKE_GENERATOR=$env:CMAKE_GENERATOR" >> $env:GITHUB_ENV
           }
           $env:VERIFY_PLAYWRIGHT_ROOT = $toolchain
