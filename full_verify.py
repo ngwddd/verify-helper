@@ -467,7 +467,7 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
     image = os.environ.get(isolated_runtime.IMAGE_VARIABLE)
     host_execution = trusted and image is None and not sealed
     sealed = not host_execution
-    sandbox_image = image if trusted else None
+    sandbox_image = image if trusted else "" if image is not None else None
     context = {"schema_version": SCHEMA_VERSION, "run_id": run_id, "version": core.VERSION,
                "mode": "full", "isolation": "linux-container-candidate" if image is not None
                else "temporary-source-snapshot",

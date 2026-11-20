@@ -25,6 +25,7 @@ jobs:
       - name: Run offline guest boundary checks
         shell: bash
         run: |
+          docker info --format '{{.OSType}} {{.DefaultRuntime}} {{json .SecurityOptions}} {{.MemoryLimit}} {{.SwapLimit}} {{.PidsLimit}}'
           docker pull python:3.12-slim
           export VERIFY_HELPER_SANDBOX_IMAGE="$(docker image inspect --format '{{.Id}}' python:3.12-slim)"
           printf 'Acceptance image ID: %s\n' "$VERIFY_HELPER_SANDBOX_IMAGE"

@@ -1,6 +1,5 @@
 """Execute boundary checks against a real Linux Docker daemon."""
 from pathlib import Path
-import json
 import os
 import socket
 import subprocess
@@ -99,7 +98,7 @@ with socket.socket(socket.AF_INET6) as client:
         self.assertEqual(report["verdict"], "UNKNOWN")
         self.assertFalse(report["releasable"])
         tests = next(row for row in report["checks"] if row["id"] == "tests")
-        self.assertEqual(tests["reason_code"], "ISOLATED_TEST_ORACLE_UNVERIFIED", json.dumps(report))
+        self.assertEqual(tests["reason_code"], "ISOLATED_TEST_ORACLE_UNVERIFIED")
         archive = store / report["run_id"]
         self.assertEqual(read_evidence(archive), report)
         for path in archive.iterdir():

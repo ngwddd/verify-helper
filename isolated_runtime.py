@@ -109,7 +109,7 @@ def run_isolated(root: Path, scope: Path, command: list[str], image: str, cancel
         info = inspect("info", "--format", "{{json .}}")
         if (info["OSType"] != "linux" or info["DefaultRuntime"] != "runc"
                 or "name=seccomp,profile=builtin" not in info.get("SecurityOptions", [])
-                or not all(info.get(key) for key in ("MemoryLimit", "SwapLimit", "PidsLimit", "CPUCfsQuota"))):
+                or not all(info.get(key) for key in ("MemoryLimit", "SwapLimit", "PidsLimit", "CpuCfsQuota"))):
             raise BoundaryUnavailable("The local Docker daemon does not meet the isolation requirements")
         metadata, = inspect("image", "inspect", image)
         if metadata["Id"] != image or metadata["Config"].get("Volumes"):
