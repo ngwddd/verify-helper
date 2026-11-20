@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 from pathlib import Path, PurePosixPath
@@ -11,7 +10,7 @@ from isolated_runtime import OUTPUT_LIMIT, run_isolated
 from private_storage import require_private
 
 POLICY_VARIABLE = "VERIFY_HELPER_ORACLE_POLICY"
-ENTRY = re.compile(r"(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.py")
+ENTRY = re.compile(r"(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(?:py|js|mjs|cjs)")
 POLICY_LIMIT = 128 * 1024
 
 
@@ -31,7 +30,7 @@ def load(path: Path, project: Path, snapshot_digest: str):
     entry = policy["entry"]
     cases = policy["cases"]
     if not isinstance(entry, str) or not ENTRY.fullmatch(entry) or not isinstance(cases, list) or not 2 <= len(cases) <= 8:
-        raise ValueError("Oracle policy must describe a Python entry and two to eight cases")
+        raise ValueError("Oracle policy must describe a Python or JavaScript entry and two to eight cases")
     inputs, outputs = set(), set()
     for case in cases:
         if not isinstance(case, dict) or set(case) != {"argv", "stdout", "exit_code"}:
@@ -52,12 +51,13 @@ def load(path: Path, project: Path, snapshot_digest: str):
 def run(root, policy, image, cancelled):
     """Return only counts and fixed status codes to the evidence writer."""
     entry = PurePosixPath(policy["entry"])
+    runner = ["/usr/local/bin/python", "-I", "-S"] if entry.suffix == ".py" else ["/usr/local/bin/node"]
     cases = policy["cases"]
     completed = failed = 0
     for case in cases:
         if cancelled():
             break
-        command = ["/usr/local/bin/python", "-I", "-S", "/workspace/" + entry.as_posix(), *case["argv"]]
+        command = [*runner, "/workspace/" + entry.as_posix(), *case["argv"]]
         try:
             result = run_isolated(root, Path("."), command, image, cancelled,
                                   expected_output=case["stdout"].encode("utf-8"))

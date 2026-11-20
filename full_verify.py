@@ -19,6 +19,7 @@ from pathlib import Path
 
 import check_specs
 import isolated_runtime
+import protected_git
 import protected_oracle
 import report_export
 import sarif
@@ -359,6 +360,9 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
         required["behavior-contract"] = "Operator-approved black-box behavior"
     report["plan"] = required
     report["plan_digest"] = plan_digest(required)
+    if sandbox_image and config_error is None and not any(
+            row["id"] == "secrets" and row["state"] == "FAIL" for row in rows):
+        _complete_isolated_js_syntax(root, files, rows, sandbox_image)
     for identifier, action, requires_trust, isolated in tasks:
         execute(identifier, action, requires_trust, isolated)
     if oracle_policy is not None:
@@ -376,6 +380,32 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
         else:
             record(adapters.check(identifier, "Required check unavailable"))
     return report
+
+
+def _complete_isolated_js_syntax(root: Path, files: list[Path], rows: list[dict], image: str) -> None:
+    syntax = next(row for row in rows if row["id"] == "syntax")
+    if syntax.get("reason_code") != "JAVASCRIPT_SYNTAX_UNAVAILABLE":
+        return
+    sources = [path for path in files if path.suffix.lower() in {".js", ".mjs", ".cjs"}]
+    for file in sources[:12]:
+        if core._worker_cancelled():
+            break
+        relative = file.relative_to(root).as_posix()
+        try:
+            result = isolated_runtime.run_isolated(
+                root, Path("."), ["/usr/local/bin/node", "--check", "/workspace/" + relative],
+                image, core._worker_cancelled,
+            )
+        except (OSError, ValueError, subprocess.SubprocessError, KeyError, TypeError):
+            break
+        syntax["coverage"]["observed"] += 1
+        if result.exit_code == 1:
+            syntax["state"] = "FAIL"
+            syntax["findings"].append({"file": relative, "line": 0, "message": "SOURCE_SYNTAX_INVALID"})
+    if syntax["coverage"]["observed"] == syntax["coverage"]["planned"]:
+        syntax["reason_code"] = ""
+        if syntax["state"] != "FAIL":
+            syntax["state"] = "PASS"
 
 
 def _isolated_unittest(root: Path, scope: Path, identifier: str, image: str) -> core.Check:
@@ -555,14 +585,16 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
             snapshot = work / "project"
             source = root
             if (revision or against) and not host_execution:
-                raise ValueError("Git verification is unavailable under the protected execution policy")
-            if revision and (revision != git.get("head") or git.get("dirty") is not False):
-                raise ValueError("Requested revision does not match a clean Git checkout")
-            if against:
-                if not git.get("head") or git.get("dirty") is not False:
-                    raise ValueError("Merge verification requires a clean Git worktree")
-                source, merge = _merge_snapshot(root, against, work)
-                context["merge"] = merge
+                source, git_context = _protected_git_source(root, work, revision, against)
+                context.update(git_context)
+            elif host_execution:
+                if revision and (revision != git.get("head") or git.get("dirty") is not False):
+                    raise ValueError("Requested revision does not match a clean Git checkout")
+                if against:
+                    if not git.get("head") or git.get("dirty") is not False:
+                        raise ValueError("Merge verification requires a clean Git worktree")
+                    source, merge = _merge_snapshot(root, against, work)
+                    context["merge"] = merge
             inventory = {}
             digest, omitted = _snapshot(source, snapshot, protected=not host_execution, inventory=inventory)
             config = snapshot / "verify.toml"
@@ -673,9 +705,26 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
                 private_write(run_output / location_data.name, location_data.read_bytes())
                 report["local_finding_index"] = True
     except (OSError, ValueError, subprocess.SubprocessError) as error:
-        if isinstance(error, MergeConflict):
+        if isinstance(error, (MergeConflict, protected_git.ProtectedMergeConflict)):
             report["merge_conflict"] = True
+        elif (revision or against) and not host_execution and not context.get("git"):
+            report["reason_code"] = "GIT_SNAPSHOT_UNAVAILABLE"
         report["blockers"].append(f"Verification infrastructure failed ({type(error).__name__})")
+        if sealed and (revision or against) and not context.get("git") and run_output is None:
+            conflict = report.get("merge_conflict") is True
+            row = adapters.check("git-snapshot", "Git object verification did not produce a source snapshot",
+                                 "FAIL" if conflict else "UNKNOWN")
+            row.reason_code = "GIT_MERGE_CONFLICT" if conflict else "GIT_SNAPSHOT_UNAVAILABLE"
+            report["checks"] = report_export.project_receipts(
+                {"checks": [row.as_dict()], "plan": {row.id: "Verified Git snapshot"}}
+            )["checks"]
+            report["plan"] = {row.id: "Verified Git snapshot"}
+            try:
+                output = _evidence_root(evidence_dir or Path.home() / ".verify-helper" / "cli-runs")
+                run_output = output / run_id
+                _record_checks(report, run_output, output)
+            except (OSError, ValueError):
+                report["blockers"].append("Git snapshot evidence could not be written")
     try:
         _finalize(report, run_output if run_output and run_output.is_dir() else None,
                   evidence_key=evidence_key)
@@ -683,6 +732,29 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
         report["blockers"].append(f"Cannot finalize evidence ({type(error).__name__})")
         _finalize(report, None)
     return scrub(report)
+
+
+def _protected_git_source(root: Path, work: Path, revision: str | None, against: str | None):
+    repo = protected_git.ObjectRepository(root, work, _protected_copy)
+    head = repo.resolve("HEAD")
+    if revision is not None and revision != head:
+        raise ValueError("Requested revision differs from the checked-out commit")
+    head_tree = repo.checkpoint(head)
+    committed = work / "committed"
+    repo.materialize(head_tree, committed)
+    live_digest, live_omitted = _snapshot(root, work / "worktree-input", protected=True)
+    committed_digest, committed_omitted = _snapshot(committed, work / "commit-input", protected=True)
+    if live_omitted or committed_omitted or live_digest != committed_digest:
+        raise ValueError("Working copy differs from the verified committed input")
+    context = {"git": {"head": head, "tree": head_tree, "dirty": False}}
+    if not against:
+        return committed, context
+    base = repo.resolve(against)
+    merged_tree = repo.merge(head, base)
+    merged = work / "merged"
+    repo.materialize(merged_tree, merged)
+    context["merge"] = {"base_commit": base, "tree": merged_tree}
+    return merged, context
 
 
 def _merge_snapshot(root: Path, base: str, work: Path) -> tuple[Path, dict]:

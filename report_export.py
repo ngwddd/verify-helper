@@ -13,9 +13,9 @@ REASONS = {"JAVASCRIPT_SYNTAX_UNAVAILABLE", "ISOLATION_UNAVAILABLE",
            "ISOLATED_TEST_ORACLE_UNVERIFIED", "ISOLATED_PROCESS_NONZERO",
            "UNSUPPORTED_ISOLATED_ADAPTER", "CUSTOM_RULE_BUDGET_EXCEEDED",
            "BEHAVIOR_CONTRACT_UNAVAILABLE", "BEHAVIOR_CONTRACT_MATCHED", "BEHAVIOR_CONTRACT_MISMATCH",
-           "BEHAVIOR_CONTRACT_INCOMPLETE"}
+           "BEHAVIOR_CONTRACT_INCOMPLETE", "GIT_MERGE_CONFLICT", "GIT_SNAPSHOT_UNAVAILABLE"}
 PUBLIC_CHECKS = frozenset(check_specs.ordered_ids()) | {
-    "execution-isolation", "scan-coverage", "configuration", "behavior-contract",
+    "execution-isolation", "scan-coverage", "configuration", "behavior-contract", "git-snapshot",
 }
 
 
@@ -93,7 +93,8 @@ def mcp_report(report: dict, run_id: str, version: str) -> dict:
                   verdict=verdict if verdict in VERDICTS else "UNKNOWN")
     public["security_status"] = security if security in {"ENFORCED", "VIOLATED"} else "UNAVAILABLE"
     if public["security_status"] == "UNAVAILABLE":
-        public["reason_code"] = "ISOLATION_UNAVAILABLE"
+        reason = report.get("reason_code")
+        public["reason_code"] = reason if reason == "GIT_SNAPSHOT_UNAVAILABLE" else "ISOLATION_UNAVAILABLE"
     omitted = report.get("protected_input")
     if isinstance(omitted, dict) and type(omitted.get("excluded_count")) is int:
         public["protected_input"] = {"reason_code": "PROTECTED_INPUT_EXCLUDED",

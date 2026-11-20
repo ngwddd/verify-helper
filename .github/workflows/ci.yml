@@ -31,6 +31,13 @@ jobs:
           export VERIFY_HELPER_SANDBOX_IMAGE="$(docker image inspect --format '{{.Id}}' "$image")"
           printf 'Acceptance image ID: %s\n' "$VERIFY_HELPER_SANDBOX_IMAGE"
           uv run python -m unittest discover -s tests -p sandbox_acceptance.py -v
+      - name: Verify JavaScript inside the offline guest
+        shell: bash
+        run: |
+          image='node@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54'
+          docker pull "$image"
+          export VERIFY_HELPER_SANDBOX_IMAGE="$(docker image inspect --format '{{.Id}}' "$image")"
+          uv run python -m unittest discover -s tests -p sandbox_node_acceptance.py -v
 
   verification:
     name: Test Python ${{ matrix.python }} on ${{ matrix.os }}

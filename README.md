@@ -18,7 +18,8 @@ RC4 是当前已发布的 Linux 有限预览，本分支是后续加固开发。
 | 参数 | 用途 |
 |---|---|
 | unsafe-local-run PROJECT | 只用于手动调试已审查的自有项目。以宿主身份执行，结果不可发布。 |
-| --against main | 仅限显式本地调试。受保护模式仍缺 Git 合并运行器。 |
+| --against main | 对经过核对的干净 Git 工作树执行内建合并，并验证合并结果。 |
+| --revision SHA | 核对完整 Git 提交 ID 和干净工作树。 |
 | --evidence-dir PATH | 指定证据根目录 |
 | --json [FILE] | 把机器可读报告写入文件，省略文件时输出到标准输出 |
 | --sarif FILE | 另存 SARIF 2.1.0 报告 |
@@ -52,11 +53,11 @@ HTTP 服务监听 127.0.0.1，在 /mcp 提供标准接口，拒绝外部 Origin�
 
 ### Linux 隔离候选
 
-操作者可以用 `VERIFY_HELPER_SANDBOX_IMAGE=sha256:<本机镜像 ID>` 配置独立运行环境，服务为每次任务检验可用性。Docker 容器默认断网、无宿主映射并以非 root 运行，目前只调度标准库 unittest。管理员可用 `VERIFY_HELPER_SANDBOX_TIMEOUT_SECONDS` 设置单命令 5 至 180 秒的上限，默认为 60 秒。受保护模式不运行项目的宿主命令，也不采用项目自定义的 `.verifyignore`。目前 Git 修订、合并、其他动态适配器和不完整测试覆盖均保留 UNKNOWN。 [RC4 整改记录](docs/v2/RC4-AUDIT.md)
+操作者可以用 `VERIFY_HELPER_SANDBOX_IMAGE=sha256:<本机镜像 ID>` 配置运行环境。Docker 容器默认断网、无宿主映射并以非 root 运行。按镜像工具链可观察标准库 unittest、检查 JavaScript 语法，或运行由操作者预先授权的 Python/JavaScript 行为用例。管理员可用 `VERIFY_HELPER_SANDBOX_TIMEOUT_SECONDS` 设置单命令 5 至 180 秒的上限，默认为 60 秒。受保护模式不运行项目的宿主命令，也不采用项目自定义的 `.verifyignore`。适用但缺证据的检查保留 UNKNOWN。 [当前整改记录](docs/v2/FINAL-HARDENING.md)
 
 ## 适用检查与当前边界
 
-下表包含静态检查与显式本机调试的适配器。受保护的动态执行目前仅覆盖 Linux 标准库 unittest 试运行和操作者配置的 Python 黑盒行为检查。
+下表包含静态检查与显式本机调试的适配器。受保护的动态执行目前覆盖 Linux 标准库 unittest 试运行、JavaScript 语法和操作者配置的 Python/JavaScript 黑盒行为检查。
 
 | 项目 | 验证范围 |
 |---|---|
@@ -105,6 +106,6 @@ Verify Helper runs Full Verification through a CLI or MCP server and reports PAS
 2. Connect an MCP client using `verify-helper serve --transport stdio --workspace /path/to/project`. For loopback Streamable HTTP, configure `VERIFY_HTTP_BEARER_TOKEN` before starting the service.
 3. Call `verify_run_full`, retain the run ID and poll `verify_get_report`. The result includes applicable checks and evidence coverage.
 
-Protected execution prevents host fallback. On Linux, the operator can provision a fixed local Docker image with `VERIFY_HELPER_SANDBOX_IMAGE`. Current protected runtime coverage consists of standard-library unittest observations and optional externally approved Python behavior checks. Windows guest execution, protected Git merge verification, other dynamic adapters and full release attestation are pending. Exit codes are 0 for PASS, 1 for FAIL and 2 for UNKNOWN.
+Protected execution prevents host fallback. On Linux, the operator can provision a fixed local Docker image with `VERIFY_HELPER_SANDBOX_IMAGE`. Protected runtime coverage includes standard-library unittest observations, JavaScript syntax and optional externally approved Python or JavaScript behavior checks. For ordinary clean SHA-1 Git repositories, protected revision and merge verification read a private copy of the object store. Windows guest execution, other dynamic adapters and full release attestation are pending. Exit codes are 0 for PASS, 1 for FAIL and 2 for UNKNOWN.
 
 The opt-in `--local-finding-index` retains a private source alias map for local troubleshooting. Use `verify-helper resolve-finding RUN_DIRECTORY source-001` to resolve an alias. The MCP response contains safe aliases and line numbers.
