@@ -1,6 +1,7 @@
 """Cross-platform checks for the protected entry point and sealed report."""
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -94,6 +95,23 @@ class TestProtectedVerification(unittest.TestCase):
         self.assertEqual(report["verdict"], "UNKNOWN")
         self.assertIn("Source snapshot contains omitted or changed entries", report["blockers"])
         self.assertNotIn("alias.txt", json.dumps(report))
+
+    def test_snapshot_omits_linked_host_directory(self):
+        witness = self.base / "host-directory"
+        witness.mkdir()
+        (witness / "outside.py").write_text("invalid Python @\n", encoding="utf-8")
+        alias = self.source / "private-alias"
+        if os.name == "nt":
+            subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(witness)],
+                           check=True, capture_output=True)
+            self.addCleanup(alias.rmdir)
+        else:
+            alias.symlink_to(witness, target_is_directory=True)
+        (self.source / "app.py").write_text("value = 1\n", encoding="utf-8")
+        report = self.run_protected()
+        self.assertEqual(report["verdict"], "UNKNOWN")
+        self.assertIn("Source snapshot contains omitted or changed entries", report["blockers"])
+        self.assertNotIn("private-alias", json.dumps(report))
 
     def test_rehashing_changed_evidence_does_not_reauthenticate_it(self):
         (self.source / "app.py").write_text("value = 1\n", encoding="utf-8")

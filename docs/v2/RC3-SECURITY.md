@@ -27,7 +27,7 @@
 | L02 | 未覆盖 | 待使用隔离 Node、C 和独立接收端验证 TCP、UDP、HTTPS。 |
 | L03 | 部分 | Linux 实测 IPv4 DNS 路由、IPv6 路由与代理环境隔离。DNS 类型、QUIC 和 DoH 的专门观察未覆盖。 |
 | L04 | 部分 | Linux 实测宿主环回监听不可达。内网、云元数据替身与客体自有回环正测待完成。 |
-| L05 | 部分 | Windows/POSIX 代码阻止已知链接类型，合成硬链接回归已覆盖。Windows junction 与并发替换未实测。 |
+| L05 | 部分 | 合成硬链接、Windows junction 与 Linux 目录符号链接均有回归。Windows 并发替换仍待实测。 |
 | L06 | 部分 | Linux 实测没有宿主 Docker 套接字和合成环境凭据。SSH Agent、Git 与浏览器凭据的独立夹具待完成。 |
 | L07 | 部分 | Linux 标准库测试原始输出未入库，MCP 和 SARIF 去除任意自由文本。假私钥、Bearer 与编码值矩阵待补。 |
 | L08 | 未覆盖 | 受保护验证不交付媒体。隔离浏览器截图与 HAR 尚无端到端审查。 |

@@ -188,6 +188,8 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
         elif requires_trust and (not trusted or config_error is not None or any(
                 row["id"] == "secrets" and row["state"] == "FAIL" for row in rows)):
             result = adapters.check(identifier, "Project code execution is unavailable")
+            if not trusted:
+                result.reason_code = "ISOLATION_UNAVAILABLE"
         elif requires_trust and sandbox_image is not None:
             result = adapters.check(identifier, "Adapter is unavailable under the isolated execution policy")
             result.reason_code = "UNSUPPORTED_ISOLATED_ADAPTER"
