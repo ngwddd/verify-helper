@@ -57,10 +57,20 @@ jobs:
             $env:CC = "$zig cc"
             $env:CXX = "$zig c++"
             $env:CMAKE_GENERATOR = 'Ninja'
+            $env:ZIG_GLOBAL_CACHE_DIR = Join-Path $native 'zig-cache'
+            $source = Join-Path $native 'compiler-probe.c'
+            $wrapper = Join-Path $native 'compiler-probe.cpp'
+            Set-Content -LiteralPath $source -Value 'int main(void) { return 0; }'
+            Set-Content -LiteralPath $wrapper -Value '#include <string>', 'int main() { return std::string("ok").size() != 2; }'
+            & $zig cc $source -o (Join-Path $native 'probe-c.exe')
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & $zig c++ $wrapper -o (Join-Path $native 'probe-cpp.exe')
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             $scripts >> $env:GITHUB_PATH
             "CC=$env:CC" >> $env:GITHUB_ENV
             "CXX=$env:CXX" >> $env:GITHUB_ENV
             "CMAKE_GENERATOR=$env:CMAKE_GENERATOR" >> $env:GITHUB_ENV
+            "ZIG_GLOBAL_CACHE_DIR=$env:ZIG_GLOBAL_CACHE_DIR" >> $env:GITHUB_ENV
           }
           $env:VERIFY_PLAYWRIGHT_ROOT = $toolchain
           $env:VERIFY_TSC = Join-Path $toolchain "node_modules/.bin/tsc$suffix"

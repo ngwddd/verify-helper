@@ -445,7 +445,7 @@ def _run(cmd: list[str], cwd: Path, timeout: int) -> tuple[int, str]:
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as proc:
             try:
                 output, _ = proc.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as error:
                 if os.name == "nt":
                     subprocess.run(["taskkill.exe", "/PID", str(proc.pid), "/T", "/F"],
                                    capture_output=True, timeout=10, check=False)
@@ -455,7 +455,10 @@ def _run(cmd: list[str], cwd: Path, timeout: int) -> tuple[int, str]:
                     except ProcessLookupError:
                         pass
                 proc.kill()
-                return 124, f"超时（>{timeout}s）：{' '.join(cmd)}"
+                partial = error.output or ""
+                if isinstance(partial, bytes):
+                    partial = partial.decode("utf-8", "replace")
+                return 124, f"超时（>{timeout}s）：{' '.join(cmd)}\n{_tail(partial, 12000)}"
             return proc.returncode, output or ""
     except FileNotFoundError:
         return 127, f"命令不存在：{cmd[0]}"
