@@ -39,6 +39,18 @@ def project_receipts(report: dict) -> dict:
         if coverage and all(type(coverage.get(key, 0)) is int and 0 <= coverage.get(key, 0) <= 200_000
                             for key in ("planned", "observed", "skipped")):
             public["coverage"] = {key: coverage.get(key, 0) for key in ("planned", "observed", "skipped")}
+        isolation = row.get("isolation_receipt")
+        if isinstance(isolation, dict):
+            version = isolation.get("engine_version")
+            image = isolation.get("image_digest")
+            if (isinstance(version, str) and re.fullmatch(r"[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}", version)
+                    and isinstance(image, str) and re.fullmatch(r"sha256:[a-f0-9]{64}", image)):
+                public["isolation_receipt"] = {
+                    "provider": "docker-local-linux", "engine_version": version, "image_digest": image,
+                    "uid": 65532, "network": "none", "host_bind_mounts": 0, "time_limit_seconds": 20,
+                    "root_filesystem_read_only": True, "credential_environment": "minimal",
+                    "verified": False,
+                }
         public_checks.append(public)
     return {"checks": public_checks, "plan": public_plan, "plan_digest": plan_digest(public_plan),
             "export_policy": "sealed"}
@@ -55,9 +67,13 @@ def mcp_report(report: dict, run_id: str, version: str) -> dict:
             row.update(evidence_ref=receipt, evidence_sha256=digest)
     status = report.get("status")
     verdict = report.get("verdict")
+    security = report.get("security_status")
     public.update(schema_version=2, run_id=run_id, version=version,
                   status=status if status in {"COMPLETED", "CANCELLED", "ERROR"} else "ERROR",
                   verdict=verdict if verdict in VERDICTS else "UNKNOWN")
+    public["security_status"] = security if security in {"ENFORCED", "VIOLATED"} else "UNAVAILABLE"
+    if public["security_status"] == "UNAVAILABLE":
+        public["reason_code"] = "ISOLATION_UNAVAILABLE"
     for key, pattern in (("policy_digest", r"sha256:[a-f0-9]{64}"), ("snapshot_sha256", r"[a-f0-9]{64}")):
         value = report.get(key)
         if isinstance(value, str) and re.fullmatch(pattern, value):

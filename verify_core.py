@@ -218,6 +218,7 @@ class Check:
     evidence: dict | None = None
     coverage: dict | None = None
     reason_code: str = ""
+    isolation_receipt: dict | None = None
 
     def as_dict(self) -> dict:
         d = asdict(self)

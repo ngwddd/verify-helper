@@ -43,7 +43,7 @@ Streamable HTTP 使用相同的核心和工具。
 verify-helper serve --workspace /path/to/projects --transport streamable-http --port 8765
 ```
 
-HTTP 服务监听 127.0.0.1，在 /mcp 提供标准接口，拒绝外部 Origin。跨主机连接需要加密通道。配置 VERIFY_HTTP_BEARER_TOKEN 后，HTTP 客户端必须发送对应的 Bearer 凭据。MCP 仅在 Linux 隔离候选由操作者显式启用时进行支持的动态检查。HTTP 模式此时仍要求配置凭据。
+HTTP 服务监听 127.0.0.1，在 /mcp 提供标准接口，拒绝外部 Origin。跨主机连接需要加密通道。启动 HTTP 模式前必须配置 VERIFY_HTTP_BEARER_TOKEN，所有 HTTP 请求均须携带对应的 Bearer 凭据。MCP 仅在 Linux 隔离候选由操作者显式启用时进行支持的动态检查。
 
 工具 `verify_run_full` 接收工作区相对 `path`，可选 `policy_path`、`revision` 或合并基准 `source_ref`。使用返回的 `run_id` 调用 `verify_get_report`，直到任务结束。用 `verify_list_capabilities` 探测运行环境，用 `verify_cancel` 请求取消。Agent 应读取 `verdict` 与 `releasable` 决定是否放行。
 

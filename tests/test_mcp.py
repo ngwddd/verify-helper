@@ -44,6 +44,7 @@ class TestMcp(unittest.IsolatedAsyncioTestCase):
             run_id = response.structured_content["run_id"]
             report = await self.wait_for_report(client, run_id)
             self.assertEqual(report["verdict"], "FAIL")
+            self.assertEqual(report["security_status"], "UNAVAILABLE")
             self.assertEqual(report["scope"], "FULL")
             self.assertFalse(report["releasable"])
             self.assertEqual(report["sarif"]["version"], "2.1.0")
@@ -116,8 +117,10 @@ class TestMcp(unittest.IsolatedAsyncioTestCase):
                         except OSError:
                             await asyncio.sleep(0.1)
                 url = f"http://127.0.0.1:{port}/mcp"
+                pending = set(self.evidence.rglob("*.pending"))
                 async with httpx2.AsyncClient(trust_env=False) as unauthenticated:
                     self.assertEqual((await unauthenticated.post(url)).status_code, 401)
+                    self.assertEqual(set(self.evidence.rglob("*.pending")), pending)
                 async with httpx2.AsyncClient(headers={"Authorization": f"Bearer {token}"},
                                               trust_env=False) as httpx:
                     bad_origin = await httpx.post(url, headers={"Origin": "https://other.invalid"})

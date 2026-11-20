@@ -8,7 +8,9 @@ import hmac
 import json
 import os
 import re
+import secrets
 import shutil
+import stat
 import sys
 import threading
 import uuid
@@ -20,7 +22,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from starlette.responses import Response
 
-from full_verify import full_verify
+from full_verify import _evidence_root, full_verify
 from isolated_runtime import IMAGE_VARIABLE
 from report_export import mcp_report
 from run_evidence import json_bytes, read_evidence
@@ -46,15 +48,40 @@ class StrictServer(MCPServer):
 
 class RunStore:
     def __init__(self, root: Path):
-        self.root = root
-        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.root = _evidence_root(root)
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.key = self._load_key()
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         self.lock = threading.Lock()
         self.jobs = {}
 
+    def _load_key(self):
+        key_path = self.root / ".manifest-key"
+        flags = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        try:
+            fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | flags, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(secrets.token_bytes(32))
+        if key_path.is_symlink():
+            raise ValueError("Evidence key must be a local regular file")
+        with os.fdopen(os.open(key_path, os.O_RDONLY | flags), "rb") as stream:
+            entry = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1
+                    or getattr(entry, "st_file_attributes", 0) & 1024
+                    or (os.name != "nt" and (entry.st_uid != os.geteuid() or entry.st_mode & 0o077))):
+                raise ValueError("Evidence key permissions are invalid")
+            key = stream.read(33)
+        if len(key) != 32:
+            raise ValueError("Evidence key is unavailable")
+        return key
+
     def _failed(self, run_id: str, detail: str) -> dict:
         return {"run_id": run_id, "status": "ERROR", "scope": "FULL",
-                "verdict": "UNKNOWN", "releasable": False, "blockers": [detail]}
+                "verdict": "UNKNOWN", "security_status": "UNAVAILABLE", "releasable": False,
+                "blockers": [detail]}
 
     def submit(self, project, **options):
         with self.lock:
@@ -65,7 +92,7 @@ class RunStore:
             run_id = "vh2_" + uuid.uuid4().hex
             cancellation = threading.Event()
             (self.root / f"{run_id}.pending").touch(exist_ok=False)
-            future = self.pool.submit(full_verify, project, evidence_dir=self.root, sealed=True,
+            future = self.pool.submit(full_verify, project, evidence_dir=self.root, sealed=True, evidence_key=self.key,
                                       run_id=run_id, cancellation=cancellation, **options)
             self.jobs[run_id] = (future, cancellation)
         return {"run_id": run_id, "status": "QUEUED", "scope": "FULL", "releasable": False}
@@ -88,7 +115,7 @@ class RunStore:
                 return {"run_id": run_id, "status": status, "scope": "FULL", "releasable": False}
         if directory.is_dir():
             try:
-                evidence = read_evidence(directory)
+                evidence = read_evidence(directory, key=self.key)
                 if evidence["run_id"] != run_id:
                     raise ValueError("Evidence is bound to another run")
                 return mcp_report(evidence, run_id, VERSION)
@@ -119,6 +146,8 @@ def create_server(workspace: Path, *, trusted: bool = False, evidence_dir: Path 
         raise ValueError("Workspace must be a directory")
     namespace = hashlib.sha256(json_bytes({"workspace": str(workspace), "owner": owner})).hexdigest()[:32]
     store_root = (evidence_dir or Path.home() / ".verify-helper" / "runs").resolve()
+    if store_root.is_relative_to(workspace):
+        raise ValueError("MCP evidence storage must be outside the verified workspace")
     runs = RunStore(store_root / namespace)
     server = StrictServer("verify-helper", version=VERSION)
     server.runs = runs
@@ -160,17 +189,16 @@ def create_server(workspace: Path, *, trusted: bool = False, evidence_dir: Path 
     return server
 
 
-def http_app(server: MCPServer, token: str | None):
+def http_app(server: MCPServer, token: str):
     application = server.streamable_http_app(json_response=True, max_request_body_size=64 * 1024)
-    expected = f"Bearer {token}".encode("ascii") if token else None
+    expected = f"Bearer {token}".encode("ascii")
 
     async def authenticated(scope, receive, send):
         if scope["type"] == "http":
-            if expected is not None:
-                supplied = [value for key, value in scope["headers"] if key.lower() == b"authorization"]
-                if len(supplied) != 1 or not hmac.compare_digest(supplied[0], expected):
-                    await Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})(scope, receive, send)
-                    return
+            supplied = [value for key, value in scope["headers"] if key.lower() == b"authorization"]
+            if len(supplied) != 1 or not hmac.compare_digest(supplied[0], expected):
+                await Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})(scope, receive, send)
+                return
             origins = [value for key, value in scope["headers"] if key.lower() == b"origin"]
             if origins and (len(origins) != 1 or not re.fullmatch(
                     rb"https?://(?:127\.0\.0\.1|localhost|\[::1\])(?::[0-9]{1,5})?", origins[0])):
@@ -195,9 +223,9 @@ def main(argv=None) -> None:
     if args.transport == "streamable-http":
         if token and (len(token) < 32 or not token.isascii() or not token.isalnum()):
             parser.error("VERIFY_HTTP_BEARER_TOKEN requires at least 32 ASCII letters or digits")
-        if args.trust_project_code and not token:
-            parser.error("Set VERIFY_HTTP_BEARER_TOKEN to enable authenticated HTTP project execution")
-        owner = "http:" + (hashlib.sha256(token.encode()).hexdigest() if token else "anonymous-loopback")
+        if not token:
+            parser.error("Set VERIFY_HTTP_BEARER_TOKEN to enable authenticated HTTP verification")
+        owner = "http:" + hashlib.sha256(token.encode()).hexdigest()
     server = create_server(args.workspace, trusted=args.trust_project_code, evidence_dir=args.evidence_dir,
                            owner=owner)
     try:

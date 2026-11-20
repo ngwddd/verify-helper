@@ -23,7 +23,7 @@ class LinuxIsolationAcceptance(unittest.TestCase):
 
     def protected(self, script, cancelled=lambda: False):
         return run_isolated(self.source, Path("."), ["/usr/local/bin/python", "-c", script],
-                            self.image, cancelled)
+                            self.image, cancelled).exit_code
 
     def test_host_file_environment_and_identity(self):
         sentinel = self.base / "host-only"
@@ -129,6 +129,8 @@ else:
         self.assertFalse(report["releasable"])
         tests = next(row for row in report["checks"] if row["id"] == "tests")
         self.assertEqual(tests["reason_code"], "ISOLATED_TEST_ORACLE_UNVERIFIED")
+        self.assertEqual(tests["isolation_receipt"]["image_digest"], self.image)
+        self.assertFalse(tests["isolation_receipt"]["verified"])
         archive = store / report["run_id"]
         self.assertEqual(read_evidence(archive), report)
         for path in archive.iterdir():

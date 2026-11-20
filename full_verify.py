@@ -185,7 +185,7 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
     def execute(identifier, action, requires_trust, isolated):
         if core._worker_cancelled():
             result = adapters.check(identifier, "Verification was cancelled")
-        elif requires_trust and (not trusted or any(
+        elif requires_trust and (not trusted or config_error is not None or any(
                 row["id"] == "secrets" and row["state"] == "FAIL" for row in rows)):
             result = adapters.check(identifier, "Project code execution is unavailable")
         elif requires_trust and sandbox_image is not None:
@@ -343,12 +343,14 @@ def _isolated_unittest(root: Path, scope: Path, identifier: str, image: str) -> 
     if not command or command[1:3] != ["-m", "unittest"]:
         return result
     try:
-        code = isolated_runtime.run_isolated(root, scope, ["/usr/local/bin/python", *command[1:]],
-                                             image, core._worker_cancelled)
+        observed = isolated_runtime.run_isolated(root, scope, ["/usr/local/bin/python", *command[1:]],
+                                                 image, core._worker_cancelled)
     except (OSError, ValueError, subprocess.SubprocessError, KeyError, TypeError):
         result.reason_code = "ISOLATION_UNAVAILABLE"
     else:
-        result.reason_code = "ISOLATED_TEST_ORACLE_UNVERIFIED" if code == 0 else "ISOLATED_PROCESS_NONZERO"
+        result.reason_code = ("ISOLATED_TEST_ORACLE_UNVERIFIED" if observed.exit_code == 0
+                              else "ISOLATED_PROCESS_NONZERO")
+        result.isolation_receipt = {"engine_version": observed.engine_version, "image_digest": image}
     return result
 
 
@@ -385,11 +387,12 @@ def decide(report: dict) -> str:
     """Compute the independent verdict from a required-check ledger and evidence."""
     rows = {row["id"]: row for row in report["checks"]}
     required = report["plan"]
-    if (report.get("merge_conflict") or
+    if (report.get("security_status") == "VIOLATED" or report.get("merge_conflict") or
             report.get("lifecycle", {}).get("security", {}).get("blocked") or
             any(rows.get(key, {}).get("state") == "FAIL" for key in required)):
         return "FAIL"
-    if (not required or report.get("blockers") or report.get("lifecycle_error")
+    if (report.get("security_status") == "UNAVAILABLE" or not required
+            or report.get("blockers") or report.get("lifecycle_error")
             or report.get("plan_digest") != plan_digest(required)):
         return "UNKNOWN"
     for key in required:
@@ -425,7 +428,7 @@ def _record_checks(report: dict, output: Path, work: Path) -> None:
         row["evidence_sha256"] = hashlib.sha256(record).hexdigest()
 
 
-def _finalize(report: dict, output: Path | None) -> None:
+def _finalize(report: dict, output: Path | None, *, evidence_key: bytes | None = None) -> None:
     report.setdefault("plan_digest", plan_digest(report["plan"]))
     report["verdict"] = decide(report)
     set_gate_fields(report)
@@ -437,7 +440,7 @@ def _finalize(report: dict, output: Path | None) -> None:
         report.pop("evidence_manifest", None)
         return
     (output / "results.sarif").write_text(json.dumps(report["sarif"], ensure_ascii=False), encoding="utf-8")
-    write_manifest(report, output)
+    write_manifest(report, output, key=evidence_key)
 
 
 def _evidence_root(path: Path) -> Path:
@@ -461,7 +464,7 @@ class MergeConflict(ValueError):
 def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Path | None = None,
                 against: str | None = None, revision: str | None = None,
                 policy_path: Path | None = None, run_id: str | None = None, cancellation=None,
-                sealed: bool = False) -> dict:
+                sealed: bool = False, evidence_key: bytes | None = None) -> dict:
     root = Path(project).expanduser().resolve()
     run_id = run_id or uuid.uuid4().hex
     image = os.environ.get(isolated_runtime.IMAGE_VARIABLE)
@@ -476,6 +479,8 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
                "policy_digest": "sha256:" + evidence_digest(f"{core.VERSION}:{trusted}".encode())}
     if sealed:
         context["export_policy"] = "sealed"
+        context["security_status"] = "UNAVAILABLE"
+        context["reason_code"] = "ISOLATION_UNAVAILABLE"
     else:
         context["project"] = str(root)
     report = {**context, "checks": [], "plan": {}, "blockers": []}
@@ -591,7 +596,8 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
             report["merge_conflict"] = True
         report["blockers"].append(f"Verification infrastructure failed ({type(error).__name__})")
     try:
-        _finalize(report, run_output if run_output and run_output.is_dir() else None)
+        _finalize(report, run_output if run_output and run_output.is_dir() else None,
+                  evidence_key=evidence_key)
     except (OSError, ValueError) as error:
         report["blockers"].append(f"Cannot finalize evidence ({type(error).__name__})")
         _finalize(report, None)

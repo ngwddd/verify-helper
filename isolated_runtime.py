@@ -11,6 +11,7 @@ import tarfile
 import tempfile
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -30,6 +31,12 @@ ENTRY = (
 
 class BoundaryUnavailable(ValueError):
     """The host could not establish or verify the execution boundary."""
+
+
+@dataclass(frozen=True)
+class ObservedRun:
+    exit_code: int
+    engine_version: str
 
 
 def _stage(root: Path, archive) -> None:
@@ -81,7 +88,7 @@ def _check_container(container: dict, image: str) -> str:
     return identity
 
 
-def run_isolated(root: Path, scope: Path, command: list[str], image: str, cancelled) -> int:
+def run_isolated(root: Path, scope: Path, command: list[str], image: str, cancelled) -> ObservedRun:
     """Return a coarse, daemon-observed exit result without retaining guest output."""
     if sys.platform != "linux" or not IMAGE_ID.fullmatch(image):
         raise BoundaryUnavailable("Isolated execution requires Linux and a local image ID")
@@ -107,7 +114,10 @@ def run_isolated(root: Path, scope: Path, command: list[str], image: str, cancel
             return json.loads(invoke(*args, capture=True).stdout)
 
         info = inspect("info", "--format", "{{json .}}")
+        version = re.fullmatch(r"([0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5})(?:[-+][a-zA-Z0-9.+~-]+)?",
+                               info.get("ServerVersion") or "")
         if (info["OSType"] != "linux" or info["DefaultRuntime"] != "runc"
+                or version is None
                 or "name=seccomp,profile=builtin" not in info.get("SecurityOptions", [])
                 or not all(info.get(key) for key in ("MemoryLimit", "SwapLimit", "PidsLimit", "CpuCfsQuota"))):
             raise BoundaryUnavailable("The local Docker daemon does not meet the isolation requirements")
@@ -142,7 +152,7 @@ def run_isolated(root: Path, scope: Path, command: list[str], image: str, cancel
             code = state["ExitCode"]
             if state["Status"] != "exited" or state["OOMKilled"] or process.returncode != code or code not in (0, 1):
                 raise BoundaryUnavailable("The isolated command did not complete normally")
-            return code
+            return ObservedRun(code, version.group(1))
         finally:
             removed = invoke("container", "rm", "--force", "--volumes", identity, check=False)
             if removed.returncode:

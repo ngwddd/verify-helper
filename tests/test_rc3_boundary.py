@@ -9,7 +9,7 @@ from unittest.mock import patch
 from full_verify import full_verify
 from isolated_runtime import IMAGE_VARIABLE, BoundaryUnavailable, run_isolated
 from report_export import mcp_report
-from run_evidence import read_evidence
+from run_evidence import digest, json_bytes, read_evidence
 
 
 class TestProtectedVerification(unittest.TestCase):
@@ -36,6 +36,7 @@ class TestProtectedVerification(unittest.TestCase):
         self.assertFalse(witness.exists())
         self.assertEqual(report["verdict"], "UNKNOWN")
         self.assertFalse(report["releasable"])
+        self.assertEqual(report["security_status"], "UNAVAILABLE")
         self.assertIn("ISOLATION_UNAVAILABLE", {row.get("reason_code") for row in report["checks"]})
         self.assertNotIn(str(self.source), json.dumps(report))
         self.assertNotIn(".env.fixture", json.dumps(report))
@@ -93,3 +94,33 @@ class TestProtectedVerification(unittest.TestCase):
         self.assertEqual(report["verdict"], "UNKNOWN")
         self.assertIn("Source snapshot contains omitted or changed entries", report["blockers"])
         self.assertNotIn("alias.txt", json.dumps(report))
+
+    def test_rehashing_changed_evidence_does_not_reauthenticate_it(self):
+        (self.source / "app.py").write_text("value = 1\n", encoding="utf-8")
+        key = bytes(range(32))
+        report = self.run_protected(evidence_key=key)
+        archive = self.output / report["run_id"]
+        self.assertEqual(read_evidence(archive, key=key), report)
+        with self.assertRaisesRegex(ValueError, "key is required"):
+            read_evidence(archive)
+        manifest_path = archive / "manifest.json"
+        report_path = archive / "report.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        report.update(verdict="PASS", releasable=True, security_status="ENFORCED")
+        body = json_bytes(report)
+        report_path.write_bytes(body)
+        manifest["files"]["report.json"] = digest(body)
+        manifest_path.write_bytes(json_bytes(manifest))
+        with self.assertRaisesRegex(ValueError, "authentication failed"):
+            read_evidence(archive, key=key)
+
+    def test_project_config_cannot_disable_isolation(self):
+        (self.source / "verify.toml").write_text(
+            '[verification]\nnetwork = "unrestricted"\nsandbox = "off"\n', encoding="utf-8")
+        (self.source / "test_app.py").write_text("import unittest\n", encoding="utf-8")
+        with patch.dict(os.environ, {IMAGE_VARIABLE: "invalid-image"}):
+            report = self.run_protected(trusted=True)
+        rows = {row["id"]: row for row in report["checks"]}
+        self.assertEqual(rows["configuration"]["state"], "FAIL")
+        self.assertEqual(rows["tests"]["state"], "UNKNOWN")
+        self.assertFalse(report["releasable"])

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 from pathlib import Path
 
@@ -56,10 +57,13 @@ def set_gate_fields(report: dict) -> None:
     counts["unknown"] += counts["required"] - sum(counts[key] for key in outcomes.values())
     report["ledger"] = ledger
     report["coverage"] = counts
-    report["releasable"] = verdict == "PASS" and report["status"] == "COMPLETED"
+    report["releasable"] = (
+        verdict == "PASS" and report["status"] == "COMPLETED"
+        and report.get("security_status", "ENFORCED") == "ENFORCED"
+    )
 
 
-def write_manifest(report: dict, output: Path) -> None:
+def write_manifest(report: dict, output: Path, *, key: bytes | None = None) -> None:
     report["evidence_manifest"] = "manifest.json"
     records = {"results.sarif": digest((output / "results.sarif").read_bytes())}
     for row in report["checks"]:
@@ -71,17 +75,28 @@ def write_manifest(report: dict, output: Path) -> None:
     records["report.json"] = digest(body)
     manifest = {"run_id": report["run_id"], "snapshot_sha256": report.get("snapshot_sha256"),
                 "policy_digest": report["policy_digest"], "plan_digest": report["plan_digest"], "files": records}
+    if key is not None:
+        manifest["hmac_sha256"] = hmac.digest(key, json_bytes(manifest), "sha256").hex()
     pending = output / "report.json.tmp"
     pending.write_bytes(body)
     (output / "manifest.json").write_bytes(json_bytes(manifest))
     pending.replace(output / "report.json")
 
 
-def read_evidence(output: Path) -> dict:
+def read_evidence(output: Path, *, key: bytes | None = None) -> dict:
     manifest_path = output / "manifest.json"
     if manifest_path.is_symlink():
         raise ValueError("Evidence manifest is not a regular file")
     manifest = json.loads(manifest_path.read_bytes())
+    if not isinstance(manifest, dict):
+        raise ValueError("Evidence manifest must be an object")
+    signature = manifest.pop("hmac_sha256", None)
+    if key is not None:
+        expected = hmac.digest(key, json_bytes(manifest), "sha256").hex()
+        if not isinstance(signature, str) or not hmac.compare_digest(signature.encode("utf-8"), expected.encode("ascii")):
+            raise ValueError("Evidence authentication failed")
+    elif signature is not None:
+        raise ValueError("Evidence authentication key is required")
     records = manifest.get("files")
     if not isinstance(records, dict) or not {"report.json", "results.sarif"} <= records.keys():
         raise ValueError("Evidence manifest is incomplete")

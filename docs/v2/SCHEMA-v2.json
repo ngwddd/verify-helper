@@ -41,6 +41,16 @@
     "releasable": {
       "type": "boolean"
     },
+    "security_status": {
+      "enum": [
+        "ENFORCED",
+        "VIOLATED",
+        "UNAVAILABLE"
+      ]
+    },
+    "export_policy": {
+      "const": "sealed"
+    },
     "policy_digest": {
       "type": "string",
       "pattern": "^sha256:[a-f0-9]{64}$"
