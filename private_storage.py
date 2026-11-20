@@ -62,6 +62,19 @@ def _require_safe_parents(path: Path) -> None:
     _check_parent(path.absolute().parent)
 
 
+def _create_evidence_parents(path: Path) -> None:
+    missing = []
+    for ancestor in (path, *path.parents):
+        try:
+            _check_parent(ancestor)
+            break
+        except FileNotFoundError:
+            missing.append(ancestor)
+    for ancestor in reversed(missing):
+        ancestor.mkdir(mode=0o700, exist_ok=True)
+        _check_parent(ancestor)
+
+
 def _check_parent(path: Path) -> None:
     entry = path.lstat()
     if not stat.S_ISDIR(entry.st_mode) or getattr(entry, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
@@ -72,7 +85,7 @@ def _check_parent(path: Path) -> None:
 
 
 def private_directory(path: Path, *, exist_ok: bool = False) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _create_evidence_parents(path.absolute().parent)
     _require_safe_parents(path)
     if os.name == "nt":
         import pywintypes
