@@ -57,7 +57,7 @@ HTTP 服务监听 127.0.0.1，在 /mcp 提供标准接口，拒绝外部 Origin�
 
 ## 适用检查与当前边界
 
-下表包含静态检查与显式本机调试的适配器。受保护的动态执行目前覆盖 Linux 标准库 unittest 试运行、JavaScript 语法和操作者配置的 Python/JavaScript 黑盒行为检查。
+下表包含静态检查与显式本机调试的适配器。受保护的动态执行目前覆盖 Linux 标准库 unittest 试运行、JavaScript 语法和操作者配置的 Python、JavaScript、单文件 C/C++ 黑盒行为检查。
 
 | 项目 | 验证范围 |
 |---|---|

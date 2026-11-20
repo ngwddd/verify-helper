@@ -195,7 +195,7 @@ def create_server(workspace: Path, *, evidence_dir: Path | None = None,
                 "isolation_attested": False,
                 "isolated_adapters": [],
                 "candidate_adapters": ["python-unittest", "python-behavior", "javascript-syntax",
-                                       "javascript-behavior"] if available else [],
+                                       "javascript-behavior", "native-single-source-behavior"] if available else [],
                 "tools": {"python": True, **{name: shutil.which(name) is not None for name in
                           ("node", "npm", "cmake", "ctest", "git", "tsc")}}}
 

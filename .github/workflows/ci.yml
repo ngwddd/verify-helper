@@ -38,6 +38,13 @@ jobs:
           docker pull "$image"
           export VERIFY_HELPER_SANDBOX_IMAGE="$(docker image inspect --format '{{.Id}}' "$image")"
           uv run python -m unittest discover -s tests -p sandbox_node_acceptance.py -v
+      - name: Compile and execute C and C++ inside the offline guest
+        shell: bash
+        run: |
+          image='gcc@sha256:8c0fe724784c6d617cb582f79ddaf5dd2233aaba2fb7a14e0b9d03348fea8088'
+          docker pull "$image"
+          export VERIFY_HELPER_SANDBOX_IMAGE="$(docker image inspect --format '{{.Id}}' "$image")"
+          uv run python -m unittest discover -s tests -p sandbox_native_acceptance.py -v
 
   verification:
     name: Test Python ${{ matrix.python }} on ${{ matrix.os }}
