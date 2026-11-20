@@ -1653,6 +1653,9 @@ def _detect_base(htmls: list[Path]) -> str:
 
 class _PrefixHandler(SimpleHTTPRequestHandler):
     prefix = ""
+    extensions_map = {**SimpleHTTPRequestHandler.extensions_map,
+                      ".js": "text/javascript", ".mjs": "text/javascript",
+                      ".css": "text/css", ".wasm": "application/wasm"}
 
     def translate_path(self, path: str) -> str:
         if self.prefix:

@@ -59,6 +59,13 @@ def chain(identifier: str, commands: list[list[str]], root: Path) -> core.Check:
     return result
 
 
+def cmake_environment_missing(output: str) -> bool:
+    return bool(re.search(r"CMAKE_(?:C|CXX)_COMPILER not set|"
+                          r"No CMAKE_(?:C|CXX)_COMPILER could be found|"
+                          r"CMake was unable to find a build program|"
+                          r"Could not find the compiler specified", output, re.I))
+
+
 def ctest(root: Path, build: Path) -> core.Check:
     # CTest reports "No tests were found" with exit 0 in older installations.
     result = command("tests-native", ["ctest", "--test-dir", str(build), "--build-config",

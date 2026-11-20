@@ -42,8 +42,19 @@ jobs:
           npm install --prefix $toolchain --no-save --no-audit --no-fund playwright@1.65.1 typescript@7.0.2
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $suffix = if ($IsWindows) { '.cmd' } else { '' }
-          & (Join-Path $toolchain "node_modules/.bin/playwright$suffix") install --with-deps chromium
+          $browserArgs = if ($IsWindows) { @('install', 'chromium') } else { @('install', '--with-deps', 'chromium') }
+          & (Join-Path $toolchain "node_modules/.bin/playwright$suffix") @browserArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($IsWindows) {
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+            $vsVersion = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion
+            $env:CMAKE_GENERATOR = switch (([version]$vsVersion).Major) {
+              17 { 'Visual Studio 17 2022' }
+              18 { 'Visual Studio 18 2026' }
+              default { throw "Unsupported Visual Studio version: $vsVersion" }
+            }
+            "CMAKE_GENERATOR=$env:CMAKE_GENERATOR" >> $env:GITHUB_ENV
+          }
           $env:VERIFY_PLAYWRIGHT_ROOT = $toolchain
           $env:VERIFY_TSC = Join-Path $toolchain "node_modules/.bin/tsc$suffix"
           $env:VERIFY_NATIVE_FIXTURE = '1'

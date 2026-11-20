@@ -27,7 +27,9 @@ SNAPSHOT_EXCLUDES = {".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__
                      ".verify-python", ".pytest_cache", ".mypy_cache", ".tox"}
 EXEC_ENV = {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "LANG", "LC_ALL",
             "VERIFY_TEST_PYTHON", "VERIFY_TSC", "VERIFY_PLAYWRIGHT_ROOT", "PLAYWRIGHT_BROWSERS_PATH",
-            "VERIFY_NATIVE_FIXTURE", "CC", "CXX", "CMAKE_GENERATOR", "INCLUDE", "LIB", "LIBPATH"}
+            "VERIFY_NATIVE_FIXTURE", "CC", "CXX", "CMAKE_GENERATOR", "INCLUDE", "LIB", "LIBPATH",
+            "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "PROGRAMDATA", "SYSTEMDRIVE",
+            "PROCESSOR_ARCHITECTURE"}
 
 
 def scrub(value):
@@ -191,6 +193,9 @@ def _run_plan(root: Path, trusted: bool) -> dict:
                     ["cmake", "-S", str(source), "-B", str(build)],
                     ["cmake", "--build", str(build), "--config", "Release"],
                 ], source)
+                if result.state == "FAIL" and adapters.cmake_environment_missing(result.output):
+                    result.state = "UNKNOWN"
+                    result.detail = "CMake could not locate the required compiler or build tool"
                 if result.state == "PASS":
                     add(adapters.ctest(source, build), "Native runtime and tests must execute", native_tests)
                 return result

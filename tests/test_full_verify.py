@@ -206,7 +206,7 @@ members = ["README.md"]
         self.file("app.mjs", "document.body.dataset.ready = 'yes';\n")
         self.file("verify.toml", '''[[flows]]
 name = "Restore saved session"
-steps = [{goto="index.html"}, {click="button"}, {expect={selector="button", text_contains="Save restored"}}]
+steps = [{goto="index.html"}, {expect={selector="body[data-ready='yes']", visible=true}}, {click="button"}, {expect={selector="button", text_contains="Save restored"}}]
 ''')
         report, rows = self.run_full()
         self.assertEqual(rows["browser"]["state"], "PASS", rows["browser"])
