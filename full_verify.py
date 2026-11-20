@@ -293,7 +293,7 @@ def decide(report: dict) -> str:
     return "PASS"
 
 
-def _record(report: dict, output: Path, work: Path) -> None:
+def _record_checks(report: dict, output: Path, work: Path) -> None:
     output.mkdir(parents=True, exist_ok=False)
     for index, row in enumerate(report["checks"], 1):
         evidence = row.pop("evidence", None)
@@ -311,11 +311,16 @@ def _record(report: dict, output: Path, work: Path) -> None:
         record = json.dumps(row, ensure_ascii=False, indent=2).encode()
         (output / row["evidence_ref"]).write_bytes(record)
         row["evidence_sha256"] = hashlib.sha256(record).hexdigest()
+
+
+def _finalize(report: dict, output: Path | None) -> None:
     report["verdict"] = decide(report)
     lifecycle = report.get("lifecycle")
     if lifecycle and "stage" in lifecycle:
         lifecycle["stage"]["verdict"] = report["verdict"]
     report["sarif"] = json.loads(sarif.dumps(report, core.VERSION))
+    if output is None:
+        return
     (output / "results.sarif").write_text(json.dumps(report["sarif"], ensure_ascii=False), encoding="utf-8")
     pending = output / "report.json.tmp"
     pending.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -336,6 +341,7 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
         return report
 
     git = _source_git(root)
+    run_output = None
     try:
         with tempfile.TemporaryDirectory(prefix="verify-helper-") as directory:
             work = Path(directory).resolve()
@@ -368,6 +374,7 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
                             "_worker(Path(sys.argv[2]),sys.argv[3]=='True',Path(sys.argv[4]))",
                             str(Path(__file__).resolve().parent), str(snapshot), str(trusted), str(result_path)],
                            cwd=work, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                            check=True, timeout=1800)
             report.update(json.loads(result_path.read_text(encoding="utf-8")))
             report.update(context, git=git, snapshot_sha256=digest, omitted=omitted)
@@ -378,15 +385,17 @@ def full_verify(project: str | Path, *, trusted: bool = False, evidence_dir: Pat
             output = (evidence_dir or root / ".verify-artifacts").absolute()
             if output.resolve() != output:
                 raise ValueError("Evidence directory may not traverse a symbolic link")
-            report["evidence_dir"] = str(output / run_id)
+            run_output = output / run_id
+            report["evidence_dir"] = str(run_output)
             report = scrub(report)
-            _record(report, output / run_id, work)
+            _record_checks(report, run_output, work)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         report["blockers"].append(f"Verification infrastructure failed ({type(error).__name__})")
-        report["verdict"] = decide(report)
-        lifecycle = report.get("lifecycle")
-        if lifecycle and "stage" in lifecycle:
-            lifecycle["stage"]["verdict"] = report["verdict"]
+    try:
+        _finalize(report, run_output if run_output and run_output.is_dir() else None)
+    except OSError as error:
+        report["blockers"].append(f"Cannot finalize evidence ({type(error).__name__})")
+        _finalize(report, None)
     return scrub(report)
 
 

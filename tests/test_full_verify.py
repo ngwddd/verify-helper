@@ -10,6 +10,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from full_verify import decide, full_verify
 
@@ -106,6 +107,22 @@ class FullVerification(unittest.TestCase):
         report, _ = self.run_full(evidence_dir=invalid)
         self.assertEqual(report["verdict"], "UNKNOWN")
         self.assertTrue(report["blockers"])
+
+    def test_cleanup_failure_changes_the_archived_and_returned_verdict(self):
+        self.file("README.md", "Documentation.")
+
+        class CleanupFailure(tempfile.TemporaryDirectory):
+            def __exit__(self, *error):
+                super().__exit__(*error)
+                raise PermissionError("Simulated locked Windows file")
+
+        with patch("full_verify.tempfile.TemporaryDirectory", CleanupFailure):
+            report, _ = self.run_full()
+        archived = Path(report["evidence_dir"]) / "report.json"
+        saved = json.loads(archived.read_text(encoding="utf-8"))
+        self.assertEqual(report["verdict"], "UNKNOWN")
+        self.assertEqual(saved["verdict"], report["verdict"])
+        self.assertEqual(saved["blockers"], report["blockers"])
 
     def test_missing_evidence_is_an_independent_veto(self):
         row = {"id": "tests", "state": "PASS", "applicable": True}

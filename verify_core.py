@@ -441,7 +441,8 @@ def _run(cmd: list[str], cwd: Path, timeout: int) -> tuple[int, str]:
     try:
         with subprocess.Popen(argv, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               text=True, encoding="utf-8", errors="replace",
-                              start_new_session=os.name != "nt") as proc:
+                              start_new_session=os.name != "nt",
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as proc:
             try:
                 output, _ = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
