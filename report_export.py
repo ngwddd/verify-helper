@@ -11,8 +11,12 @@ from run_evidence import plan_digest, set_gate_fields
 VERDICTS = {"PASS", "FAIL", "UNKNOWN"}
 REASONS = {"JAVASCRIPT_SYNTAX_UNAVAILABLE", "ISOLATION_UNAVAILABLE",
            "ISOLATED_TEST_ORACLE_UNVERIFIED", "ISOLATED_PROCESS_NONZERO",
-           "UNSUPPORTED_ISOLATED_ADAPTER", "CUSTOM_RULE_BUDGET_EXCEEDED"}
-PUBLIC_CHECKS = frozenset(check_specs.ordered_ids()) | {"execution-isolation", "scan-coverage", "configuration"}
+           "UNSUPPORTED_ISOLATED_ADAPTER", "CUSTOM_RULE_BUDGET_EXCEEDED",
+           "BEHAVIOR_CONTRACT_UNAVAILABLE", "BEHAVIOR_CONTRACT_MATCHED", "BEHAVIOR_CONTRACT_MISMATCH",
+           "BEHAVIOR_CONTRACT_INCOMPLETE"}
+PUBLIC_CHECKS = frozenset(check_specs.ordered_ids()) | {
+    "execution-isolation", "scan-coverage", "configuration", "behavior-contract",
+}
 
 
 def project_receipts(report: dict) -> dict:

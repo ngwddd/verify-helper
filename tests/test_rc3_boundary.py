@@ -192,9 +192,22 @@ class TestProtectedVerification(unittest.TestCase):
         self.assertFalse(report["releasable"])
 
     def test_custom_rule_limits_are_reported_as_missing_coverage(self):
-        (self.source / "verify.toml").write_text('[[rules]]\npattern = "literal"\n', encoding="utf-8")
+        (self.source / "verify.toml").write_text(
+            '[[rules]]\npattern = "literal"\npaths = ["content.txt"]\n', encoding="utf-8")
         (self.source / "content.txt").write_text("x" * 33_000, encoding="utf-8")
         report = self.run_protected()
         custom = next(row for row in report["checks"] if row["id"] == "custom")
         self.assertEqual(custom["state"], "UNKNOWN")
         self.assertEqual(custom["reason_code"], "CUSTOM_RULE_BUDGET_EXCEEDED")
+
+    def test_confirmed_custom_failure_survives_incomplete_coverage(self):
+        (self.source / "verify.toml").write_text(
+            '[[rules]]\npattern = "fixture-forbidden"\npaths = ["content.txt"]\nrisk = "high"\n',
+            encoding="utf-8")
+        (self.source / "content.txt").write_text("fixture-forbidden\n" + "x" * 33_000, encoding="utf-8")
+        report = self.run_protected()
+        custom = next(row for row in report["checks"] if row["id"] == "custom")
+        self.assertEqual(report["verdict"], "FAIL")
+        self.assertEqual(custom["state"], "FAIL")
+        self.assertEqual(custom["reason_code"], "CUSTOM_RULE_BUDGET_EXCEEDED")
+        self.assertEqual(custom["coverage"], {"planned": 1, "observed": 0, "skipped": 0})

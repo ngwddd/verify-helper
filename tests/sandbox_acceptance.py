@@ -1,6 +1,7 @@
 """Execute boundary checks against a real Linux Docker daemon."""
 from pathlib import Path
 import os
+import json
 import socket
 import subprocess
 import tempfile
@@ -8,7 +9,9 @@ import time
 import unittest
 from unittest.mock import patch
 
-from full_verify import full_verify
+from full_verify import _snapshot, full_verify
+from private_storage import private_write
+from protected_oracle import POLICY_VARIABLE
 from isolated_runtime import IMAGE_VARIABLE, TIME_VARIABLE, BoundaryUnavailable, run_isolated
 from run_evidence import read_evidence
 
@@ -151,6 +154,44 @@ else:
                                    capture_output=True, env={**os.environ, "LC_ALL": "C"}, timeout=5)
             self.assertNotEqual(other.returncode, 0)
             self.assertIn(b"Permission denied", other.stderr)
+
+    def test_operator_behavior_receipt_is_distinct_from_full_verdict(self):
+        app = self.source / "entry.py"
+        policy = self.base / "oracle.json"
+        receipts = self.base / "receipts"
+        expected = {"alpha": "fixture-alpha-result\n", "beta": "fixture-beta-result\n"}
+
+        def authorize_snapshot():
+            with tempfile.TemporaryDirectory() as snapshot:
+                digest, omitted = _snapshot(self.source, Path(snapshot), protected=True)
+            self.assertFalse(omitted)
+            private_write(policy, json.dumps({
+                "project": str(self.source.resolve()),
+                "snapshot_sha256": digest,
+                "entry": "entry.py",
+                "cases": [{"argv": [name], "stdout": value, "exit_code": 0}
+                          for name, value in expected.items()],
+            }).encode())
+
+        def assert_run(state, verdict, observed):
+            with patch.dict(os.environ, {POLICY_VARIABLE: str(policy)}):
+                report = full_verify(self.source, evidence_dir=receipts)
+            check = next(row for row in report["checks"] if row["id"] == "behavior-contract")
+            self.assertEqual(check["state"], state, check)
+            self.assertEqual(report["verdict"], verdict)
+            self.assertFalse(report["releasable"])
+            if observed is not None:
+                self.assertEqual(check["coverage"]["observed"], observed)
+            for artifact in (receipts / report["run_id"]).iterdir():
+                self.assertNotIn(b"fixture-alpha-result", artifact.read_bytes())
+
+        app.write_text('import sys\nprint("fixture-" + sys.argv[1] + "-result")\n', encoding="utf-8")
+        authorize_snapshot()
+        assert_run("PASS", "UNKNOWN", 2)
+        app.write_text("raise SystemExit(0)\n", encoding="utf-8")
+        assert_run("UNKNOWN", "UNKNOWN", None)
+        authorize_snapshot()
+        assert_run("FAIL", "FAIL", 2)
 
 
 if __name__ == "__main__":

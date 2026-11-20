@@ -19,6 +19,7 @@ from pathlib import Path
 
 import check_specs
 import isolated_runtime
+import protected_oracle
 import report_export
 import sarif
 import verification_adapters as adapters
@@ -166,7 +167,7 @@ def _scope(root: Path, files: list[Path]) -> list[Path]:
 
 
 def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
-              sandbox_image: str | None = None) -> dict:
+              sandbox_image: str | None = None, oracle_policy: dict | None = None) -> dict:
     protected = not trusted or sandbox_image is not None
     files, _, large, _ = core.scan_files(root, project_ignores=not protected)
     ctx = core.Ctx(core.Cache(False))
@@ -345,10 +346,20 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
 
     for identifier in policy_required:
         required.setdefault(identifier, "Required by operator policy")
+    if oracle_policy is not None:
+        required["behavior-contract"] = "Operator-approved black-box behavior"
     report["plan"] = required
     report["plan_digest"] = plan_digest(required)
     for identifier, action, requires_trust, isolated in tasks:
         execute(identifier, action, requires_trust, isolated)
+    if oracle_policy is not None:
+        oracle = adapters.check("behavior-contract", "Operator behavior evidence is unavailable")
+        oracle.reason_code = "BEHAVIOR_CONTRACT_UNAVAILABLE"
+        if (oracle_policy and sandbox_image and config_error is None
+                and not any(row["id"] == "secrets" and row["state"] == "FAIL" for row in rows)):
+            oracle.state, oracle.reason_code, oracle.coverage = protected_oracle.run(
+                root, oracle_policy, sandbox_image, core._worker_cancelled)
+        record(oracle)
     by_id = {row["id"]: row for row in rows}
     for identifier in required:
         if identifier in by_id:
@@ -378,8 +389,9 @@ def _isolated_unittest(root: Path, scope: Path, identifier: str, image: str) -> 
 
 
 def _worker(root: Path, trusted: bool, result_path: Path, policy_required: tuple[str, ...] = (),
-            sandbox_image: str | None = None, sealed: bool = False) -> None:
-    report = _run_plan(root, trusted, policy_required, sandbox_image)
+            sandbox_image: str | None = None, sealed: bool = False, oracle_path: Path | None = None) -> None:
+    oracle_policy = json.loads(oracle_path.read_bytes()) if oracle_path is not None else None
+    report = _run_plan(root, trusted, policy_required, sandbox_image, oracle_policy)
     if sealed:
         result_path.write_text(json.dumps(report_export.project_receipts(report)), encoding="utf-8")
         return
@@ -540,6 +552,17 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
             policy_material = {"engine": core.VERSION, "trusted": host_execution,
                                "sandbox_image": image if image and isolated_runtime.IMAGE_ID.fullmatch(image) else None,
                                "project_contract": evidence_digest(config.read_bytes()) if config.is_file() else None}
+            oracle_path = None
+            configured_oracle = os.environ.get(protected_oracle.POLICY_VARIABLE)
+            if sealed and configured_oracle is not None:
+                oracle_path = work / "operator-oracle.json"
+                try:
+                    policy_raw, operator_oracle = protected_oracle.load(Path(configured_oracle), root, digest)
+                    policy_material["operator_oracle"] = evidence_digest(policy_raw)
+                except (OSError, ValueError):
+                    operator_oracle = {}
+                    policy_material["operator_oracle"] = "unavailable"
+                private_write(oracle_path, json.dumps(operator_oracle).encode())
             policy_required = []
             if policy_path is not None:
                 policy_bytes = policy_path.read_bytes()
@@ -580,11 +603,12 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
                             "from pathlib import Path; from full_verify import _wait_for_launch,_worker; "
                             "_wait_for_launch(Path(sys.argv[6])); "
                             "_worker(Path(sys.argv[2]),sys.argv[3]=='True',Path(sys.argv[4]),json.loads(sys.argv[5]),"
-                            "json.loads(sys.argv[7]),sys.argv[8]=='True')",
+                            "json.loads(sys.argv[7]),sys.argv[8]=='True', Path(sys.argv[9]) if sys.argv[9] else None)",
                             str(Path(__file__).resolve().parent), str(snapshot),
                             str(host_execution or sandbox_image is not None), str(result_path),
                             json.dumps(policy_required), str(launch),
-                            json.dumps("" if omitted and sandbox_image is not None else sandbox_image), str(sealed)],
+                            json.dumps("" if omitted and sandbox_image is not None else sandbox_image), str(sealed),
+                            str(oracle_path) if oracle_path is not None else ""],
                            cwd=work, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            start_new_session=os.name != "nt",
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))

@@ -1886,19 +1886,28 @@ def check_custom(root: Path, files: list[Path], ctx: "Ctx") -> Check:
 
     rules = data.get("rules") or []
     if not isinstance(rules, list):
-        rules = []
+        c.state = "FAIL"
+        c.findings = [{"file": "verify.toml", "line": 0, "message": "rules must be an array of tables"}]
+        return c
     findings = []
     compiled = 0
+    completed = 0
     deadline = time.monotonic() + 3
     incomplete = len(rules) > 128
     def limit():
-        c.state = "UNKNOWN"
+        c.state = "FAIL" if findings else "UNKNOWN"
+        c.findings = findings
+        c.risk = "high" if any(f.get("severity") in ("critical", "high") for f in findings) else "medium"
+        c.exit_code = 1 if findings else None
+        c.coverage = {"planned": len(rules), "observed": completed}
         c.reason_code = "CUSTOM_RULE_BUDGET_EXCEEDED"
         c.detail = "Custom rule coverage exceeded the verification budget"
+        c.seconds = time.time() - t0
         return c
 
     for idx, rule in enumerate(rules[:128]):
         if not isinstance(rule, dict):
+            findings.append({"file": "verify.toml", "line": 0, "message": "Rule must be a table"})
             continue
         rid = str(rule.get("id") or f"rule{idx + 1}")
         pat = rule.get("pattern")
@@ -1919,10 +1928,14 @@ def check_custom(root: Path, files: list[Path], ctx: "Ctx") -> Check:
         globs = rule.get("paths") or ["**/*"]
         if isinstance(globs, str):
             globs = [globs]
+        if not isinstance(globs, list) or not all(isinstance(glob, str) for glob in globs):
+            findings.append({"file": "verify.toml", "line": 0, "message": "Invalid rule paths"})
+            continue
         msg = str(rule.get("message") or pat)
         # risk 是正式键名；severity 是很多人会顺手写的别名（各 linter 的惯例不同），
         # 静默忽略会让规则「看起来配了等级、实际没生效」，所以两个都收。
         sev = str(rule.get("risk") or rule.get("severity") or "medium").lower()
+        rule_incomplete = False
         for p in files:
             if time.monotonic() >= deadline:
                 return limit()
@@ -1940,6 +1953,7 @@ def check_custom(root: Path, files: list[Path], ctx: "Ctx") -> Check:
                     return limit()
                 if len(line) > 32_768:
                     incomplete = True
+                    rule_incomplete = True
                     continue
                 try:
                     match = rx.search(line, timeout=min(remaining, 0.05))
@@ -1948,6 +1962,8 @@ def check_custom(root: Path, files: list[Path], ctx: "Ctx") -> Check:
                 if match:
                     findings.append({"file": rel, "line": i,
                                      "message": f"[{rid}] {msg}", "severity": sev})
+        if not rule_incomplete:
+            completed += 1
     if incomplete:
         return limit()
     c.findings = findings

@@ -1,9 +1,11 @@
 """Offline Linux execution using an operator-provisioned local Docker image."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import selectors
 import stat
 import subprocess
 import sys
@@ -18,6 +20,7 @@ from pathlib import Path
 
 IMAGE_VARIABLE = "VERIFY_HELPER_SANDBOX_IMAGE"
 TIME_VARIABLE = "VERIFY_HELPER_SANDBOX_TIMEOUT_SECONDS"
+OUTPUT_LIMIT = 16 * 1024
 IMAGE_ID = re.compile(r"sha256:[a-f0-9]{64}")
 PATH = "/usr/local/bin:/usr/bin:/bin"
 SOCKET = "/var/run/docker.sock"
@@ -40,6 +43,7 @@ class ObservedRun:
     exit_code: int
     engine_version: str
     time_limit: int
+    output_matches: bool | None = None
 
 
 def _stage(root: Path, archive) -> None:
@@ -136,7 +140,43 @@ def provider_available(image: str | None) -> bool:
         return False
 
 
-def run_isolated(root: Path, scope: Path, command: list[str], image: str, cancelled) -> ObservedRun:
+def _observe(process, deadline, cancelled, expected_output):
+    if expected_output is None:
+        while process.poll() is None:
+            if cancelled() or time.monotonic() >= deadline:
+                process.kill()
+                raise BoundaryUnavailable("Isolated execution was cancelled or exceeded its time limit")
+            time.sleep(0.1)
+        return None
+
+    observed = hashlib.sha256()
+    count = 0
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while selector.get_map() or process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if cancelled() or remaining <= 0:
+                process.kill()
+                raise BoundaryUnavailable("Isolated execution was cancelled or exceeded its time limit")
+            if not selector.get_map():
+                time.sleep(min(remaining, 0.1))
+                continue
+            if not selector.select(min(remaining, 0.1)):
+                continue
+            data = os.read(process.stdout.fileno(), 4096)
+            if not data:
+                selector.unregister(process.stdout)
+                continue
+            count += len(data)
+            if count > OUTPUT_LIMIT:
+                process.kill()
+                raise BoundaryUnavailable("Isolated output exceeded its observation budget")
+            observed.update(data)
+    return observed.digest() == hashlib.sha256(expected_output).digest()
+
+
+def run_isolated(root: Path, scope: Path, command: list[str], image: str, cancelled,
+                 *, expected_output: bytes | None = None) -> ObservedRun:
     """Return a coarse, daemon-observed exit result without retaining guest output."""
     if scope.is_absolute() or ".." in scope.parts:
         raise BoundaryUnavailable("Isolated command scope must stay within the snapshot")
@@ -162,19 +202,15 @@ def run_isolated(root: Path, scope: Path, command: list[str], image: str, cancel
             container, = inspect("container", "inspect", name)
             identity = _check_container(container, image)
             with subprocess.Popen([*base, "start", "--attach", "--interactive", identity],
-                                  cwd=config, env=env, stdin=archive, stdout=subprocess.DEVNULL,
+                                  cwd=config, env=env, stdin=archive,
+                                  stdout=subprocess.PIPE if expected_output is not None else subprocess.DEVNULL,
                                   stderr=subprocess.DEVNULL) as process:
-                deadline = time.monotonic() + time_limit + 5
-                while process.poll() is None:
-                    if cancelled() or time.monotonic() >= deadline:
-                        process.kill()
-                        raise BoundaryUnavailable("Isolated execution was cancelled or exceeded its time limit")
-                    time.sleep(0.1)
+                output_matches = _observe(process, time.monotonic() + time_limit + 5, cancelled, expected_output)
             state = inspect("container", "inspect", "--format", "{{json .State}}", identity)
             code = state["ExitCode"]
             if state["Status"] != "exited" or state["OOMKilled"] or process.returncode != code or code not in (0, 1):
                 raise BoundaryUnavailable("The isolated command did not complete normally")
-            return ObservedRun(code, version, time_limit)
+            return ObservedRun(code, version, time_limit, output_matches)
         finally:
             removed = invoke("container", "rm", "--force", "--volumes", identity, check=False)
             if removed.returncode:
