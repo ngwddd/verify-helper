@@ -54,7 +54,7 @@ class TestWorkspaceShape(unittest.TestCase):
             "proj-c/setup.py": "from setuptools import setup\nsetup()\n",
             "_sp/draft.py": "def broken(:\n    pass\n",          # 草稿里的语法错
         })
-        cls.rep = V.verify(str(cls.root), use_cache=False)
+        cls.rep = V._verify_checks(str(cls.root), use_cache=False)
 
     @classmethod
     def tearDownClass(cls):
@@ -84,7 +84,7 @@ class TestSiteWithPrefix(unittest.TestCase):
                 '<html lang="zh"><head><title>404</title></head><body><h1>找不到</h1>'
                 '<a href="/mysite/index.html">回首页</a></body></html>'),
         })
-        cls.rep = V.verify(str(cls.root), checks=["links", "runtime-web"], use_cache=False)
+        cls.rep = V._verify_checks(str(cls.root), checks=["links", "runtime-web"], use_cache=False)
 
     @classmethod
     def tearDownClass(cls):
@@ -114,7 +114,7 @@ class TestSubprojectIgnore(unittest.TestCase):
             "site/tpl/snippet.html": '<a href="not-here.html">模板链接</a>',
             "site/.verifyignore": "tpl/*.html\n",
         })
-        cls.rep = V.verify(str(cls.root), checks=["links"], use_cache=False)
+        cls.rep = V._verify_checks(str(cls.root), checks=["links"], use_cache=False)
 
     @classmethod
     def tearDownClass(cls):
@@ -140,7 +140,7 @@ class TestDirectoryIgnore(unittest.TestCase):
             ".verifyignore": "_sp/\n",
         })
         try:
-            rep = V.verify(str(d), checks=["syntax"], use_cache=False)
+            rep = V._verify_checks(str(d), checks=["syntax"], use_cache=False)
             c = by_id(rep)["syntax"]
             self.assertEqual(c["state"], "PASS", f"{c['detail']} {c['findings']}")
             self.assertEqual(rep["verdict"], "PASS")
@@ -153,7 +153,7 @@ class TestDirectoryIgnore(unittest.TestCase):
                         "_sp/broken.py": "def f(:\n",
                         ".verifyignore": pat + "\n"})
             try:
-                c = by_id(V.verify(str(d), checks=["syntax"], use_cache=False))["syntax"]
+                c = by_id(V._verify_checks(str(d), checks=["syntax"], use_cache=False))["syntax"]
                 self.assertEqual(c["state"], "PASS", f"pattern={pat!r} {c['detail']}")
                 self.assertEqual(c["findings"], [])
             finally:
@@ -193,7 +193,7 @@ class TestOwnVsOtherPaths(unittest.TestCase):
             "ok.js": "const a = 1;\n",
         })
         try:
-            rep = V.verify(str(d), checks=["paths"], use_cache=False)
+            rep = V._verify_checks(str(d), checks=["paths"], use_cache=False)
             c = by_id(rep)["paths"]
             self.assertEqual(c["findings"], [], "别人的路径不该进 findings")
             self.assertTrue(c["hints"], "应该进 hints")
@@ -206,7 +206,7 @@ class TestOwnVsOtherPaths(unittest.TestCase):
         me = Path.home().name
         d = mkproj({"build.py": f'ROOT = r"C:\\Users\\{me}\\proj"\n'})
         try:
-            rep = V.verify(str(d), checks=["paths"], use_cache=False)
+            rep = V._verify_checks(str(d), checks=["paths"], use_cache=False)
             c = by_id(rep)["paths"]
             self.assertEqual(c["state"], "FAIL", c["detail"])
             self.assertTrue(any(me in f["message"] for f in c["findings"]))
@@ -217,7 +217,7 @@ class TestOwnVsOtherPaths(unittest.TestCase):
         """`C:\\Users\\<you>` 这种文档占位符，既不是泄漏也不是别人的路径。"""
         d = mkproj({"README.md": "示例：C:\\Users\\<you>\\proj 与 /Users/<you>/proj\n"})
         try:
-            rep = V.verify(str(d), checks=["paths"], use_cache=False)
+            rep = V._verify_checks(str(d), checks=["paths"], use_cache=False)
             c = by_id(rep)["paths"]
             self.assertEqual(c["findings"], [])
             self.assertEqual(c["hints"], [], "占位符连提示都不该有")
@@ -231,7 +231,7 @@ class TestSingleQuotedHtml(unittest.TestCase):
     def test_single_quoted_dead_link_detected(self):
         d = mkproj({"p.html": "<html lang='zh'><body><a href='missing.html'>x</a></body></html>"})
         try:
-            c = by_id(V.verify(str(d), checks=["links"], use_cache=False))["links"]
+            c = by_id(V._verify_checks(str(d), checks=["links"], use_cache=False))["links"]
             self.assertEqual(c["state"], "FAIL", c["detail"])
             self.assertTrue(any("missing.html" in f["message"] for f in c["findings"]))
         finally:
@@ -241,7 +241,7 @@ class TestSingleQuotedHtml(unittest.TestCase):
         d = mkproj({"p.html": "<html lang='zh'><body><h2 id='top'>t</h2>"
                               "<a href='#top'>go</a><a href='#nope'>bad</a></body></html>"})
         try:
-            c = by_id(V.verify(str(d), checks=["links"], use_cache=False))["links"]
+            c = by_id(V._verify_checks(str(d), checks=["links"], use_cache=False))["links"]
             msgs = [f["message"] for f in c["findings"]]
             self.assertTrue(any("#nope" in m for m in msgs), msgs)
             self.assertFalse(any("#top" in m for m in msgs), msgs)
@@ -261,7 +261,7 @@ class TestGeneratedFileHint(unittest.TestCase):
             "out.html": "<!-- generated by build.py, do not edit -->\n<a href='missing.html'>x</a>\n",
         })
         try:
-            rep = V.verify(str(d), checks=["links"], use_cache=False)
+            rep = V._verify_checks(str(d), checks=["links"], use_cache=False)
             c = by_id(rep)["links"]
             self.assertEqual(c["state"], "FAIL")
             self.assertTrue(
@@ -273,7 +273,7 @@ class TestGeneratedFileHint(unittest.TestCase):
     def test_handwritten_file_gets_no_hint(self):
         d = mkproj({"page.html": "<a href='missing.html'>x</a>\n"})
         try:
-            c = by_id(V.verify(str(d), checks=["links"], use_cache=False))["links"]
+            c = by_id(V._verify_checks(str(d), checks=["links"], use_cache=False))["links"]
             self.assertFalse(any("生成文件" in h["message"] for h in c["hints"]))
         finally:
             shutil.rmtree(d, ignore_errors=True)
@@ -290,7 +290,7 @@ class TestWorkspaceTestsHint(unittest.TestCase):
             "root.py": "print(1)\n",
         })
         try:
-            rep = V.verify(str(d), checks=["syntax", "tests"], use_cache=False)
+            rep = V._verify_checks(str(d), checks=["syntax", "tests"], use_cache=False)
             self.assertTrue(
                 any("子项目里有" in n for n in rep["notes"]),
                 f"缺少子项目测试提示：{rep['notes']}")
@@ -308,8 +308,8 @@ class TestIdempotent(unittest.TestCase):
                          '<a href="missing.html">d</a></body></html>',
         })
         try:
-            r1 = V.verify(str(d), checks=["syntax", "links", "html"], use_cache=False)
-            r2 = V.verify(str(d), checks=["syntax", "links", "html"], use_cache=False)
+            r1 = V._verify_checks(str(d), checks=["syntax", "links", "html"], use_cache=False)
+            r2 = V._verify_checks(str(d), checks=["syntax", "links", "html"], use_cache=False)
             sig = lambda r: (r["verdict"],
                              tuple(sorted((c["id"], c["state"], len(c["findings"]))
                                           for c in r["checks"])))
@@ -329,7 +329,7 @@ class TestIdempotent(unittest.TestCase):
             (d / "verify.toml").write_text(
                 '[[rules]]\nid = "no-print"\nseverity = "high"\n'
                 'pattern = "print\\\\("\nmessage = "不要留 print"\n', encoding="utf-8")
-            rep = V.verify(str(d), checks=["custom"], use_cache=False)
+            rep = V._verify_checks(str(d), checks=["custom"], use_cache=False)
             c = {x["id"]: x for x in rep["checks"]}["custom"]
             self.assertEqual(c["state"], "FAIL")
             self.assertEqual(c["risk"], "high")
@@ -350,7 +350,7 @@ class TestIdempotent(unittest.TestCase):
                 'LABEL = "TODO 统计"\n'          # 字符串：不算
                 'x = 1  # TODO 真的待办\n'        # 注释：算
                 'y = 2\n', encoding="utf-8")
-            rep = V.verify(str(d), checks=["todos"], use_cache=False)
+            rep = V._verify_checks(str(d), checks=["todos"], use_cache=False)
             c = {x["id"]: x for x in rep["checks"]}["todos"]
             self.assertEqual(c["state"], "FAIL")
             self.assertEqual(len(c["findings"]), 1, c["findings"])

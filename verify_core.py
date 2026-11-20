@@ -27,7 +27,7 @@ import json
 import os
 import re
 import shutil
-import socket
+import signal
 import subprocess
 import sys
 import threading
@@ -36,11 +36,12 @@ import tomllib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
+from urllib.parse import quote
 
 import check_specs as S
 import directions as DIR
 
-VERSION = "1.10.8"
+VERSION = "2.0.0rc1"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -91,7 +92,8 @@ JS_EXT = {".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx"}
 HTML_EXT = {".html", ".htm"}
 JSON_EXT = {".json"}
 CSS_EXT = {".css"}
-TEXT_EXT = PY_EXT | JS_EXT | HTML_EXT | JSON_EXT | CSS_EXT | {
+NATIVE_EXT = {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hxx", ".hh"}
+TEXT_EXT = PY_EXT | JS_EXT | HTML_EXT | JSON_EXT | CSS_EXT | NATIVE_EXT | {
     ".md", ".txt", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".env"}
 
 MAX_FILE_BYTES = 5 * 1024 * 1024
@@ -99,7 +101,7 @@ JS_CHECK_CAP = 120               # node --check 单次运行的检查上限
 CACHE_DIR = Path(os.environ.get("TEMP", ".")) / "project-verify"
 
 SECRET_PATTERNS = [
-    ("OpenAI/DeepSeek 风格密钥", re.compile(r"\bsk-[A-Za-z0-9]{16,}")),
+    ("API 密钥", re.compile(r"\bsk-[A-Za-z0-9]{16,}")),
     ("GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}")),
     ("AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("私钥块", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
@@ -108,7 +110,7 @@ SECRET_PATTERNS = [
 # 课程笔记里全是 password = "" 这类教学示例，扫进去就是一堆假阳性。
 CRED_PATTERN = ("疑似明文密码赋值",
                 re.compile(r"(?i)\b(password|passwd|pwd|secret|token)\s*[=:]\s*[\"'][^\"'\s]{8,}[\"']"))
-CODE_EXT = PY_EXT | JS_EXT | {".env", ".ini", ".cfg", ".conf", ".yml", ".yaml", ".json", ".toml"}
+CODE_EXT = PY_EXT | JS_EXT | NATIVE_EXT | {".env", ".ini", ".cfg", ".conf", ".yml", ".yaml", ".json", ".toml"}
 TODO_RE = re.compile(r"\b(TODO|FIXME)\b")
 
 
@@ -211,6 +213,7 @@ class Check:
     # 证据文件（截图等）的临时目录。检查自己不做清理，交给 write_artifacts：
     # 有 artifacts 就复制进去再删，没 artifacts 就直接删 —— 两头都不留垃圾。
     evidence: dict | None = None
+    coverage: dict | None = None
 
     def as_dict(self) -> dict:
         d = asdict(self)
@@ -436,13 +439,27 @@ def _which(cmd: str) -> str:
 def _run(cmd: list[str], cwd: Path, timeout: int) -> tuple[int, str]:
     argv = [_which(cmd[0])] + list(cmd[1:])
     try:
-        r = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=timeout)
-        return r.returncode, (r.stdout or "") + (r.stderr or "")
+        with subprocess.Popen(argv, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True, encoding="utf-8", errors="replace",
+                              start_new_session=os.name != "nt") as proc:
+            try:
+                output, _ = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                if os.name == "nt":
+                    subprocess.run(["taskkill.exe", "/PID", str(proc.pid), "/T", "/F"],
+                                   capture_output=True, timeout=10, check=False)
+                else:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                proc.kill()
+                return 124, f"超时（>{timeout}s）：{' '.join(cmd)}"
+            return proc.returncode, output or ""
     except FileNotFoundError:
         return 127, f"命令不存在：{cmd[0]}"
     except subprocess.TimeoutExpired:
-        return 124, f"超时（>{timeout}s）：{' '.join(cmd)}"
+        return 124, f"清理超时：{cmd[0]}"
     except OSError as e:
         return 126, f"起不来：{e}"
 
@@ -454,12 +471,6 @@ def _node_error_line(out: str) -> str:
             return s[:200]
     s = (out or "").strip()
     return s.splitlines()[0][:200] if s else "node --check 失败"
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -525,7 +536,7 @@ def check_syntax(root: Path, files: list[Path], ctx: "Ctx") -> Check:
     c = Check("syntax", "语法：每个源文件都要能被解析")
     t0 = time.time()
     pys = [p for p in files if p.suffix.lower() in PY_EXT]
-    jss = [p for p in files if p.suffix.lower() in JS_EXT]
+    jss = [p for p in files if p.suffix.lower() in {".js", ".mjs", ".cjs"}]
     jsonf = [p for p in files if p.suffix.lower() in JSON_EXT]
     tomlf = [p for p in files if p.suffix.lower() == ".toml"]
     if not (pys or jss or jsonf or tomlf):
@@ -565,8 +576,8 @@ def check_syntax(root: Path, files: list[Path], ctx: "Ctx") -> Check:
             continue
         todo.append(p)
 
-    capped = todo[:JS_CHECK_CAP]
-    js_skipped = len(todo) - len(capped)
+    capped = todo
+    js_skipped = 0
     no_node = False
     if capped:
         def one(p: Path):
@@ -575,9 +586,9 @@ def check_syntax(root: Path, files: list[Path], ctx: "Ctx") -> Check:
 
         with ThreadPoolExecutor(max_workers=ctx.workers) as ex:
             for p, code, out in ex.map(one, capped):
-                if code == 127:
+                if code in (124, 126, 127):
                     no_node = True
-                    break
+                    continue
                 if code == 0:
                     ctx.cache.put(p, True)
                 else:
@@ -791,10 +802,9 @@ BOM = b"\xef\xbb\xbf"
 LOCKFILES = ("package-lock.json", "pnpm-lock.yaml", "yarn.lock")
 # 廉价预筛：这 16 个字面量一个都不出现，就不可能命中任何一条正则。
 # 绝大多数文件（尤其中文笔记、数据）一个都没有，直接跳过逐行扫描。
-MARKERS = (b"sk-", b"ghp", b"akia", b"-----begin", b"password", b"passwd",
+MARKERS = (b"sk-", b"gh", b"akia", b"-----begin", b"password", b"passwd",
            b"pwd", b"secret", b"token", b"users\\", b"/home/", b"/users/",
            b"todo", b"fixme", b"xxx", b"hack")
-BIG_SKIP = 2 * 1024 * 1024      # 超过 2MB 的文件只验编码，不做逐行扫描
 
 
 def scan_text_once(root: Path, files: list[Path]) -> dict:
@@ -804,7 +814,7 @@ def scan_text_once(root: Path, files: list[Path]) -> dict:
     enc_bad, bom_hits = [], []
     n_files = 0
     for p in files:
-        ext = p.suffix.lower()
+        ext = ".env" if p.name == ".env" or p.name.startswith(".env.") else p.suffix.lower()
         if ext not in TEXT_EXT:
             continue
         n_files += 1
@@ -831,8 +841,6 @@ def scan_text_once(root: Path, files: list[Path]) -> dict:
             enc_bad.append({"file": _rel(root, p), "line": 0,
                             "message": f"不是合法 UTF-8（第 {e.start} 字节）"})
             text_ok = False
-        if len(raw_body) > BIG_SKIP:
-            continue                      # 大文件只验编码，不逐行扫
         low = raw_body.lower()
         if not any(m in low for m in MARKERS):
             # 一个标记都没有 → 不可能命中任何正则，连解码都省了
@@ -854,12 +862,12 @@ def scan_text_once(root: Path, files: list[Path]) -> dict:
                 for label, rx in SECRET_PATTERNS:
                     if rx.search(line):
                         secrets_hits.append({"file": rel, "line": i,
-                                             "message": f"{label}：{line.strip()[:90]}"})
+                                             "message": label})
                         hit = True
                         break
                 if not hit and is_code and CRED_PATTERN[1].search(line):
                     secrets_hits.append({"file": rel, "line": i,
-                                         "message": f"{CRED_PATTERN[0]}：{line.strip()[:90]}"})
+                                         "message": CRED_PATTERN[0]})
             for label, rx in LOCAL_PATH_PATTERNS:
                 m = rx.search(line)
                 if m:
@@ -907,11 +915,11 @@ def _mk(cid: str, title: str, ctx: "Ctx", root: Path, files: list[Path],
         cap: int | None = None) -> Check:
     c = Check(cid, title, blocking=blocking)
     t0 = time.time()
-    if not any(p.suffix.lower() in TEXT_EXT for p in files):
+    b = _bundle(ctx, root, files)
+    if not b["files"]:
         c.state, c.applicable = "UNKNOWN", False
         c.detail = "没有可扫描的文本文件"
         return c
-    b = _bundle(ctx, root, files)
     hits = b.get(key, [])
     c.findings = hits[:cap] if cap else hits
     c.state = "FAIL" if hits else "PASS"
@@ -969,7 +977,8 @@ def _find_playwright(root: Path) -> Path | None:
     """找一个 node 能 require 到 playwright 的目录。"""
     here = Path(__file__).resolve().parent
     home = Path.home()
-    for d in (root, here, home / "AppData/Roaming/npm", home / ".npm-global",
+    configured = Path(os.environ.get("VERIFY_PLAYWRIGHT_ROOT", str(here)))
+    for d in (configured, root, here, home / "AppData/Roaming/npm", home / ".npm-global",
               Path.home() / "node_modules"):
         try:
             if (d / "node_modules" / "playwright").is_dir():
@@ -1009,18 +1018,18 @@ def check_browser(root: Path, files: list[Path], ctx: "Ctx") -> Check:
     out_file = tmp / "out.json"
     shots = tmp / "shots"
     entries = []
-    for p in htmls[:30]:
+    for p in htmls:
         try:
             rel = p.relative_to(site_root).as_posix()
         except ValueError:
             continue
-        entries.append({"rel": rel, "url": f"http://127.0.0.1:0/{rel}"})
+        entries.append({"rel": rel})
     if not entries:
+        shutil.rmtree(tmp, ignore_errors=True)
         c.state, c.applicable = "UNKNOWN", False
         c.detail = "页面都不在站点根之下"
         return c
 
-    port = _free_port()
     base = _detect_base(htmls)
     for e in entries:
         e["url"] = f"http://127.0.0.1:0{base}/{e['rel']}"
@@ -1030,10 +1039,10 @@ def check_browser(root: Path, files: list[Path], ctx: "Ctx") -> Check:
     try:
         httpd, port = _serve(site_root, base)
         for e in entries:
-            e["url"] = f"http://127.0.0.1:{port}{base}/{e['rel']}"
+            e["url"] = f"http://127.0.0.1:{port}{base}/{quote(e['rel'])}"
         pages_file.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
 
-        probe = Path(__file__).resolve().parent / "browser_probe.mjs"
+        probe = Path(__file__).resolve().parent / "verification_resources" / "browser_probe.mjs"
         cmd = [node, str(probe), "--module", str(pw_dir),
                "--base", f"http://127.0.0.1:{port}",
                "--pages", str(pages_file), "--out", str(out_file),
@@ -1079,7 +1088,12 @@ def check_browser(root: Path, files: list[Path], ctx: "Ctx") -> Check:
                                      "message": f"资源失败 {f.get('reason')}：{f.get('url')}"[:300],
                                      "severity": "high"})
             c.findings = findings
-            c.state = "FAIL" if findings else "PASS"
+            actual = [p.get("rel") for p in data.get("pages", [])]
+            expected = [p["rel"] for p in entries]
+            complete = (set(actual) == set(expected) and len(actual) == len(entries) == len(htmls)
+                        and all(pg.get("status") == 200 for pg in data.get("pages", [])))
+            c.state = "FAIL" if findings else ("PASS" if complete else "UNKNOWN")
+            c.coverage = {"planned": len(htmls), "observed": len(set(actual)), "subjects": actual}
             shots_n = len(data.get("shots", []))
             c.detail = (f"站点根 {_rel(root, site_root) or '.'}"
                         + (f"（部署前缀 {base}）" if base else "")
@@ -1168,10 +1182,6 @@ def check_interaction(root: Path, files: list[Path], ctx: "Ctx") -> Check:
         c.state, c.applicable = "UNKNOWN", False
         c.detail = why
         return c
-    if ctx.fast:
-        c.state, c.applicable = "UNKNOWN", False
-        c.detail = f"{len(flows)} 条流程（fast 模式跳过交互测试）"
-        return c
 
     htmls = [p for p in files if p.suffix.lower() in HTML_EXT]
     site_root = _find_site_root(root, htmls) or root
@@ -1200,7 +1210,7 @@ def check_interaction(root: Path, files: list[Path], ctx: "Ctx") -> Check:
             {"base": f"http://127.0.0.1:{port}{base}", "timeoutMs": ctx.flow_timeout,
              "flows": flows}, ensure_ascii=False), encoding="utf-8")
 
-        runner = Path(__file__).resolve().parent / "flow_runner.mjs"
+        runner = Path(__file__).resolve().parent / "verification_resources" / "flow_runner.mjs"
         code, out = _run([node, str(runner), "--module", str(pw_dir),
                           "--spec", str(spec_file), "--out", str(out_file),
                           "--shots", str(shots)], root, ctx.flow_total_timeout)
@@ -1220,7 +1230,14 @@ def check_interaction(root: Path, files: list[Path], ctx: "Ctx") -> Check:
                                  "message": msg[:400],
                                  "shot": r.get("shot")})
             c.findings = findings
-            c.state = "FAIL" if failed else "PASS"
+            complete = [r.get("name") for r in results] == [f.get("name") for f in flows]
+            c.state = "FAIL" if failed else ("PASS" if complete else "UNKNOWN")
+            c.coverage = {"planned": len(flows), "observed": len(results)}
+            if shots.is_dir() and any(shots.iterdir()):
+                saved = Path(tempfile.mkdtemp(prefix="vh-evidence-")) / "interaction"
+                shutil.move(shots, saved)
+                c.evidence = {"dir": str(saved), "kind": "interaction-screenshots",
+                              "count": len(list(saved.glob("*.png")))}
             c.detail = f"{len(flows)} 条流程，通过 {len(results) - len(failed)}，失败 {len(failed)}"
             if base:
                 c.detail += f"（部署前缀 {base}）"
@@ -1233,10 +1250,7 @@ def check_interaction(root: Path, files: list[Path], ctx: "Ctx") -> Check:
         if httpd:
             httpd.shutdown()
             httpd.server_close()
-        if c.state != "FAIL":
-            shutil.rmtree(tmp, ignore_errors=True)   # 失败时保留截图作为证据
-        else:
-            c.detail += f"；证据在 {tmp}"
+        shutil.rmtree(tmp, ignore_errors=True)
     c.seconds = time.time() - t0
     return c
 
@@ -1282,10 +1296,6 @@ def _changed_lines(root: Path) -> dict[str, set[int]]:
 def check_mutation(root: Path, files: list[Path], ctx: "Ctx") -> Check:
     c = Check("mutation", "变异门：测试能不能发现改坏的行")
     t0 = time.time()
-    if ctx.fast:
-        c.state, c.applicable = "UNKNOWN", False
-        c.detail = "fast 模式跳过变异"
-        return c
     cmd, why, _ = _detect_test_command(root)
     if cmd is None:
         c.state, c.applicable = "UNKNOWN", False
@@ -1322,26 +1332,28 @@ def check_mutation(root: Path, files: list[Path], ctx: "Ctx") -> Check:
     budget = ctx.mutation_max
     survivors, killed, errors = [], 0, []
     for p, lineno, src_tok, dst_tok in candidates[:budget]:
-        original = p.read_text(encoding="utf-8", errors="replace")
-        lines = original.splitlines(keepends=True)
-        if lineno - 1 >= len(lines):
-            continue
-        mutated_line = lines[lineno - 1].replace(src_tok, dst_tok, 1)
-        if mutated_line == lines[lineno - 1]:
-            continue
-        lines[lineno - 1] = mutated_line
-        try:
-            p.write_text("".join(lines), encoding="utf-8")
-            code, out = _run(cmd, root, ctx.mutation_timeout)
-        finally:
-            p.write_text(original, encoding="utf-8")     # 一定要还原
+        import tempfile
+
+        relative = p.relative_to(root)
+        with tempfile.TemporaryDirectory(prefix="vh-mutant-") as temp:
+            candidate = Path(temp) / "project"
+            shutil.copytree(root, candidate, ignore=shutil.ignore_patterns(*SKIP_DIRS),
+                            symlinks=True)
+            mutated = candidate / relative
+            if mutated.is_symlink():
+                errors.append(f"{relative}:{lineno} is a symbolic link")
+                continue
+            lines = mutated.read_bytes().splitlines(keepends=True)
+            lines[lineno - 1] = lines[lineno - 1].replace(src_tok.encode(), dst_tok.encode(), 1)
+            mutated.write_bytes(b"".join(lines))
+            code, out = _run(cmd, candidate, ctx.mutation_timeout)
         if code == 0:
             survivors.append({
                 "file": _rel(root, p), "line": lineno,
                 "message": f"把 {src_tok.strip()} 改成 {dst_tok.strip()} 后测试仍然通过 —— 这行没有有效断言",
                 "severity": "medium",
             })
-        elif code in (124, 127):
+        elif code in (124, 125, 126, 127) or code < 0 or not _test_counts(out)[0]:
             errors.append(f"{_rel(root, p)}:{lineno} 运行时出错（{code}）")
         else:
             killed += 1
@@ -1352,7 +1364,9 @@ def check_mutation(root: Path, files: list[Path], ctx: "Ctx") -> Check:
         c.detail = f"试了 {total} 个变异，存活 {len(survivors)}（另有 {len(errors)} 个跑不起来）"
     else:
         c.detail = f"试了 {total} 个变异，被杀 {killed}，存活 {len(survivors)}"
-    c.state = "FAIL" if survivors else ("PASS" if total else "UNKNOWN")
+    c.state = "FAIL" if survivors else ("PASS" if total and not errors else "UNKNOWN")
+    c.coverage = {"planned": min(budget, len(candidates)), "observed": total,
+                  "candidate_count": len(candidates)}
     c.command = " ".join(cmd) + "（逐个变异重跑）"
     c.exit_code = 0 if not survivors else 1
     c.seconds = time.time() - t0
@@ -1393,7 +1407,7 @@ def _py_for(root: Path) -> str:
     跑测试会 import 失败 → 全部用例被跳过 → 看着"绿"其实什么都没验）。
     """
     # ① 显式指定（环境变量）—— 用来对付「仓库里没有 venv，但本机有」的情况
-    env = os.environ.get("DSH_TEST_PYTHON")
+    env = os.environ.get("VERIFY_TEST_PYTHON")
     if env and Path(env).is_file():
         return env
     # ② 项目根的 .verify-python 文件：一行路径，适合本机配置且可 .gitignore
@@ -1414,9 +1428,9 @@ def _py_for(root: Path) -> str:
     return sys.executable
 
 
-def _detect_test_command(root: Path) -> tuple[list[str] | None, str, int]:
+def _detect_test_command(root: Path, language: str | None = None) -> tuple[list[str] | None, str, int]:
     pkg = root / "package.json"
-    if pkg.exists():
+    if language != "python" and pkg.exists():
         try:
             data = json.loads(pkg.read_text(encoding="utf-8"))
             script = (data.get("scripts") or {}).get("test") or ""
@@ -1425,22 +1439,22 @@ def _detect_test_command(root: Path) -> tuple[list[str] | None, str, int]:
         except Exception:
             pass
     pyproj = root / "pyproject.toml"
-    if pyproj.exists():
+    if language != "javascript" and pyproj.exists():
         try:
             if "pytest" in pyproj.read_text(encoding="utf-8", errors="replace").lower():
                 return [_py_for(root), "-m", "pytest", "-q"], "pytest", 300
         except Exception:
             pass
-    if (root / "pytest.ini").exists() or (root / "conftest.py").exists():
+    if language != "javascript" and ((root / "pytest.ini").exists() or (root / "conftest.py").exists()):
         return [_py_for(root), "-m", "pytest", "-q"], "pytest", 300
     tests = root / "tests"
     if tests.is_dir():
-        if any(tests.glob("*.py")):
+        if language != "javascript" and any(tests.glob("*.py")):
             return [_py_for(root), "-m", "unittest", "discover", "-s", "tests"], \
                 "tests/ 下的 unittest", 300
-        if any(list(tests.glob("*.mjs")) + list(tests.glob("*.js"))):
+        if language != "python" and any(list(tests.glob("*.mjs")) + list(tests.glob("*.js"))):
             return ["node", "--test", "tests"], "tests/ 下的 node --test", 300
-    if (root / "test").is_dir() and any((root / "test").glob("*.py")):
+    if language != "javascript" and (root / "test").is_dir() and any((root / "test").glob("*.py")):
         return [_py_for(root), "-m", "unittest", "discover", "-s", "test"], \
             "test/ 下的 unittest", 300
 
@@ -1460,14 +1474,14 @@ def _detect_test_command(root: Path) -> tuple[list[str] | None, str, int]:
 
     dirs = [root] + [root / x for x in ("tests", "test", "src", "__tests__")
                      if (root / x).is_dir()]
-    if _has(["*.test.js", "*.test.mjs", "*.test.cjs", "*.spec.js", "*.spec.mjs"], dirs):
+    if language != "python" and _has(["*.test.js", "*.test.mjs", "*.test.cjs", "*.spec.js", "*.spec.mjs"], dirs):
         return ["node", "--test"], "node --test 自动发现 *.test.*", 300
-    if _has(["*.test.ts", "*.spec.ts"], dirs):
-        return ["npx", "vitest", "run"], "vitest（TypeScript 测试）", 420
+    if language != "python" and _has(["*.test.ts", "*.spec.ts"], dirs):
+        return ["npx", "--no-install", "vitest", "run"], "vitest（TypeScript 测试）", 420
     # 散落的 test_*.py：必须记清是**哪个目录**命中的 ——
     # 命中 root/tests 却用默认 start dir（=root）去 discover，会收集 0 个用例，
     # 得到一个假的 FAIL（实测：工作区根目录 62 个 py、0 个 test_*.py，退出码 5）。
-    probe_dirs = [root] + ([root / "tests"] if (root / "tests").is_dir() else [])
+    probe_dirs = [] if language == "javascript" else [root, root / "tests"]
     suspects: list[str] = []
     for d in probe_dirs:
         for pat in ("test_*.py", "*_test.py"):
@@ -1500,38 +1514,30 @@ def _detect_test_command(root: Path) -> tuple[list[str] | None, str, int]:
 
 
 def _test_counts(out: str) -> tuple[int, int]:
-    """从测试输出里抠出 (跑了几个用例, 跳过几个)。
-
-    unittest: "Ran 10 tests in 0.000s" + "OK (skipped=10)"
-    pytest:   "10 skipped in 0.02s" / "5 passed, 3 skipped"
-    """
-    ran = 0
-    m = re.search(r"^Ran (\d+) tests? in", out, re.M)
-    if m:
-        ran = int(m.group(1))
-    else:
-        m = re.search(r"(\d+) (?:passed|failed|skipped)", out)
-        if m:
-            ran = int(m.group(1))
-    skipped = 0
-    m = re.search(r"skipped=(\d+)", out)
-    if m:
-        skipped = int(m.group(1))
-    else:
-        m = re.search(r"(\d+) skipped", out)
-        if m:
-            skipped = int(m.group(1))
-    return ran, skipped
+    """Return collected and skipped counts from supported runner summaries."""
+    unittest_count = re.findall(r"^Ran (\d+) tests? in ", out, re.M)
+    if unittest_count:
+        skipped = re.findall(r"^OK \(skipped=(\d+)[,)]", out, re.M)
+        return int(unittest_count[-1]), int(skipped[-1]) if skipped else 0
+    tap = re.search(r"^(?:#|ℹ) tests (\d+)\s*$", out, re.M)
+    if tap:
+        skipped = re.search(r"^(?:#|ℹ) skipped (\d+)\s*$", out, re.M)
+        todo = re.search(r"^(?:#|ℹ) todo (\d+)\s*$", out, re.M)
+        return int(tap[1]), sum(int(n[1]) for n in (skipped, todo) if n)
+    summaries = re.findall(
+        r"^=*[ \t]*((?:\d+ (?:passed|failed|skipped|xfailed|xpassed|deselected|errors?)(?:, )?)+)"
+        r"(?: in [^\n]+)?[ =]*$", out, re.M)
+    if summaries:
+        counts = [(int(n), state) for n, state in re.findall(r"(\d+) (\w+)", summaries[-1])]
+        return sum(n for n, _ in counts), sum(n for n, state in counts if state in
+                                               {"skipped", "xfailed", "xpassed", "deselected"})
+    return 0, 0
 
 
-def check_tests(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+def check_tests(root: Path, files: list[Path], ctx: "Ctx", language: str | None = None) -> Check:
     c = Check("tests", "测试：跑得起来，且真的通过")
     t0 = time.time()
-    if ctx.fast:
-        c.state, c.applicable = "UNKNOWN", False
-        c.detail = "fast 模式跳过测试"
-        return c
-    cmd, why, timeout = _detect_test_command(root)
+    cmd, why, timeout = _detect_test_command(root, language)
     if cmd is None:
         c.state, c.applicable = "UNKNOWN", False
         c.detail = why
@@ -1540,31 +1546,17 @@ def check_tests(root: Path, files: list[Path], ctx: "Ctx") -> Check:
     c.command = " ".join(cmd)
     c.exit_code = code
     c.output = _tail(out, 2000)
-    if code == 127:
-        c.state, c.detail = "UNKNOWN", f"命令跑不起来：{why}"
-    elif code == 124:
-        c.state, c.detail = "UNKNOWN", f"超时：{why}"
-    elif code == 0 and _test_counts(out)[0] > 0 and _test_counts(out)[1] >= _test_counts(out)[0]:
-        # 全跳过 = 一个用例都没真跑（典型：解释器 ABI / 依赖不匹配 → import 失败被 skip）。
-        # 这种情况判 PASS 就是谎报 —— 它和「0 个用例」一样属于「测不了」。
-        ran, skipped = _test_counts(out)
-        c.state = "UNKNOWN"
-        c.detail = (f"{why}；退出码 0，但 {ran} 个用例里 {skipped} 个被跳过 —— "
-                    "没验到任何东西，多半是测试用的解释器或依赖与项目不匹配"
-                    "（例如 venv 是 3.12、系统 python 是 3.14）")
-    elif code == 5 or "NO TESTS RAN" in out:
-        # 识别到了入口，但一个用例都没收集到 —— 这是「测不了」，不是「测不过」。
-        # 判成 FAIL 会把"模式没匹配上"说成"测试挂了"，属于谎报。
-        c.state = "UNKNOWN"
-        c.detail = (f"{why}；但收集到 0 个用例（退出码 {code}）—— "
-                    "多半是匹配模式或目录不对，不是用例失败。")
+    ran, skipped = _test_counts(out)
+    c.coverage = {"planned": ran, "observed": max(0, ran - skipped), "skipped": skipped}
+    if code in (124, 125, 126, 127) or code < 0:
+        c.detail = f"测试运行环境不可用（{code}）：{why}"
+    elif code == 5 or "no tests ran" in out.lower() or (code == 0 and ran <= skipped):
+        c.detail = f"{why}；缺少实际执行证据，收集 {ran}，跳过 {skipped}"
     else:
         c.state = "PASS" if code == 0 else "FAIL"
-        c.detail = f"{why}；退出码 {code}"
-        # 从输出里抠出失败的用例名，省得再去翻日志
+        c.detail = f"{why}；退出码 {code}，收集 {ran}，跳过 {skipped}"
         names = re.findall(r"^(?:FAIL|ERROR):\s+(\S+)", out, re.M)[:10]
-        if names:
-            c.findings = [{"file": why, "line": 0, "message": n} for n in names]
+        c.findings = [{"file": why, "line": 0, "message": n} for n in names]
     c.seconds = time.time() - t0
     return c
 
@@ -1710,7 +1702,6 @@ def check_runtime_web(root: Path, files: list[Path], ctx: "Ctx") -> Check:
         c.state, c.applicable = "UNKNOWN", False
         c.detail = "没有 index.html，无法确定站点根（不是可服务的静态站）"
         return c
-    port = _free_port()
     base = _detect_base(htmls)
     httpd = None
     try:
@@ -1719,13 +1710,13 @@ def check_runtime_web(root: Path, files: list[Path], ctx: "Ctx") -> Check:
         import urllib.error
         bad = []
         served = 0
-        for p in htmls[:200]:
+        for p in htmls:
             try:
                 rel = p.relative_to(site_root).as_posix()
             except ValueError:
                 continue
             served += 1
-            url = f"http://127.0.0.1:{port}{base}/{rel}"
+            url = f"http://127.0.0.1:{port}{base}/{quote(rel)}"
             try:
                 with urllib.request.urlopen(url, timeout=5) as r:
                     if r.status != 200:
@@ -1735,7 +1726,8 @@ def check_runtime_web(root: Path, files: list[Path], ctx: "Ctx") -> Check:
             except Exception as e:
                 bad.append({"file": rel, "line": 0, "message": f"{type(e).__name__}"})
         c.findings = bad
-        c.state = "FAIL" if bad else "PASS"
+        c.state = "FAIL" if bad else ("PASS" if served == len(htmls) else "UNKNOWN")
+        c.coverage = {"planned": len(htmls), "observed": served}
         c.detail = (f"站点根 {_rel(root, site_root) or '.'}"
                     + (f"（部署前缀 {base}）" if base else "")
                     + f"，起 http.server:{port}，GET {served} 个页面，失败 {len(bad)}")
@@ -1866,7 +1858,6 @@ def check_custom(root: Path, files: list[Path], ctx: "Ctx") -> Check:
 class Ctx:
     cache: Cache
     workers: int = 8
-    fast: bool = False
     test_timeout: int = 300
     browser_timeout: int = 180
     mutation_max: int = 5
@@ -1942,8 +1933,8 @@ def _ensure_lifecycle() -> None:
         pass
 
 
-def verify(project: str, checks: list[str] | None = None,
-           include_git: bool = False, fast: bool = False,
+def _verify_checks(project: str, checks: list[str] | None = None,
+           include_git: bool = False,
            use_cache: bool = True, workers: int = 8,
            stage: str | None = None, tier: str = "auto",
            accepts: list[dict] | None = None, only_new: bool = False,
@@ -1975,7 +1966,7 @@ def verify(project: str, checks: list[str] | None = None,
     if include_git and "git" not in selected:
         selected.append("git")
 
-    ctx = Ctx(cache=Cache(use_cache), workers=max(1, min(workers, 16)), fast=fast)
+    ctx = Ctx(cache=Cache(use_cache), workers=max(1, min(workers, 16)))
 
     # 这五项共用一次逐行扫描：先在这里算好（一次），再并行跑其余检查。
     # 不预计算的话，五个线程会各自从头扫一遍，反而更慢。
@@ -2459,140 +2450,9 @@ def list_checks_text() -> str:
 
 
 def main_cli(argv=None):
-    import argparse
-    ap = argparse.ArgumentParser(
-        prog="verify-helper",
-        description=f"验证助手 v{VERSION} —— 给任意项目目录跑一组机械检查，返回三态结论与证据。")
-    ap.add_argument("project", nargs="?", help="项目目录（--list-checks 时可省略）")
-    ap.add_argument("--checks", default="", help="逗号分隔；省略=默认全部（不含 git）")
-    ap.add_argument("--git", action="store_true", help="把 git 状态也算进总判定")
-    ap.add_argument("--fast", action="store_true",
-                    help="跳过测试与变异（保留运行时与浏览器：那才是抓真问题的两层）")
-    ap.add_argument("--no-cache", action="store_true", help="忽略语法缓存")
-    ap.add_argument("--workers", type=int, default=8, help="并行度，默认 8")
-    ap.add_argument("--json", action="store_true", help="输出完整 JSON 报告")
-    ap.add_argument("--sarif", metavar="FILE", help="写出 SARIF 2.1.0（给 GitHub Code Scanning 用）")
-    ap.add_argument("--fail-on", default="high",
-                    choices=["critical", "high", "medium", "low"],
-                    help="退出码阈值：该等级及以上的问题会让退出码为 1（默认 high）")
-    ap.add_argument("--list-checks", action="store_true", help="列出全部检查项")
-    ap.add_argument("--baseline", default="off", choices=["off", "save", "check"],
-                    help="基线：save 存一份，check 与上次比对")
-    ap.add_argument("--baseline-file", default="", help="基线文件路径（默认项目根 .verify-baseline.json）")
-    # ── v1.9 生命周期 ──
-    ap.add_argument("--stage", default="pr",
-                    choices=["precommit", "pr", "merge", "postdeploy"],
-                    help="这一轮属于哪一层（默认 pr）")
-    ap.add_argument("--tier", default="auto", choices=["auto", "low", "medium", "high"],
-                    help="风险档；auto = 按 git 改动自动判定")
-    ap.add_argument("--accept", default="",
-                    help="接受某条 finding：id::理由（多个用 ; 分隔；也可用 | 分隔）")
-    ap.add_argument("--accept-file", default="",
-                    help="接受记录文件（默认项目根 .verify-accept.json）")
-    ap.add_argument("--only-new", action="store_true", help="只报本轮新出现的 finding")
-    ap.add_argument("--against", default="", help="合并队列：与目标分支组合后再判定")
-    ap.add_argument("--no-artifacts", action="store_true", help="不写 .verify-artifacts 证据")
-    ap.add_argument("--artifacts-dir", default="",
-                    help="证据写到哪里（默认项目根 .verify-artifacts）")
-    ap.add_argument("--no-review-md", action="store_true", help="忽略 REVIEW.md")
-    a = ap.parse_args(argv)
+    from full_verify import main
 
-    if a.list_checks:
-        print(list_checks_text())
-        return 0
-    if not a.project:
-        ap.error("缺少 project 参数（或用 --list-checks）")
-
-    sel = [x.strip() for x in a.checks.split(",") if x.strip()] or None
-
-    accepts = []
-    for chunk in [x for x in a.accept.split(";") if x.strip()]:
-        # finding id 形如 check:file:line:hash，本身就带冒号 ——
-        # 所以优先用 "::" 或 "|" 分隔；退化时才从最右边切一个冒号。
-        if "::" in chunk:
-            fid, _, reason = chunk.partition("::")
-        elif "|" in chunk:
-            fid, _, reason = chunk.partition("|")
-        else:
-            fid, _, reason = chunk.rpartition(":")
-        if fid.strip() and reason.strip():
-            accepts.append({"id": fid.strip(), "reason": reason.strip(),
-                            "at": time.strftime("%Y-%m-%d")})
-
-    # 从 --accept-file 读一批「已接受」（长期豁免放文件里，命令行只做临时接受）
-    if a.accept_file:
-        try:
-            import json as _json
-            data = _json.loads(Path(a.accept_file).read_text(encoding="utf-8"))
-            rows = data.get("accepted") if isinstance(data, dict) else data
-            for e in rows or []:
-                if isinstance(e, dict) and e.get("id") and e.get("reason"):
-                    accepts.append(e)
-        except Exception as _e:
-            print(f"（--accept-file 读失败：{_e}）", file=sys.stderr)
-
-    # 接受记录落盘：写下就是「我回答过了」，可审计、可入库
-    if accepts:
-        try:
-            import lifecycle as _LC
-            cur = _LC.load_accepts(Path(a.project))
-            merged = {e["id"]: e for e in (cur.get("accepted") or []) if e.get("id")}
-            for e in accepts:
-                merged[e["id"]] = e
-            _LC.save_accepts(Path(a.project), list(merged.values()))
-        except Exception as _e:
-            print(f"（接受记录未写盘：{_e}）", file=sys.stderr)
-
-    # 合并队列：先与目标分支组合，再对合并结果跑检查
-    merge = {}
-    target = a.project
-    if a.against:
-        import lifecycle as _LC
-        merge = _LC.merge_probe(Path(a.project), a.against)
-        if merge.get("ok"):
-            target = merge["path"]
-
-    rep = verify(target, sel, include_git=a.git, fast=a.fast,
-                 use_cache=not a.no_cache, workers=a.workers,
-                 stage=a.stage, tier=a.tier, accepts=accepts,
-                 only_new=a.only_new, artifacts=not a.no_artifacts,
-                 review_md=not a.no_review_md, against=a.against or None,
-                 artifacts_dir=a.artifacts_dir or None)
-    if a.against:
-        rep["merge_probe"] = {"ok": merge.get("ok"), "note": merge.get("note")}
-        if merge.get("ok"):
-            import lifecycle as _LC
-            _LC.cleanup_worktree(Path(a.project), merge.get("path", ""))
-
-    if a.baseline != "off" and "error" not in rep:
-        bpath = Path(a.baseline_file) if a.baseline_file else Path(rep["project"]) / BASELINE_NAME
-        try:
-            if a.baseline == "save":
-                bpath.write_text(json.dumps(baseline_snapshot(rep), ensure_ascii=False, indent=1),
-                                 encoding="utf-8")
-                rep["baseline_saved"] = str(bpath)
-            else:
-                if bpath.exists():
-                    snap = json.loads(bpath.read_text(encoding="utf-8"))
-                    rep["baseline"] = baseline_compare(rep, snap)
-                else:
-                    rep["baseline_error"] = f"基线文件不存在：{bpath}（先跑一次 --baseline save）"
-        except Exception as e:
-            rep["baseline_error"] = f"{type(e).__name__}: {e}"
-
-    if a.sarif:
-        import sarif as sarif_mod
-        Path(a.sarif).write_text(sarif_mod.dumps(rep, VERSION), encoding="utf-8")
-        print(f"SARIF 已写入：{a.sarif}")
-
-    print(json.dumps(rep, ensure_ascii=False, indent=1) if a.json else render(rep))
-
-    worst = worst_risk(rep)
-    order = S.RISK_ORDER
-    if worst is not None and order.get(worst, 9) <= order.get(a.fail_on, 1):
-        return 1
-    return 0 if rep.get("verdict") == "PASS" else 1
-
+    return main(argv)
 
 if __name__ == "__main__":
     sys.exit(main_cli())

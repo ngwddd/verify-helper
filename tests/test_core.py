@@ -43,8 +43,8 @@ class TestVerdicts(unittest.TestCase):
     def setUpClass(cls):
         cls.broken = fixture.make_broken()
         cls.clean = fixture.make_clean()
-        cls.rep_broken = V.verify(str(cls.broken), use_cache=False)
-        cls.rep_clean = V.verify(str(cls.clean), use_cache=False)
+        cls.rep_broken = V._verify_checks(str(cls.broken), use_cache=False)
+        cls.rep_clean = V._verify_checks(str(cls.clean), use_cache=False)
 
     @classmethod
     def tearDownClass(cls):
@@ -83,7 +83,7 @@ class TestVerdicts(unittest.TestCase):
         import tempfile
         empty = Path(_tmp.mkdtemp(prefix="vh-empty-"))
         try:
-            rep = V.verify(str(empty), use_cache=False)
+            rep = V._verify_checks(str(empty), use_cache=False)
             self.assertEqual(rep["verdict"], "UNKNOWN")
             self.assertIn("UNKNOWN", rep["notes"][0] if rep["notes"] else "UNKNOWN")
         finally:
@@ -116,7 +116,7 @@ class TestVerdicts(unittest.TestCase):
         d = Path(_tmp.mkdtemp(prefix="vh-warn-"))
         try:
             (d / "a.py").write_text(f'X = r"C:\\Users\\{Path.home().name}\\x"\n', encoding="utf-8")
-            text = V.render(V.verify(str(d), checks=["paths"], use_cache=False))
+            text = V.render(V._verify_checks(str(d), checks=["paths"], use_cache=False))
             self.assertIn("⚠", text)
             self.assertIn("仅提示", text)
             self.assertNotIn("✗ 本机绝对路径", text)
@@ -128,7 +128,7 @@ class TestIgnoreAndRules(unittest.TestCase):
     def test_verifyignore_excludes_template(self):
         p = fixture.make_with_ignore()
         try:
-            rep = V.verify(str(p), use_cache=False)
+            rep = V._verify_checks(str(p), use_cache=False)
             self.assertEqual(by_id(rep)["links"]["state"], "PASS", V.render(rep))
         finally:
             fixture.cleanup(p)
@@ -136,7 +136,7 @@ class TestIgnoreAndRules(unittest.TestCase):
     def test_custom_rules_fire_and_raise_risk(self):
         p = fixture.make_with_rules()
         try:
-            rep = V.verify(str(p), use_cache=False)
+            rep = V._verify_checks(str(p), use_cache=False)
             c = by_id(rep)["custom"]
             self.assertEqual(c["state"], "FAIL")
             self.assertTrue(any("no-console-log" in f["message"] for f in c["findings"]))
@@ -149,7 +149,7 @@ class TestIgnoreAndRules(unittest.TestCase):
     def test_no_toml_means_not_applicable(self):
         p = fixture.make_clean()
         try:
-            c = by_id(V.verify(str(p), use_cache=False))["custom"]
+            c = by_id(V._verify_checks(str(p), use_cache=False))["custom"]
             self.assertEqual(c["state"], "UNKNOWN")
             self.assertFalse(c["applicable"])
         finally:
@@ -163,14 +163,14 @@ class TestCli(unittest.TestCase):
     def test_fail_exit_code(self):
         p = fixture.make_broken()
         try:
-            self.assertEqual(V.main_cli([str(p), "--checks", "syntax"]), 1)
+            self.assertEqual(V.main_cli([str(p)]), 1)
         finally:
             fixture.cleanup(p)
 
-    def test_pass_exit_code(self):
+    def test_incomplete_exit_code(self):
         p = fixture.make_clean()
         try:
-            self.assertEqual(V.main_cli([str(p)]), 0)
+            self.assertEqual(V.main_cli([str(p)]), 2)
         finally:
             fixture.cleanup(p)
 

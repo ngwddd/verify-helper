@@ -55,7 +55,7 @@ class TestBackupSkip(unittest.TestCase):
             "app.py": "print('real')\n",
             "app.backup-20260101/app.py": "import os\nos.system('ls')\n",   # 备份里才有危险调用
         })
-        rep = V.verify(str(root), checks=["secrets"], use_cache=False)
+        rep = V._verify_checks(str(root), checks=["secrets"], use_cache=False)
         files = rep["files"]
         # 备份目录里的文件不应计入
         self.assertFalse(any(Path(f).parts and "app.backup-20260101" in str(f)
@@ -76,7 +76,7 @@ class TestWorkspaceProfile(unittest.TestCase):
                                      "    def test_ok(self): pass\n",
             "projB/lib.py": "x = 1\n",
         })
-        rep = V.verify(str(root), checks=["todos"], use_cache=False)
+        rep = V._verify_checks(str(root), checks=["todos"], use_cache=False)
         ws = {w["path"]: w for w in (rep.get("workspace") or [])}
         self.assertIn("projA", ws)
         self.assertIn("projB", ws)
@@ -86,7 +86,7 @@ class TestWorkspaceProfile(unittest.TestCase):
     def test_single_project_has_no_profile(self) -> None:
         root = Path(_tmp.mkdtemp(prefix="vh-ws1-"))
         _mk(root, {"app.py": "print(1)\n"})
-        rep = V.verify(str(root), checks=["todos"], use_cache=False)
+        rep = V._verify_checks(str(root), checks=["todos"], use_cache=False)
         self.assertEqual(rep.get("workspace"), [], "单项目不该报工作区画像")
 
 
@@ -95,7 +95,7 @@ class TestArtifactsDir(unittest.TestCase):
         root = Path(_tmp.mkdtemp(prefix="vh-art-"))
         out = Path(_tmp.mkdtemp(prefix="vh-art-out-"))
         _mk(root, {"a.py": "import os\n"})          # 触发 imports 提示 → 有非 PASS 项
-        rep = V.verify(str(root), checks=["imports"], use_cache=False,
+        rep = V._verify_checks(str(root), checks=["imports"], use_cache=False,
                        artifacts_dir=str(out))
         lc = rep.get("lifecycle") or {}
         d = (lc.get("artifacts") or {}).get("dir") or ""
@@ -107,7 +107,7 @@ class TestTierReasonInWorkspace(unittest.TestCase):
     def test_no_git_medium(self) -> None:
         root = Path(_tmp.mkdtemp(prefix="vh-tier-"))
         _mk(root, {"a.py": "print(1)\n"})
-        rep = V.verify(str(root), checks=["todos"], use_cache=False)
+        rep = V._verify_checks(str(root), checks=["todos"], use_cache=False)
         tier = (rep.get("lifecycle") or {}).get("tier") or {}
         self.assertEqual(tier.get("tier"), "medium")
         self.assertTrue(any("git" in r for r in tier.get("reasons") or []),

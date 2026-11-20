@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'v2.0/development']
   pull_request:
   workflow_dispatch:
 
@@ -10,73 +10,75 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: test (py${{ matrix.python }} · ${{ matrix.os }})
+  verification:
+    name: Test Python ${{ matrix.python }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python: ["3.11", "3.12", "3.13", "3.14"]
-        exclude:
-          # 3.14 在 ubuntu 上偶发没有预编译产物，先用 Windows 覆盖
-          - os: ubuntu-latest
-            python: "3.14"
+        python: ['3.11', '3.12', '3.13', '3.14']
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python }}
-
-      - name: 版本与依赖检查
+      - run: uv sync --locked
+      - name: Unit and MCP protocol tests
+        run: uv run python -m unittest discover -s tests -v
+      - name: Conformance
+        run: uv run python conformance.py
+      - name: Language and browser acceptance
+        if: matrix.python == '3.12'
+        shell: pwsh
         run: |
-          python -V
-          python -c "import tomllib, json, ast; print('stdlib ok')"
-
-      - name: 单元测试
-        run: python -m unittest discover -s tests -v
-
-      - name: CLI 冒烟
+          $toolchain = Join-Path $env:RUNNER_TEMP vh-toolchain
+          npm install --prefix $toolchain --no-save --no-audit --no-fund playwright@1.65.1 typescript@7.0.2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $suffix = if ($IsWindows) { '.cmd' } else { '' }
+          & (Join-Path $toolchain "node_modules/.bin/playwright$suffix") install --with-deps chromium
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:VERIFY_PLAYWRIGHT_ROOT = $toolchain
+          $env:VERIFY_TSC = Join-Path $toolchain "node_modules/.bin/tsc$suffix"
+          $env:VERIFY_NATIVE_FIXTURE = '1'
+          uv run python -m unittest discover -s tests -p test_full_verify.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "VERIFY_PLAYWRIGHT_ROOT=$env:VERIFY_PLAYWRIGHT_ROOT" >> $env:GITHUB_ENV
+          "VERIFY_TSC=$env:VERIFY_TSC" >> $env:GITHUB_ENV
+          "VERIFY_NATIVE_FIXTURE=1" >> $env:GITHUB_ENV
+      - name: Build and verify distribution
+        if: matrix.python == '3.12'
+        shell: pwsh
         run: |
-          python verify_core.py --list-checks
-          python verify_core.py . --fast --no-cache
-
-      - name: 自检（应通过）
-        run: python verify_core.py . --fast
-
-  conformance:
-    name: 符合性测试（48 项）
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+          uv build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:VERIFY_TEST_PYTHON = uv run python -c "import sys; print(sys.executable)"
+          $evidence = Join-Path $env:RUNNER_TEMP vh-evidence
+          $json = uv run verify-helper . --trust-project-code --evidence-dir $evidence --json
+          $verdictCode = $LASTEXITCODE
+          $report = $json | ConvertFrom-Json
+          if (@($report.checks | Where-Object { $_.id -like 'delivery-*' -and $_.state -eq 'PASS' }).Count -ne 2) {
+            throw "Delivery verification failed"
+          }
+          if ($verdictCode -ne 0) {
+            $report.checks | Where-Object { $_.id -in $report.plan.PSObject.Properties.Name -and $_.state -ne 'PASS' } |
+              Select-Object id, state, detail, output | Format-List
+            throw "Self-verification did not pass"
+          }
+          $wheel = (Get-ChildItem -LiteralPath dist -Filter '*.whl').FullName
+          uv run --no-project --with $wheel verify-helper --list-checks
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run --no-project --with $wheel verify-helper-mcp --help
+      - name: Retain verification evidence
+        if: always() && matrix.python == '3.12'
+        uses: actions/upload-artifact@v4
         with:
-          python-version: "3.12"
-
-      # 自己生成 32 个项目喂进去，比对「总判定 + 检查状态」
-      # 不含浏览器/playwright 依赖：相关用例在无 playwright 时会降级为 UNKNOWN
-      - name: 跑符合性测试
-        run: python conformance.py
-
-  sarif:
-    name: 生成 SARIF 并上传 Code Scanning
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      # 自检可能因低风险项报 FAIL，这里允许失败，只要求 SARIF 能生成
-      - name: 生成 SARIF
-        run: python verify_core.py . --sarif verify.sarif || true
-
-      - name: 上传
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: verify.sarif
-          category: verify-helper
+          name: verification-${{ matrix.os }}-py${{ matrix.python }}
+          path: ${{ runner.temp }}/vh-evidence
+          if-no-files-found: warn

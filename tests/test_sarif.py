@@ -24,7 +24,7 @@ class TestSarif(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.broken = fixture.make_broken()
-        cls.rep = V.verify(str(cls.broken), use_cache=False)
+        cls.rep = V._verify_checks(str(cls.broken), use_cache=False)
         cls.doc = sarif.to_sarif(cls.rep, V.VERSION)
 
     @classmethod
@@ -76,7 +76,7 @@ class TestSarif(unittest.TestCase):
     def test_passing_project_has_no_results(self):
         clean = fixture.make_clean()
         try:
-            rep = V.verify(str(clean), use_cache=False)
+            rep = V._verify_checks(str(clean), use_cache=False)
             doc = sarif.to_sarif(rep, V.VERSION)
             self.assertEqual(doc["runs"][0]["results"], [])
             self.assertTrue(doc["runs"][0]["invocations"][0]["executionSuccessful"])

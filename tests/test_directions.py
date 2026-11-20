@@ -47,8 +47,8 @@ class TestCardShape(unittest.TestCase):
                 self.assertTrue(card["must_not_touch"])
                 # 验证方式必须同时给 MCP 调用与命令行两种
                 self.assertIn("verify_start(", card["verify"])
-                self.assertIn(f'checks=["{cid}"]', card["verify"])
-                self.assertIn(f"--checks {cid}", card["verify"])
+                self.assertIn(cid, card["verify"])
+                self.assertIn("verify-helper . --json", card["verify"])
 
     def test_cards_cite_the_location(self):
         """除了 interaction（file 是流程名），每张卡都要写出 文件:行。"""
@@ -140,7 +140,7 @@ class TestIntegration(unittest.TestCase):
     def test_findings_get_direction_in_json(self):
         d = self._fixture()
         try:
-            rep = V.verify(str(d), checks=["links"], use_cache=False)
+            rep = V._verify_checks(str(d), checks=["links"], use_cache=False)
             c = {x["id"]: x for x in rep["checks"]}["links"]
             self.assertEqual(c["state"], "FAIL")
             self.assertTrue(c["findings"])
@@ -154,10 +154,10 @@ class TestIntegration(unittest.TestCase):
     def test_render_shows_card_and_hides_generic_advice(self):
         d = self._fixture()
         try:
-            text = V.render(V.verify(str(d), checks=["links"], use_cache=False))
+            text = V.render(V._verify_checks(str(d), checks=["links"], use_cache=False))
             self.assertIn("方向：", text)
             self.assertIn("别动：", text)
-            self.assertIn('验证：verify_start(checks=["links"]) 应 PASS', text)
+            self.assertIn('确认 links 应 PASS', text)
             # 有方向卡时，通用的那句「怎么改」不该再出现
             self.assertNotIn("→ 怎么改：改链接指向真实文件", text)
         finally:
@@ -167,7 +167,7 @@ class TestIntegration(unittest.TestCase):
         d = Path(_tmp.mkdtemp(prefix="vh-dir-ok-"))
         try:
             (d / "a.py").write_text("x = 1\n", encoding="utf-8")
-            rep = V.verify(str(d), checks=["syntax"], use_cache=False)
+            rep = V._verify_checks(str(d), checks=["syntax"], use_cache=False)
             c = {x["id"]: x for x in rep["checks"]}["syntax"]
             self.assertEqual(c["state"], "PASS")
             self.assertFalse(c["findings"])

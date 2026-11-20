@@ -37,7 +37,7 @@ class TestConsistentSubprojectCount(unittest.TestCase):
             "b/y.py": "print(2)\n",
             "c/z.py": "print(3)\n",
         })
-        rep = V.verify(str(root), checks=["todos"], use_cache=False)
+        rep = V._verify_checks(str(root), checks=["todos"], use_cache=False)
         profile = rep.get("workspace") or []
         self.assertEqual(len(profile), 3)
         joined = " ".join(rep.get("notes") or [])
@@ -58,23 +58,19 @@ class TestDocHttpNotFlagged(unittest.TestCase):
 
 
 class TestAcceptFile(unittest.TestCase):
-    def test_cli_accept_file_is_read(self) -> None:
+    def test_accept_file_is_read(self) -> None:
         root = Path(_tmp.mkdtemp(prefix="vh-af-"))
         _mk(root, {"a.py": "import os\n"})          # imports 会给出低风险提示
-        first = V.verify(str(root), checks=["imports"], use_cache=False, artifacts=False)
+        first = V._verify_checks(str(root), checks=["imports"], use_cache=False, artifacts=False)
         un = ((first.get("lifecycle") or {}).get("accept") or {}).get("unresolved") or []
         self.assertTrue(un, "应当有一条未回应")
         fid = un[0]["id"]
 
-        af = Path(_tmp.mkdtemp(prefix="vh-afj-")) / "accept.json"
+        af = root / ".verify-accept.json"
         af.write_text(json.dumps({"accepted": [{"id": fid, "reason": "临时脚本，已知"}]},
                                  ensure_ascii=False), encoding="utf-8")
 
-        rc = V.main_cli([str(root), "--checks", "imports", "--accept-file", str(af),
-                         "--no-artifacts", "--stage", "pr"])
-        self.assertIn(rc, (0, 1))
-        # 落盘文件里应当有这条接受
-        saved = json.loads((root / ".verify-accept.json").read_text(encoding="utf-8"))
+        saved = LC.load_accepts(root)
         self.assertTrue(any(e.get("id") == fid for e in saved.get("accepted") or []),
                         "accept-file 里的条目应当被合并进 .verify-accept.json")
 
@@ -111,7 +107,7 @@ class TestBackupNote(unittest.TestCase):
             "app.py": "print(1)\n",
             "old.backup-20260101/app.py": "print(2)\n",
         })
-        rep = V.verify(str(root), checks=["todos"], use_cache=False)
+        rep = V._verify_checks(str(root), checks=["todos"], use_cache=False)
         joined = " ".join(rep.get("notes") or [])
         self.assertIn("备份目录", joined, f"应说明跳过了备份目录，notes={joined[:200]}")
 

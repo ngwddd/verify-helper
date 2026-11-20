@@ -14,6 +14,7 @@
  * 输出 JSON: {ok, pages:[{rel,status,console:[],pageerrors:[],failed:[]}], shots:[]}
  */
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 import { join, dirname } from 'node:path';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
@@ -92,7 +93,7 @@ async function visit(p) {
     rec.status = resp ? resp.status() : 0;
     await page.waitForTimeout(250);      // 让异步渲染里的错误冒出来
     if (shotsDir && result.shots.length < 12) {
-      const safe = p.rel.replace(/[\\/:*?"<>|]/g, '_');
+      const safe = createHash('sha256').update(p.rel).digest('hex');
       const file = join(shotsDir, safe + '.png');
       await page.screenshot({ path: file, fullPage: false });
       result.shots.push(file);

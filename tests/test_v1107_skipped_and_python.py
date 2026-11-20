@@ -51,15 +51,15 @@ class TestPythonForTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             fake = Path(d) / "py.exe"
             fake.write_text("", encoding="utf-8")
-            old = os.environ.get("DSH_TEST_PYTHON")
-            os.environ["DSH_TEST_PYTHON"] = str(fake)
+            old = os.environ.get("VERIFY_TEST_PYTHON")
+            os.environ["VERIFY_TEST_PYTHON"] = str(fake)
             try:
                 self.assertEqual(V._py_for(Path(d)), str(fake))
             finally:
                 if old is None:
-                    os.environ.pop("DSH_TEST_PYTHON", None)
+                    os.environ.pop("VERIFY_TEST_PYTHON", None)
                 else:
-                    os.environ["DSH_TEST_PYTHON"] = old
+                    os.environ["VERIFY_TEST_PYTHON"] = old
 
     def test_verify_python_file(self) -> None:
         import os
@@ -67,12 +67,12 @@ class TestPythonForTests(unittest.TestCase):
             fake = Path(d) / "py.exe"
             fake.write_text("", encoding="utf-8")
             (Path(d) / ".verify-python").write_text(str(fake) + "\n", encoding="utf-8")
-            old = os.environ.pop("DSH_TEST_PYTHON", None)
+            old = os.environ.pop("VERIFY_TEST_PYTHON", None)
             try:
                 self.assertEqual(V._py_for(Path(d)), str(fake))
             finally:
                 if old is not None:
-                    os.environ["DSH_TEST_PYTHON"] = old
+                    os.environ["VERIFY_TEST_PYTHON"] = old
 
     def test_fallback_is_current_python(self) -> None:
         with tempfile.TemporaryDirectory() as d:

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -94,7 +95,7 @@ class TestCheckFallback(unittest.TestCase):
     def test_not_applicable_without_flows(self):
         d = proj(None)
         try:
-            rep = V.verify(str(d), checks=["interaction"], use_cache=False)
+            rep = V._verify_checks(str(d), checks=["interaction"], use_cache=False)
             c = {x["id"]: x for x in rep["checks"]}["interaction"]
             self.assertEqual(c["state"], "UNKNOWN")
             self.assertFalse(c["applicable"])
@@ -104,25 +105,13 @@ class TestCheckFallback(unittest.TestCase):
     def test_unknown_when_playwright_missing(self):
         d = proj(GOOD)
         try:
-            if V._find_playwright(d) is not None:
-                self.skipTest("这台机器上有 playwright，跳过降级用例")
-            rep = V.verify(str(d), checks=["interaction"], use_cache=False)
+            with patch.object(V, "_find_playwright", return_value=None):
+                rep = V._verify_checks(str(d), checks=["interaction"], use_cache=False)
             c = {x["id"]: x for x in rep["checks"]}["interaction"]
             self.assertEqual(c["state"], "UNKNOWN")
             self.assertIn("playwright", c["detail"])
         finally:
             shutil.rmtree(d, ignore_errors=True)
-
-    def test_fast_mode_skips(self):
-        d = proj(GOOD)
-        try:
-            rep = V.verify(str(d), checks=["interaction"], fast=True, use_cache=False)
-            c = {x["id"]: x for x in rep["checks"]}["interaction"]
-            self.assertEqual(c["state"], "UNKNOWN")
-            self.assertIn("fast", c["detail"])
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
 
 if __name__ == "__main__":
     unittest.main()

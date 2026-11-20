@@ -8,7 +8,7 @@
 四道闸（任一不过 → 返回 None，这一条就不写方向）：
 
   ① 有证据     卡里必须带具体位置（构造时强制写入 evidence，取自 finding）
-  ② 可验证     必须给出一条能执行的 `--checks <id>` 命令
+  ② 可验证     必须给出可执行的完整验证命令
   ③ 有边界     必须写明至少一条「不要动 X」
   ④ 最小       动作里不许出现「重写整个文件」「删掉测试」这类话
 
@@ -52,17 +52,8 @@ def _where(f: dict) -> str:
 
 
 def _verify_text(check_id: str, blocking: bool) -> str:
-    """验证方式。**必须区分阻断项与非阻断项**。
-
-    非阻断项单独跑时，没有任何能定性的检查 —— 按设计结论必然是 UNKNOWN，
-    永远不可能 PASS。所以对它们写「应 PASS」是错的（v1.8.1 的 bug，
-    由外部实测报告抓出来）：判据只能是「这一项不再列出任何条目」。
-    """
-    if blocking:
-        return (f'verify_start(checks=["{check_id}"]) 应 PASS'
-                f'（命令行 --checks {check_id}）')
-    return (f'verify_start(checks=["{check_id}"]) 应 0 处提示'
-            f'（只报告不参与判定；命令行 --checks {check_id}）')
+    expectation = "应 PASS" if blocking else "应 0 处提示"
+    return f'verify_start(path=".") 或 verify-helper . --json，确认 {check_id} {expectation}'
 
 
 def _card(f: dict, cls, cause, action, must_not, check_id, scale="low", cite=True):
@@ -347,7 +338,7 @@ def _gate(card: dict, finding: dict) -> bool:
         return False
     # ② 可验证：必须同时给出 MCP 调用与命令行两种形式
     verify = card.get("verify") or ""
-    if "verify_start(" not in verify or "--checks" not in verify:
+    if "verify_start(" not in verify or "verify-helper ." not in verify:
         return False
     # ③ 有边界：至少一条「不要动」
     must_not = card.get("must_not_touch") or []

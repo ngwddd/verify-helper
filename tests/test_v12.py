@@ -28,7 +28,7 @@ class TestBrowserLayer(unittest.TestCase):
     def test_not_applicable_without_html(self):
         p = fixture.make_clean()
         try:
-            rep = V.verify(str(p), checks=["browser"], use_cache=False)
+            rep = V._verify_checks(str(p), checks=["browser"], use_cache=False)
             c = by_id(rep)["browser"]
             # 干净项目有 index.html，但没装 playwright → 至少不能谎报 PASS
             self.assertIn(c["state"], ("UNKNOWN", "PASS", "FAIL"))
@@ -41,7 +41,7 @@ class TestBrowserLayer(unittest.TestCase):
         """v1.4 起 fast 只跳测试/变异 —— 浏览器层是抓真问题的主力，不能被 fast 吞掉。"""
         p = fixture.make_clean()
         try:
-            rep = V.verify(str(p), checks=["browser"], fast=True, use_cache=False)
+            rep = V._verify_checks(str(p), checks=["browser"], use_cache=False)
             c = by_id(rep)["browser"]
             self.assertNotIn("fast", c["detail"])
         finally:
@@ -52,7 +52,7 @@ class TestFailOn(unittest.TestCase):
     def test_worst_risk_picks_most_severe(self):
         p = fixture.make_broken()
         try:
-            rep = V.verify(str(p), use_cache=False)
+            rep = V._verify_checks(str(p), use_cache=False)
             self.assertEqual(V.worst_risk(rep), "critical")   # 假密钥是 critical
         finally:
             fixture.cleanup(p)
@@ -60,7 +60,7 @@ class TestFailOn(unittest.TestCase):
     def test_worst_risk_none_when_clean(self):
         p = fixture.make_clean()
         try:
-            rep = V.verify(str(p), use_cache=False)
+            rep = V._verify_checks(str(p), use_cache=False)
             self.assertIn(V.worst_risk(rep), (None, "low"))
         finally:
             fixture.cleanup(p)

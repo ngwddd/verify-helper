@@ -24,7 +24,7 @@ class TestBaseline(unittest.TestCase):
     def test_roundtrip_no_change(self):
         p = fixture.make_clean()
         try:
-            rep = V.verify(str(p), use_cache=False)
+            rep = V._verify_checks(str(p), use_cache=False)
             snap = V.baseline_snapshot(rep)
             diff = V.baseline_compare(rep, snap)
             self.assertEqual(diff["new"], [])
@@ -35,10 +35,10 @@ class TestBaseline(unittest.TestCase):
     def test_detects_new_problem(self):
         p = fixture.make_clean()
         try:
-            rep = V.verify(str(p), use_cache=False)
+            rep = V._verify_checks(str(p), use_cache=False)
             snap = V.baseline_snapshot(rep)
             (p / "broken.py").write_text("def f(:\n", encoding="utf-8")
-            rep2 = V.verify(str(p), use_cache=False)
+            rep2 = V._verify_checks(str(p), use_cache=False)
             diff = V.baseline_compare(rep2, snap)
             self.assertEqual(len(diff["new"]), 1)
             self.assertEqual(diff["new"][0]["check"], "syntax")
@@ -49,12 +49,12 @@ class TestBaseline(unittest.TestCase):
     def test_detects_fixed_problem(self):
         p = fixture.make_broken()
         try:
-            rep = V.verify(str(p), checks=["syntax"], use_cache=False)
+            rep = V._verify_checks(str(p), checks=["syntax"], use_cache=False)
             snap = V.baseline_snapshot(rep)
             (p / "bad.py").unlink()
             (p / "bad.mjs").unlink()
             (p / "config.json").unlink()
-            rep2 = V.verify(str(p), checks=["syntax"], use_cache=False)
+            rep2 = V._verify_checks(str(p), checks=["syntax"], use_cache=False)
             diff = V.baseline_compare(rep2, snap)
             self.assertTrue(diff["fixed"])
             self.assertIn("syntax", diff["improved"])
@@ -83,7 +83,7 @@ class TestMutation(unittest.TestCase):
     def test_survived_mutant_is_reported(self):
         d = self._weak_project()
         try:
-            rep = V.verify(str(d), checks=["mutation"], use_cache=False)
+            rep = V._verify_checks(str(d), checks=["mutation"], use_cache=False)
             c = by_id(rep)["mutation"]
             self.assertEqual(c["state"], "FAIL", c["detail"])
             self.assertTrue(any("没有有效断言" in f["message"] for f in c["findings"]))
@@ -93,7 +93,7 @@ class TestMutation(unittest.TestCase):
     def test_source_is_restored(self):
         d = self._weak_project()
         try:
-            V.verify(str(d), checks=["mutation"], use_cache=False)
+            V._verify_checks(str(d), checks=["mutation"], use_cache=False)
             self.assertEqual((d / "calc.py").read_text(encoding="utf-8"),
                              "def add(a, b):\n    return a + b\n")
         finally:
@@ -102,7 +102,7 @@ class TestMutation(unittest.TestCase):
     def test_not_applicable_without_tests(self):
         p = fixture.make_clean()
         try:
-            c = by_id(V.verify(str(p), checks=["mutation"], use_cache=False))["mutation"]
+            c = by_id(V._verify_checks(str(p), checks=["mutation"], use_cache=False))["mutation"]
             self.assertEqual(c["state"], "UNKNOWN")
             self.assertFalse(c["applicable"])
         finally:
@@ -111,7 +111,7 @@ class TestMutation(unittest.TestCase):
     def test_not_in_default_run(self):
         p = fixture.make_clean()
         try:
-            rep = V.verify(str(p), use_cache=False)
+            rep = V._verify_checks(str(p), use_cache=False)
             self.assertNotIn("mutation", by_id(rep))
         finally:
             fixture.cleanup(p)

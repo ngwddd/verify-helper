@@ -30,7 +30,7 @@ def _mk(root: Path, files: dict[str, str]) -> None:
 
 
 def _tests_check(root: Path):
-    rep = V.verify(str(root), checks=["tests"], use_cache=False)
+    rep = V._verify_checks(str(root), checks=["tests"], use_cache=False)
     return next(c for c in rep["checks"] if c["id"] == "tests")
 
 

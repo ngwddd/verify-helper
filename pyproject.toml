@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "verify-helper"
+version = "2.0.0rc1"
+description = "Evidence-based full project verification for MCP clients"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = ["mcp>=2.3,<3"]
+
+[project.scripts]
+verify-helper = "full_verify:main"
+verify-helper-mcp = "server:main"
+
+[tool.setuptools]
+py-modules = ["verify_core", "full_verify", "verification_adapters", "server", "lifecycle", "check_specs", "directions", "sarif"]
+
+[tool.setuptools.package-data]
+verification_resources = ["*.mjs"]
+
+[tool.setuptools.packages.find]
+include = ["verification_resources"]

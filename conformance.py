@@ -244,7 +244,7 @@ def run_cases(verbose: bool):
         tmp = Path(tempfile.mkdtemp(prefix=f"vh-cf-{c['id']}-"))
         try:
             make_case(tmp, c["files"])
-            rep = V.verify(str(tmp), checks=c.get("checks"), fast=False, use_cache=False)
+            rep = V._verify_checks(str(tmp), checks=c.get("checks"), use_cache=False)
             got = {"verdict": rep["verdict"]}
             states = {x["id"]: x["state"] for x in rep["checks"]}
             ok = got["verdict"] == c["expect"]["verdict"]
@@ -285,7 +285,7 @@ def run_extra(verbose: bool):
                         '<!doctype html><html lang="zh"><head><title>t</title></head>'
                         '<body><h1>x</h1><a href="nope.html">a</a></body></html>',
                         "a.py": "import json\n"})
-        rep = V.verify(str(tmp), checks=["links", "imports"], use_cache=False)
+        rep = V._verify_checks(str(tmp), checks=["links", "imports"], use_cache=False)
 
         # SARIF
         try:
@@ -307,10 +307,10 @@ def run_extra(verbose: bool):
         check("方向卡四段齐全",
               all(k in d for k in ("class", "root_cause", "action", "must_not_touch", "verify")))
         check("方向卡引用了位置", bool(d.get("evidence")) and d["evidence"] in d.get("root_cause", ""))
-        check("方向卡给了可执行验证", "verify_start(" in d.get("verify", "") and "--checks" in d.get("verify", ""))
+        check("方向卡给了可执行验证", "verify_start(" in d.get("verify", "") and "verify-helper ." in d.get("verify", ""))
 
         # 幂等：同目录跑两次签名一致
-        r2 = V.verify(str(tmp), checks=["links", "imports"], use_cache=False)
+        r2 = V._verify_checks(str(tmp), checks=["links", "imports"], use_cache=False)
         sig = lambda r: (r["verdict"], tuple((x["id"], x["state"], len(x["findings"])) for x in r["checks"]))
         check("两次运行结果一致", sig(rep) == sig(r2))
 
@@ -319,18 +319,17 @@ def run_extra(verbose: bool):
 
         # 退出码语义（--fail-on 收的是风险等级，不是 "fail" 这个词）
         import subprocess
-        r = subprocess.run([sys.executable, str(ROOT / "verify_core.py"), str(tmp),
-                            "--checks", "links", "--fail-on", "high"],
+        r = subprocess.run([sys.executable, str(ROOT / "verify_core.py"), str(tmp)],
                            capture_output=True, text=True, encoding="utf-8")
         check("有阻断失败时退出码 1", r.returncode == 1, f"exit={r.returncode}")
-        r = subprocess.run([sys.executable, str(ROOT / "verify_core.py"), str(ROOT),
-                            "--checks", "syntax", "--fail-on", "high"],
+        make_case(tmp / "valid", {"README.md": "Valid documentation.\n"})
+        r = subprocess.run([sys.executable, str(ROOT / "verify_core.py"), str(tmp / "valid")],
                            capture_output=True, text=True, encoding="utf-8")
         check("全过时退出码 0", r.returncode == 0, f"exit={r.returncode}")
 
         # --json 输出可被解析
         r = subprocess.run([sys.executable, str(ROOT / "verify_core.py"), str(tmp),
-                            "--checks", "links,imports", "--json"],
+                            "--json"],
                            capture_output=True, text=True, encoding="utf-8")
         try:
             import json as J
@@ -342,7 +341,7 @@ def run_extra(verbose: bool):
         # --sarif 会落盘且内容合法
         sfile = tmp / "out.sarif"
         subprocess.run([sys.executable, str(ROOT / "verify_core.py"), str(tmp),
-                        "--checks", "links", "--sarif", str(sfile)],
+                        "--sarif", str(sfile)],
                        capture_output=True, text=True, encoding="utf-8")
         try:
             import json as J
@@ -354,7 +353,7 @@ def run_extra(verbose: bool):
         big = Path(tempfile.mkdtemp(prefix="vh-cf-big-"))
         try:
             (big / "big.py").write_text("x = 1\n" * 400000, encoding="utf-8")   # ~3MB
-            rb = V.verify(str(big), checks=["syntax"], use_cache=False)
+            rb = V._verify_checks(str(big), checks=["syntax"], use_cache=False)
             check("3MB 文件不崩且不误判", rb["verdict"] in ("PASS", "UNKNOWN"), f"verdict={rb['verdict']}")
         finally:
             shutil.rmtree(big, ignore_errors=True)
@@ -366,19 +365,19 @@ def run_extra(verbose: bool):
             make_case(low, {"a.py": f'X = r"{W}{CUR_USER}\\proj"\n',
                             "ok.py": "y = 1\n"})
             r = subprocess.run([sys.executable, str(ROOT / "verify_core.py"), str(low),
-                                "--checks", "syntax,paths", "--fail-on", "low"],
+                                "--trust-project-code"],
                                capture_output=True, text=True, encoding="utf-8")
-            check("--fail-on low 时低风险也算失败", r.returncode == 1, f"exit={r.returncode}")
+            check("缺少测试证据时退出码为 2", r.returncode == 2, f"exit={r.returncode}")
             r = subprocess.run([sys.executable, str(ROOT / "verify_core.py"), str(low),
-                                "--checks", "syntax,paths", "--fail-on", "high"],
+                                "--json"],
                                capture_output=True, text=True, encoding="utf-8")
-            check("同一项目 --fail-on high 时不算失败", r.returncode == 0, f"exit={r.returncode}")
+            check("未执行代码时返回 UNKNOWN", r.returncode == 2, f"exit={r.returncode}")
 
             # UNKNOWN 的退出码：不该当成成功
             r = subprocess.run([sys.executable, str(ROOT / "verify_core.py"), str(low),
-                                "--checks", "paths", "--fail-on", "critical"],
+                                "--json"],
                                capture_output=True, text=True, encoding="utf-8")
-            check("UNKNOWN 时退出码非 0（fail-closed）", r.returncode == 1, f"exit={r.returncode}")
+            check("UNKNOWN 时退出码非 0（fail-closed）", r.returncode == 2, f"exit={r.returncode}")
         finally:
             shutil.rmtree(low, ignore_errors=True)
     finally:

@@ -1,604 +1,78 @@
-# 验证助手 · verify-helper
+# Verify Helper
 
-[![CI](https://github.com/ngwddd/verify-helper/actions/workflows/ci.yml/badge.svg)](https://github.com/ngwddd/verify-helper/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.11%2B-3776ab.svg)](https://www.python.org/)
+Verify Helper 通过 CLI 或 MCP 对项目运行完整验证，输出 PASS、FAIL 或 UNKNOWN，并留下 JSON、SARIF 和逐项证据。当前分支使用 Python MCP SDK v2，支持 MCP 2026-07-28 以及 SDK 支持的旧协议。
 
-给**任意项目目录**跑一遍机械检查，返回 **PASS / FAIL / UNKNOWN** 三态结论，
-每条结论都带证据（命令、退出码、`文件:行号`）、**风险等级**和**修复建议**。
+## 安装与运行
 
-既是一个命令行工具，也是一个 MCP 服务器（agent 可以直接调用）。
+需要 Python 3.11 或更新版本。开发版可使用以下命令。
 
-当前版本 **v1.10.8**（以 `verify_core.py` 的 `VERSION` 为准）；检查项数量以
-`python verify_core.py --list-checks` 的输出为准。
-
----
-
-## 为什么做这个
-
-Agent 的自验经常很水：跑个构建看到「成功」就宣称完成，但页面点了没反应、链接 404、
-测试里根本没断言。有研究统计了 20,574 个真实编码会话（1,639 个仓库）：**22.58% 的错位
-案例属于「不准确自我汇报」** —— 把还没做成的事说成做完了（[arXiv:2605.29442](https://arxiv.org/abs/2605.29442)）。
-
-这个工具把「完成」的判定从模型的自我叙述里拿出来，交给可复核的输出：
-
-- **没有 oracle（判定标准）的检查，一律记 UNKNOWN，绝不当 PASS。**
-- **每条 FAIL 都附证据**：跑了什么命令、退出码多少、哪一行出问题。
-- **每条 FAIL 都附修复建议**，不是只告诉你错了。
-
-## 快速开始
-
-```bash
-# 直接跑（零依赖，Python 3.11+）
-python verify_core.py /path/to/project
-
-# 列出全部检查项
-python verify_core.py --list-checks
-
-# 快速模式：跳过「测试 / 变异 / 交互」三项（HTTP 与浏览器照跑）
-python verify_core.py /path/to/project --fast
-
-# 输出 SARIF（给 GitHub Code Scanning 用）
-python verify_core.py /path/to/project --sarif out.sarif
+```sh
+uv sync --locked
+uv run verify-helper /path/to/project --trust-project-code --json
 ```
 
-退出码：`0 = PASS`，`1 = FAIL / UNKNOWN`，`2 = 参数错误`（argparse 的默认值）。
-`--fail-on <等级>` 决定哪个风险等级起算失败（默认 `high`）。
+可信项目的测试和构建在临时副本中运行。CLI 启用项目代码执行后，子进程仍使用当前操作系统账户。请将未经信任的项目放在独立运行环境中处理。缺少执行授权、工具链、断言或完整覆盖时，适用的检查会影响最终裁决。退出码为 0（PASS）、1（FAIL）或 2（UNKNOWN）。
 
-### 作为 MCP 服务器
+| 参数 | 用途 |
+|---|---|
+| --trust-project-code | 运行来自已审查项目的测试、构建、浏览器和契约 |
+| --against main | 对干净 Git 工作树与指定提交的合并结果运行验证 |
+| --evidence-dir PATH | 指定证据根目录 |
+| --json | 把机器可读报告写入标准输出 |
+| --sarif FILE | 另存 SARIF 2.1.0 报告 |
+| --list-checks | 显示可用检查 |
 
-零依赖、纯 stdio，**只要 Python 3.11+，不用装任何包**：
+## MCP
 
-```bash
-git clone https://github.com/ngwddd/verify-helper.git
-cd verify-helper
-python server.py          # 前台起一个 stdio 服务器（客户端会自己拉起，一般不用手跑）
-```
-
-> macOS / Linux 上多半叫 `python3`，Windows 上叫 `python`。填配置时用**绝对路径**最稳。
-
-#### 通用客户端配置（Claude Desktop / Cursor / VS Code / Windsurf 等）
+stdio 示例配置。将工作区限定到验证任务所需的目录。
 
 ```json
 {
   "mcpServers": {
     "verify-helper": {
-      "command": "python",
-      "args": ["/绝对路径/verify-helper/server.py"],
-      "env": { "PYTHONIOENCODING": "utf-8" }
+      "command": "verify-helper-mcp",
+      "args": ["--workspace", "/path/to/projects"]
     }
   }
 }
 ```
 
-Windows 示例：
+Streamable HTTP 使用相同的核心和工具。
 
-```json
-{
-  "mcpServers": {
-    "verify-helper": {
-      "command": "C:\\Python312\\python.exe",
-      "args": ["C:\\Users\\you\\verify-helper\\server.py"],
-      "env": { "PYTHONIOENCODING": "utf-8" }
-    }
-  }
-}
+```sh
+verify-helper-mcp --workspace /path/to/projects --transport streamable-http --port 8765
 ```
 
-#### DeepSeek Harness（DSH）配置
+HTTP 服务监听 127.0.0.1，在 /mcp 提供标准接口。跨主机连接需要加密通道。配置 VERIFY_HTTP_BEARER_TOKEN 后，HTTP 客户端必须发送对应的 Bearer 凭据。动态执行通过启动参数 --trust-project-code 启用，HTTP 模式同时要求配置凭据。工具 verify_start 接收工作区相对 path 和可选 against，返回结构化裁决和证据。代码修改 Agent 与验证进程可以各自在独立工作区运行，使用提交和快照摘要关联结果。
 
-```yaml
-- insert:
-    - id: verify-helper
-      name: '@deepseek-ai/dsh-mcp-client'
-      config:
-        serverName: verify-helper
-        transport: stdio
-        command: 'python'
-        args: ['/绝对路径/verify-helper/server.py']
-        env:
-          PYTHONIOENCODING: utf-8
-        toolCallTimeoutMs: 600000
-        failOnStartupError: false
-```
+## 适用检查
 
-#### 装好了怎么确认
-
-```bash
-python verify_core.py --list-checks     # 应列出 17 项检查（默认跑 15 项；mutation / git 需显式打开）
-```
-
-客户端里应该出现四个工具：
-
-| 工具 | 作用 |
+| 项目 | 验证范围 |
 |---|---|
-| `verify_start(path, checks?, fast?, format?, stage?, tier?, accept?, …)` | 跑一遍验证，`format` 可选 `text` / `json` / `sarif`；生命周期参数见「分层闸门」 |
-| `verify_report(run_id?)` | 取回完整报告，默认最近一次 |
-| `verify_checks()` | 列出全部检查项、风险等级、修复建议 |
-| `verify_accept(action, path, id?, reason?)` | 管理接受记录：`list` / `add` / `clear`，`add` 必须写理由 |
+| Python | 语法、编码、测试，及项目显式声明的变异和业务契约 |
+| JavaScript | Node 语法、npm 或 Node 测试及运行契约 |
+| TypeScript 与 JSX | TypeScript 编译器及测试入口，项目须提供 tsconfig.json |
+| C/C++ | CMake 构建与 CTest，或项目声明的构建与运行契约 |
+| Web | HTML 与链接、HTTP 页面、Chromium 及已声明的交互流程 |
+| 交付物 | ZIP、wheel、Tar/Gzip 完整性与成员校验，wheel RECORD 哈希校验 |
 
-FAIL 时返回 `isError: true` —— 调用方不会被「静默通过」骗过去。
+适用的动态检查使用环境已安装的工具。可使用 VERIFY_TEST_PYTHON 指定可信 Python 解释器，使用 VERIFY_PLAYWRIGHT_ROOT 指定包含 node_modules/playwright 的目录，使用 PLAYWRIGHT_BROWSERS_PATH 指定浏览器缓存，使用 VERIFY_TSC 指定 TypeScript 编译器。验证进程保留一组工具链所需的环境变量，临时目录与用户配置目录按次分配。
 
-**第一次跑建议**：先让它检查它自己。
+## 项目规则
 
-```
-用 verify-helper 检查 /绝对路径/verify-helper，fast=true
-```
-
-能返回一屏 PASS/FAIL 表格，就说明接对了。
-
----
-
-## 工具栏按钮（可选，仅 DSH）
-
-如果你用 **DeepSeek Harness**，`plugin/` 里有一个把验证变成按钮的小插件：
-
-| 动作 | 结果 |
-|---|---|
-| 单击 | 填入「快速检查」请求 |
-| Shift + 单击 | 填入「完整检查」请求 |
-| 双击 | 撤销，恢复点击前的草稿 |
-
-它只把请求**写进输入框**（不自动发送），你改完按回车才跑。
-安装方式见 [`plugin/README.md`](plugin/README.md)。其他 MCP 客户端用不到这个 —— 它们没有输入框工具栏。
-
----
-
-## 检查项
-
-由 [`check_specs.py`](check_specs.py) 生成，代码与文档不会漂移：
-
-<!-- TABLE:START -->
-| 检查 | 风险 | 阻断 | 判定什么 | 不通过怎么改 |
-|---|---|:--:|---|---|
-| `syntax` | 高 | ✅ | 每个 .py / .js / .json / .toml 文件都要能被对应的解析器接受。 | 按报错的行号修掉；JS 可用 node --check 单文件复现。 |
-| `links` | 高 | ✅ | HTML 里的相对链接目标必须存在，页内与跨页锚点必须真实存在。 | 改链接指向真实文件，或补上被引用的 id；站点根绝对路径请用线上预览确认。 |
-| `html` | 高 | ✅ | 标签必须配平（无孤立闭合、无未闭合），同一页面 id 不得重复。 | 补齐缺失的闭合标签；重复 id 改名并同步修改引用它的锚点。 |
-| `secrets` | 严重 | ✅ | 源码与配置里不得出现真实凭据（API key、token、私钥、明文密码）。 | 立即吊销该凭据并改用环境变量；已提交历史也需清理。 |
-| `encoding` | 高 | ✅ | 文本文件必须是合法 UTF-8（UTF-16 与 GBK 会被 Windows 工具链悄悄弄坏）。 | 转存为 UTF-8（无 BOM）；批量转换时注意先备份。 |
-| `tests` | 高 | ✅ | 项目自带的测试套件必须真的跑起来并通过（以退出码为准）。 | 先修失败的用例。判定「有没有测试入口」的顺序：package.json 的 scripts.test → pytest 配置或用例 → tests/ 或 test/ 目录 → 根目录 test_*.py。都没有就记 UNKNOWN；补一个冒烟测试，比假装验过强。 |
-| `runtime-web` | 高 | ✅ | 静态站点的每个页面通过 HTTP 请求都必须返回 200（大小写、路径层级只有这一层能验出来）。 | 核对文件实际路径与链接大小写；确认站点根目录正确。 |
-| `browser` | 高 | ✅ | 用真实浏览器打开每个页面，抓 JS 未捕获异常、console.error 与资源 404（需要本机装有 playwright）。 | 按报错栈修脚本；资源 404 通常是路径或大小写写错。 |
-| `interaction` | 高 | ✅ | 按 verify.toml 的 [[flows]] 真的去点、填、选，再断言结果；未捕获异常一律算失败（需要 playwright）。 | 修失败的那一步：选择器写错就改选择器，点了没反应就查脚本。 |
-| `a11y` | 低 | — | img 有 alt、单页一个 h1、有 title 与 lang、target=_blank 带 rel=noopener。 | 补 alt / 调整标题层级 / 加 lang；外链加 rel="noopener"。 |
-| `bom` | 低 | — | 文件开头不应有 UTF-8 BOM（会让 CSS/JS 首行规则失效、diff 多一个隐形字符）。 | 用编辑器或脚本去掉开头的 EF BB BF 三字节。 |
-| `paths` | 低 | — | 代码与文档里不应写死本机绝对路径（发布时会泄漏用户名与目录结构）。 | 改成相对路径或环境变量。 |
-| `imports` | 低 | — | Python 里导入了却没用到的名字（会拖慢启动、掩盖真实依赖）。 | 删掉未使用的 import；若是再导出，加进 __all__ 或用 # noqa 说明。 |
-| `todos` | 低 | — | 代码里 TODO / FIXME 的数量（只报告，不判定对错）。 | 要么做完，要么改成 issue 编号。 |
-| `custom` | 中 | — | 项目 verify.toml 里声明的正则规则（规则即数据，不用改引擎）。 | 按规则里写的 message 修改。 |
-| `mutation` | 中 | — | 把改动行里的运算符/布尔值改坏，重跑测试：测试还能通过，说明这行没有有效断言（opt-in，默认不跑）。 | 给这些行补上真正会失败的断言，或删掉死代码。 |
-| `git` | 低 | — | 工作区是否有未提交改动（默认不参与总判定）。 | 确认这些改动是有意保留的，或提交/ stash 掉。 |
-<!-- TABLE:END -->
-
-**风险等级决定阻不阻断**：`严重` / `高` → 阻断（FAIL 会让总判定失败）；`中` / `低` → 只报告。
-
----
-
-## 三态规则
-
-```
-PASS    检查跑了，且通过
-FAIL    检查跑了，且不通过
-UNKNOWN 没跑 / 跑不了 / 判不了 —— 永远不许当 PASS
-```
-
-另有一个 `applicable` 标志：项目里根本没有这类文件时（比如没有 HTML 却要查链接），
-记 `UNKNOWN + applicable=false`，它**不参与总判定** —— 那是「不适用」，不是「判不了」。
-
-总判定：
-
-```
-有阻断项 FAIL        → FAIL
-否则有阻断项 UNKNOWN  → UNKNOWN
-否则有阻断项 PASS     → PASS
-只跑了非阻断检查      → UNKNOWN，并说明原因
-```
-
-这条规则的理论依据是测试领域的 **oracle 问题**：没有判定标准，跑再多遍也证明不了正确。
-
-v1.10.6 起还有一条写死的细则：`tests` 里出现 `Ran N tests` 且 `skipped ≥ N`（所有用例
-都被跳过）→ **UNKNOWN**，不是 PASS —— 退出码 0 只说明「没报错」，不说明「验到了」。
-
-v1.10.8 起，闸门也只认**阻断档检查**给出的 PASS/FAIL：只跑 `bom` / `paths` 这类提示级
-检查时，结论是 UNKNOWN（此前会被闸门算成 PASS，属于假绿）。
-
----
-
-## 基线差分：这次比上次多了什么
-
-```bash
-python verify_core.py . --baseline save     # 存一份当前状态
-# ……改代码……
-python verify_core.py . --baseline check    # 与上次比
-```
-
-输出会多一段：
-
-```
-与基线相比：新增 1 条问题
-  + [syntax] broken.py:1 invalid syntax
-恶化的检查：syntax
-```
-
-指纹用「文件 + 消息」的哈希，所以**行号漂移不会误报**。基线文件是项目根的
-`.verify-baseline.json`，建议加进 `.gitignore`。
-
-## 变异门：测试到底有没有断言
-
-覆盖率只说明「代码被执行到了」，不说明「断言有效」。变异门会把你的代码改坏，
-再看测试能不能发现：
-
-```bash
-python verify_core.py . --checks mutation
-```
-
-```
-⚠ 变异门（中·仅提示） — 试了 1 个变异，被杀 0，存活 1
-    · calc.py:2 把 + 改成 - 后测试仍然通过 —— 这行没有有效断言
-```
-
-规则：
-
-- **优先只打 git 改动行**（没有改动信息时退化为全文件扫描），最多 5 个变异，每个 90 秒超时 —— 全量变异在小项目上也跑不动；
-- 改完**立刻还原**源文件（`finally` 里还原，测试崩了也不会留坏代码）；
-- 默认不跑（不在默认检查集里），要显式 `--checks mutation`；
-- 没测试入口就记 UNKNOWN，不假装验过。
-
----
-
-## 每条失败项带「往哪修」
-
-报告里不只有「哪儿错了」，还有方向：
-
-```
-✗ 链接与锚点【高】 — 死链 1
-    · notes/papers.html:205 死链：advising-rules.js
-      方向：站点里没有 advising-rules.js 这个文件，但这一行在引用它 → 把这一行的引用改成
-            真实存在的文件；如果文件名是构建时改掉的，改构建脚本，别改生成出来的页面
-      别动：.verifyignore（加进去只是掩盖，不算修好） / 同页的其他链接
-      验证：verify_start(checks=[links]) 应 PASS（命令行 --checks links）
-```
-
-**为什么需要这个**：只说「改链接指向真实文件」，模型能选的做法太多 ——
-改链接？改文件名？建个空文件？删掉这页？加进 `.verifyignore`？
-**每条都能让检查变绿，但只有一条是对的。**
-
-### 四条硬规则
-
-方向不是随便写的，四道闸任一不过就**不写**（宁缺勿滥）：
-
-| 闸 | 要求 |
-|---|---|
-| 有证据 | 必须写出 `文件:行`，且真的出现在根因里 |
-| 可验证 | 必须有一条能跑的 `--checks <id>` 命令 |
-| 有边界 | 必须写明至少一条「不要动 X」 |
-| 最小 | 不许出现「重写整个文件」「删掉测试」「关掉检查」 |
-
-### 三种分类
-
-| 类 | 含义 | 产出 |
-|---|---|---|
-| **A** | 有公认正确做法（死链、BOM、编码、未用 import） | 完整的改法 |
-| **B** | 要你决定（凭据吊销、路径要不要改、h1 怎么排） | 只写「你要定什么」，**不给改法** |
-| **C** | 不该修（TODO 统计、git 状态） | 不给方向 |
-
-### 成本
-
-`0` 次额外检查、`0` 次额外调用、`< 1ms` / 条 —— **总时长不变**。
-通过的项一个字段都不加。
-
----
-
-## 交互测试：真的点一下
-
-`browser` 只证明「页面能打开」；**交互测试**证明「点了有反应」。
-
-在 `verify.toml` 写几条用户会走的路：
+在项目根放置 verify.toml。交互步骤与静态正则可参考 examples 下的配置。声明的运行命令需要返回退出码 0，并输出一行精确匹配的断言文本。
 
 ```toml
-[[flows]]
-name = "升学自检：切标签 + 空输入应给提示"
-steps = [
-  { goto   = "notes/advising/index.html" },
-  { click  = '[data-tab="report"]' },
-  { expect = { selector = '[data-tab="report"][aria-selected="true"]', visible = true } },
-  { fill   = '#targetAtar', value = '85' },
-  { expect = { selector = '#targetAtar', input_value = '85' } },
-  { click  = '#btnAtar' },
-  { expect = { selector = '#atarBox', text_contains = '门' } },
-  { expect = { no_console_error = true } },
-]
+[verification]
+mutation = false
+
+[[verification.contracts]]
+argv = ["python", "tests/verify_save_migration.py"]
+expect_output = "Save migration verified"
 ```
 
-```bash
-python verify_core.py . --checks interaction
-```
+交付约定可使用 [[verification.delivery]]，提供相对 path、sha256 与非空 members 列表。C/C++ 可以用 [verification.build] 与 [verification.runtime] 声明 argv 和 expect_output。
 
-```
-✓ 交互测试【高】 — 1 条流程，通过 1，失败 0（部署前缀 /ausmat-guide）  [2.68s]
-```
+## 裁决与证据
 
-失败时给到「第几步、什么动作、为什么」：
-
-```
-✗ 交互测试【高】 — 1 条流程，通过 0，失败 1
-    · 故意写错选择器:2 「故意写错选择器」第 2 步 点击 #btnAtarTYPO 失败：
-      page.click: Timeout 10000ms exceeded.
-  证据在 %TEMP%\vh-flow-fqatw16p（失败截图留在里面）
-```
-
-**动作**：`goto` / `click` / `fill` / `select` / `press` / `wait` / `expect`（每步一个）
-
-**断言**：`selector` + `visible` / `text_contains` / `input_value`；或 `url_contains`；
-或 `no_console_error`；都可加 `timeout`
-
-规则：
-
-- **流程执行期间出现未捕获异常 → 整条失败**，不用你写断言
-- 选择器写错会以「超时」报出来，不会静默通过
-- 断言状态用属性选择器最稳：`'[data-tab="report"][aria-selected="true"]'`
-- 需要 playwright；没有就记 UNKNOWN，不假装验过
-- `--fast` 会跳过它
-
-完整示例见 [`examples/verify-flows.toml`](examples/verify-flows.toml)。
-
----
-
-## 自定义规则（规则即数据）
-
-在项目根放 `verify.toml`，不改引擎就能加检查：
-
-```toml
-[[rules]]
-id = "no-console-log"
-pattern = 'console\.log\('
-paths = ["**/*.js", "**/*.mjs"]
-message = "生产代码里不要留 console.log"
-risk = "medium"          # medium/low 只报告；high/critical 会让总判定 FAIL
-
-[[rules]]
-id = "no-http"
-pattern = 'src="http://'
-paths = ["**/*.html"]
-message = "站内资源不要用 http://"
-risk = "high"
-```
-
-## 排除文件
-
-`.verifyignore`（一行一个 glob，`#` 注释），用来排除模板片段、页面快照、示例代码：
-
-```
-src/current-index.html
-templates/**/*.html
-```
-
-**按目录生效**，和 `.gitignore` 一样：子项目里放自己的 `.verifyignore`，
-从父目录扫整个工作区时它同样有效。
-
-## 工作区会被提醒
-
-如果一个目录下面识别到 ≥3 个子项目，报告里会明说：
-
-```
-注意：这看起来是**工作区**（识别到 4 个子项目）。工具不会替你挑项目，
-     草稿、备份、资料都会被算进来。建议对单个项目跑，或先写 .verifyignore。
-```
-
-它**不会**替你猜哪个是项目 —— 猜错就会漏验。提醒你，但不替你做决定。
-
----
-
-## SARIF 与 GitHub Code Scanning
-
-```bash
-python verify_core.py . --sarif verify.sarif
-```
-
-上传后，每条告警会直接出现在 PR 的 diff 行内。工作流示例见
-[`examples/github-action.yml`](examples/github-action.yml)。
-
----
-
-## 性能
-
-不追求「全量」，追求「快到可以随手跑」：
-
-| 项目规模 | 检查项 | 耗时 |
-|---|---|---|
-| 53 个文件 | 15 项 | 0.03s |
-| 1,868 个文件 | 15 项 | 0.7s |
-| 11,470 个文件 | 15 项 | **6.1s** |
-
-> 本机实测（Windows / Python 3.14 / 纯 `.py` 语料，磁盘缓存已热）。表里是报告内的「总耗时」，
-> 不含解释器启动；同一份 11,470 文件的语料第一次跑（冷盘）约 12s。换成 HTML/JS/CSS 混合的
-> 真实站点，单位成本会不一样。
-
-做到这一点的四件事：
-
-1. **合并扫描** —— 密钥 / 路径 / TODO / 编码 / BOM 五项共用一次逐行遍历；
-2. **字面量预筛** —— 先在小写字节流里找 16 个标记（`sk-`、`password`、`TODO`…），一个都没有就完全不逐行扫；
-3. **共享读缓存** —— 一份文件被多个检查读，只读一次；
-4. **并行 + 缓存** —— 检查并行跑；`node --check` 结果按 `(mtime, size)` 缓存。
-
----
-
-## 设计取舍
-
-**保留的（我们的味道）**
-
-- 三态而不是两态：`UNKNOWN` 是一等公民。
-- 每条结论都带命令和退出码，可事后复核。
-- 中文优先，输出给人看，不给人猜。
-- 零第三方依赖，`git clone` 就能跑。
-
-**抄来的（别人的精华）**
-
-- 风险分级（OpenSSF Scorecard）：每项带 Critical/High/Medium/Low。
-- 修复建议（Scorecard）：每条规则都有 remediation。
-- SARIF（OASIS 标准）：结果能被 GitHub Code Scanning 直接消费。
-- 规则即数据（Semgrep）：`verify.toml` 让用户加检查不改引擎。
-- 配置生成文档（Scorecard）：README 的表格由 `check_specs.py` 生成。
-
-**明确不做的（别人的糟粕）**
-
-- ❌ 堆几百条规则 —— 规则越多越互相冲突，维护成本指数上升。
-- ❌ 把覆盖率当唯一指标 —— 覆盖率说明「执行到」，不说明「断言有效」。
-- ❌ 全量变异测试 —— 小项目也跑不动，只做静态 + 运行时。
-- ❌ 用 LLM 评审当唯一闸门 —— 没有 oracle，正好是本工具要解决的问题。
-
----
-
-## 局限（说清楚，不掩饰）
-
-- **浏览器层要自己备环境**：`browser` / `interaction` 需要本机有 `node` + `playwright`，没有就记 UNKNOWN，不假装验过。
-- **变异门范围很窄**：只支持 Python；最多 5 个变异，每个 90 秒超时；默认不跑，要 `--checks mutation`。
-- **JS 语法检查单次上限 120 个文件**，超出会如实写「另有 N 个未检查」，不假装查过。
-- **站点根绝对路径**（`/xxx`）离线不校验，只在报告里标注。
-- **测试解释器要对上**：Python 测试优先用项目自带 venv，也可以用 `DSH_TEST_PYTHON` 或项目根的
-  `.verify-python` 指定；解释器不对会整批跳过 —— 那记 UNKNOWN，不算 PASS。
-- **只做机械检查**：没有语义理解，也没有 LLM 评审；判断不了的一律 UNKNOWN。
-
----
-
-## 开发
-
-```bash
-python -m unittest discover -s tests -v     # 167 个单元测试
-python conformance.py                       # 48 项符合性断言（32 个项目夹具 + 输出契约）
-python verify_core.py . --fast              # 自己检查自己
-```
-
-两套测试分工不同：
-
-| | 单元测试（`tests/`） | 符合性测试（`conformance.py`） |
-|---|---|---|
-| 测什么 | 函数与规则的边界 | **喂一整个项目进去，结论对不对** |
-| 怎么造 | 临时目录里的最小 fixture | 自己生成 32 个小项目 |
-| 覆盖 | 解析、判定、渲染、MCP 协议 | 真阳性 / 假阳性抵抗 / 三态 / 刁难用例 / 输出契约 |
-| 退出码 | unittest 的 | 非 0 = 有回归 |
-
-`conformance.py` 的用例分六类：
-
-1. **干净项目不能被冤枉** —— 最简包、空目录、只有 README
-2. **每个检查抓到该抓的** —— 坏语法、死链、未闭合、假密钥、GBK、BOM、a11y、未用 import
-3. **假阳性抵抗** —— 占位符路径、别人的路径、单引号 `href`、`.verifyignore`、`build/`
-4. **三态规则** —— 只跑非阻断项 / 没源文件 / 拼错检查名，都必须是 UNKNOWN
-5. **刁难它** —— 外链、`mailto:`、`#锚点`、坏 TOML、CRLF、0 字节文件、
-   中文加空格文件名、非法 UTF-8、嵌套 ignore、3MB 大文件
-6. **输出契约** —— SARIF、`--json`、`--sarif`、幂等、方向卡四段、退出码语义（含 fail-closed）
-
-测试不依赖任何本机真实项目：所有 fixture 在临时目录里现造、跑完即删。
-
-## 许可证
-
-MIT
-
----
-
-## 分层闸门（v1.9）
-
-v1.9 之前，它只是一次性跑完默认那批检查、给一个 PASS/FAIL/UNKNOWN。
-现在多了**生命周期语义**：这一轮属于哪层、这次改动多危险、哪些问题被谁回应了。
-
-### 1. 分层：`--stage`
-
-| 层 | 该拦什么 | 跑哪些检查 |
-|---|---|---|
-| `precommit` | 秒级反馈，挂 git hook | syntax / encoding / bom / secrets / imports / paths / todos / custom |
-| `pr` | 完整静态 + 运行时 | 默认 15 项（不含 mutation / git） |
-| `merge` | 与目标分支组合后全量再跑 | 默认 15 项（不含 mutation / git；配 `--against main`） |
-| `postdeploy` | 只验线上行为 | runtime-web / browser / interaction / tests |
-
-```bash
-python verify_core.py . --stage precommit      # 提交前，亚秒级
-python verify_core.py . --stage pr             # PR
-python verify_core.py . --stage merge --against main   # 合并队列
-```
-
-### 2. 风险档：`--tier auto`
-
-**由变更决定，不由项目决定**。命中敏感路径（auth/、billing/、.github/workflows/、
-migrations/、installer、*.pem…）或改动 ≥400 行 / ≥25 文件 → `high`（要 2 人）；
-≥60 行或 ≥6 文件 → `medium`（1 人）；其余 `low`（0 人）。
-
-### 3. 每条 finding 必须被回应
-
-```bash
-# 修掉，或者写理由接受（会落盘到 .verify-accept.json，可入库、可审计）
-python verify_core.py . --accept "bom:a.py:1:3c7f56dfc6::构建会重新生成，已确认"
-```
-- **凭据类（secrets）永远不接受**，必须真修。
-- 未回应项只在**阻断档检查**（严重 / 高）上卡判定；中风险（比如 `custom` 规则命中）
-  会报出来，但不会把总判定压成 FAIL；低风险只提示（避免噪声把人逼到无视它）。
-
-### 4. 噪声与收敛
-
-每轮记录 finding 集合，算 `新增 / 重复 / 修好`；**连续三轮条数不变 → 判定收敛**，
-提示「剩下的要么接受要么改，不要再刷第 4 轮」。
-`--only-new` 可只看本轮新出现的问题。
-
-### 5. 回归集：`regression.toml`
-
-```toml
-[[case]]
-path = "src/app.py"
-check = "syntax"
-why = "曾经少个括号，整站白屏"
-```
-
-每次运行都会检查这些「出过事的路径」有没有被覆盖到、对应检查有没有真的跑到。
-
-### 6. 安全层
-
-在 `secrets` 之上再扫一遍危险调用（`shell=True`、`eval/exec`、`os.system`、
-明文 `http://`、关闭 TLS 校验…）。**只有凭据类（critical）直接阻塞**；
-高危项进入「未回应」清单，必须修或写理由接受。
-
-### 7. 证据留档
-
-失败 / 未知项的**命令、退出码、原始输出、findings** 落到
-`.verify-artifacts/<时间戳>/`（只保留最近 20 次）；带证据文件的 PASS 项（比如浏览器截图）
-也一起留档。报告里给目录与文件数 —— 下一个人不用重跑，也不用相信"我看过了"。
-
-### 8. REVIEW.md
-
-仓库可以放一份 `REVIEW.md` 告诉检查器这个仓库的规矩：
-
-```
-skip: drafts/**, legacy/**
-no-style: true          # 只关 a11y 这类纯风格项
-require-evidence: true  # 没有 file:line 的 finding 直接丢
-max-nits: 2
-security-skip: vendor/**  # 安全层豁免（比逐条接受干净）
-```
-
-### 9. 度量
-
-报告里带 `metrics`：`unknown_rate`（缺 oracle 的比例）、
-`needs_human_eyes`（需要人看的条数，用来代理"人的时间"）、
-`noise_new/repeat/fixed`、`slowest` 三项。
-
-### 10. MCP 工具
-
-新增 `verify_accept`（list / add / clear），`verify_start` 的 schema 也带上了
-`stage / tier / accept / only_new / against / artifacts / review_md`。
-
----
-
-## 噪声治理（v1.10）
-
-真实工作区（2240 文件 / 15 个子项目 / 51 条安全发现）跑出来的四个毛病，这一版修掉：
-
-| 毛病 | 之前 | 现在 |
-|---|---|---|
-| 备份目录重复扫 | `my-site.backup-*/` 与正本各报一遍 | **默认跳过**，notes 里说明 |
-| 同类问题铺满屏 | 「51 条高危发现」 | 「51 条 / **3 类**」+ 每类前 2 个位置 + 处理建议 |
-| 不知道噪声哪来的 | 「未回应 32 条」 | 「未回应来源：security 23、paths 5、imports 3、bom 1」 |
-| 工作区看不出该验谁 | 只给一个总判定 | **工作区画像**：每个子项目的文件数、有无测试入口、是否 git |
-
-```bash
-python verify_core.py <工作区>                        # 看画像 → 挑子项目
-python verify_core.py <工作区>/dsh-bili-whale          # 对单项目下结论
-python verify_core.py <项目> --artifacts-dir ../.vh   # 证据不落项目树
-```
+每次运行的 UUID 对应一个证据目录，默认位于项目的 .verify-artifacts。report.json 包含项目提交、源快照 SHA-256、检查计划、各项状态、证据文件摘要及总裁决。已执行的页面、测试和命令覆盖可以在对应检查中核对。results.sarif 用于代码扫描服务。缺少必检项、写证据失败或只执行部分用例会阻止 PASS。PASS 表示当前验证计划已执行并通过，发布验证另有跨平台和独立审计要求。
