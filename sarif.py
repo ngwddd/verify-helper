@@ -115,6 +115,9 @@ def to_sarif(report: dict, version: str = "1.1.0") -> dict:
             r["ruleIndex"] = index.get(c["id"], 0)
             results.append(r)
 
+    invocation = {"executionSuccessful": report.get("verdict") != "FAIL"}
+    if report.get("started"):
+        invocation["endTimeUtc"] = report["started"] + "Z"
     run = {
         "tool": {"driver": {
             "name": TOOL_NAME,
@@ -123,10 +126,7 @@ def to_sarif(report: dict, version: str = "1.1.0") -> dict:
             "rules": [_rule(s) for s in used],
         }},
         "results": results,
-        "invocations": [{
-            "executionSuccessful": report.get("verdict") != "FAIL",
-            "endTimeUtc": report.get("started", "") + "Z",
-        }],
+        "invocations": [invocation],
         "properties": {
             "verdict": report.get("verdict"),
             "files": report.get("files"),

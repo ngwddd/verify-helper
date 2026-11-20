@@ -36,6 +36,7 @@ import os
 from pathlib import Path
 assert Path('allowed.txt').read_text() == 'snapshot-input'
 assert not Path({str(sentinel)!r}).exists()
+assert not Path('/proc/1/root' + {str(sentinel)!r}).exists()
 assert not Path('/var/run/docker.sock').exists()
 assert 'VH_FIXTURE_PRIVATE' not in os.environ
 assert os.geteuid() == 65532
@@ -59,6 +60,13 @@ assert not Path('/proc/net/route').read_text().splitlines()[1:]
 assert not any('proxy' in name.lower() for name in os.environ)
 with socket.socket() as client:
     assert client.connect_ex(('127.0.0.1', {port})) != 0
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+    try:
+        client.connect(('192.0.2.1', 53))
+    except OSError:
+        pass
+    else:
+        raise AssertionError('Unexpected IPv4 DNS route')
 with socket.socket(socket.AF_INET6) as client:
     client.settimeout(1)
     try:
@@ -67,6 +75,22 @@ with socket.socket(socket.AF_INET6) as client:
         pass
     else:
         raise AssertionError('Unexpected IPv6 route')
+""")
+        self.assertEqual(code, 0)
+
+    def test_root_is_read_only_and_temporary_paths_are_writable(self):
+        code = self.protected("""
+import errno
+from pathlib import Path
+assert Path('/tmp').is_dir()
+Path('/tmp/local-test').write_text('ok')
+Path('workspace-test').write_text('ok')
+try:
+    Path('/etc/hosts').write_text('fixture')
+except OSError as error:
+    assert error.errno in (errno.EACCES, errno.EROFS)
+else:
+    raise AssertionError('System file is writable')
 """)
         self.assertEqual(code, 0)
 
@@ -79,6 +103,12 @@ with socket.socket(socket.AF_INET6) as client:
 
         with self.assertRaisesRegex(BoundaryUnavailable, "cancelled"):
             self.protected("import time; time.sleep(60)", cancelled)
+        self.assertEqual(self.containers(), baseline)
+
+    def test_timeout_removes_container(self):
+        baseline = self.containers()
+        with self.assertRaises(BoundaryUnavailable):
+            self.protected("import time; time.sleep(60)")
         self.assertEqual(self.containers(), baseline)
 
     @staticmethod

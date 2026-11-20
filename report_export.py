@@ -55,11 +55,15 @@ def mcp_report(report: dict, run_id: str, version: str) -> dict:
             row.update(evidence_ref=receipt, evidence_sha256=digest)
     status = report.get("status")
     verdict = report.get("verdict")
-    public.update(run_id=run_id, status=status if status in {"COMPLETED", "CANCELLED", "ERROR"} else "ERROR",
+    public.update(schema_version=2, run_id=run_id, version=version,
+                  status=status if status in {"COMPLETED", "CANCELLED", "ERROR"} else "ERROR",
                   verdict=verdict if verdict in VERDICTS else "UNKNOWN")
-    value = report.get("snapshot_sha256")
-    if isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value):
-        public["snapshot_sha256"] = value
+    for key, pattern in (("policy_digest", r"sha256:[a-f0-9]{64}"), ("snapshot_sha256", r"[a-f0-9]{64}")):
+        value = report.get(key)
+        if isinstance(value, str) and re.fullmatch(pattern, value):
+            public[key] = value
+    if report.get("evidence_manifest") == "manifest.json":
+        public["evidence_manifest"] = "manifest.json"
     set_gate_fields(public)
     public["releasable"] = public["releasable"] and report.get("releasable") is True
     public["sarif"] = sarif.to_sarif(public, version)

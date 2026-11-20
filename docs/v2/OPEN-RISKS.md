@@ -2,7 +2,7 @@
 
 | Item | Status | Required evidence |
 |---|---|---|
-| OS-level and network containment | OPEN | Chromium preview routing is restricted to the preview origin. Untrusted execution remains disabled. A verified host sandbox and independent evidence writer are still required. |
+| OS-level and network containment | PARTIAL | The RC3 branch adds a Linux-only offline container candidate. Windows guest isolation and independent security acceptance remain open. See [RC3 security evidence](RC3-SECURITY.md). |
 | Cancellation of detached descendants | PARTIAL | Windows Job Object cleanup is verified. Detached POSIX descendants remain outside the tested guarantee. |
 | Repository trial runs | NOT_RUN | Obtain explicit per-repository authorization and isolated environments. |
 | Client matrix | PARTIAL | Official Python SDK and independent TypeScript SDK 1.27.1 exercised. Desktop Agent evidence is still required. |

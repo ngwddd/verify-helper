@@ -83,3 +83,13 @@ class TestProtectedVerification(unittest.TestCase):
             with self.assertRaises(BoundaryUnavailable):
                 run_isolated(self.source, Path("."), ["/usr/local/bin/python"], "python:latest", lambda: False)
             launch.assert_not_called()
+
+    def test_snapshot_omits_hardlink_to_host_file(self):
+        witness = self.base / "host-witness"
+        witness.write_text("synthetic private hardlink target", encoding="utf-8")
+        os.link(witness, self.source / "alias.txt")
+        (self.source / "app.py").write_text("value = 1\n", encoding="utf-8")
+        report = self.run_protected()
+        self.assertEqual(report["verdict"], "UNKNOWN")
+        self.assertIn("Source snapshot contains omitted or changed entries", report["blockers"])
+        self.assertNotIn("alias.txt", json.dumps(report))
