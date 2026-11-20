@@ -19,7 +19,7 @@ PUBLIC_CHECKS = frozenset(check_specs.ordered_ids()) | {
 }
 
 
-def project_receipts(report: dict) -> dict:
+def project_receipts(report: dict, *, locations: dict | None = None) -> dict:
     """Build exportable receipts without project filenames, diagnostics, or media."""
     checks = report["checks"]
     plan = report["plan"]
@@ -46,6 +46,8 @@ def project_receipts(report: dict) -> dict:
                 file, line = finding.get("file"), finding.get("line")
                 if isinstance(file, str) and type(line) is int and 0 < line <= 1_000_000:
                     alias = aliases.setdefault(file, f"source-{len(aliases) + 1:03}")
+                    if locations is not None:
+                        locations[alias] = file
                     findings.append({"file": alias, "line": line,
                                      "message": "SOURCE_SYNTAX_INVALID"})
             if findings:

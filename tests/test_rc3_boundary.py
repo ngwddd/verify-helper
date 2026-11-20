@@ -12,7 +12,7 @@ from full_verify import full_verify
 from isolated_runtime import IMAGE_VARIABLE, BoundaryUnavailable, run_isolated
 from private_storage import require_private
 from report_export import mcp_report
-from run_evidence import digest, json_bytes, read_evidence
+from run_evidence import digest, json_bytes, read_evidence, resolve_local_finding
 
 
 class TestProtectedVerification(unittest.TestCase):
@@ -211,3 +211,16 @@ class TestProtectedVerification(unittest.TestCase):
         self.assertEqual(custom["state"], "FAIL")
         self.assertEqual(custom["reason_code"], "CUSTOM_RULE_BUDGET_EXCEEDED")
         self.assertEqual(custom["coverage"], {"planned": 1, "observed": 0, "skipped": 0})
+
+    def test_local_finding_alias_requires_an_intact_opt_in_index(self):
+        file_name = "synthetic-private-filename.py"
+        (self.source / file_name).write_text("bad syntax @\n", encoding="utf-8")
+        report = self.run_protected(local_locations=True)
+        archive = self.output / report["run_id"]
+        locations = archive / "locations.json"
+        require_private(locations)
+        self.assertNotIn(file_name, json.dumps(report))
+        self.assertEqual(file_name, resolve_local_finding(archive, "source-001"))
+        locations.write_text('{"source-001":"replacement.py"}', encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "digest mismatch"):
+            resolve_local_finding(archive, "source-001")

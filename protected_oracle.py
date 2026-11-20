@@ -16,7 +16,7 @@ POLICY_LIMIT = 128 * 1024
 
 
 def load(path: Path, project: Path, snapshot_digest: str):
-    if not path.is_absolute() or path.resolve(strict=True).is_relative_to(project):
+    if not path.is_absolute() or path.resolve(strict=True) != path or path.is_relative_to(project):
         raise ValueError("Oracle policy must be outside the project")
     require_private(path)
     with path.open("rb") as stream:

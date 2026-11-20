@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 from pathlib import Path
 from private_storage import private_write, require_private
 
@@ -60,7 +61,7 @@ def set_gate_fields(report: dict) -> None:
     report["coverage"] = counts
     report["releasable"] = (
         verdict == "PASS" and report["status"] == "COMPLETED"
-        and report.get("security_status", "ENFORCED") == "ENFORCED"
+        and report.get("security_status") == "ENFORCED"
         and report.get("mode") != "unsafe-local"
     )
 
@@ -68,6 +69,11 @@ def set_gate_fields(report: dict) -> None:
 def write_manifest(report: dict, output: Path, *, key: bytes | None = None) -> None:
     report["evidence_manifest"] = "manifest.json"
     records = {"results.sarif": digest((output / "results.sarif").read_bytes())}
+    if report.get("local_finding_index") is True:
+        locations = output / "locations.json"
+        require_private(locations)
+        report["local_finding_index_sha256"] = digest(locations.read_bytes())
+        records[locations.name] = report["local_finding_index_sha256"]
     for row in report["checks"]:
         if row.get("evidence_sha256"):
             records[row["evidence_ref"]] = row["evidence_sha256"]
@@ -111,6 +117,10 @@ def read_evidence(output: Path, *, key: bytes | None = None) -> dict:
     if digest(body) != records["report.json"]:
         raise ValueError("Evidence report changed while it was being read")
     report = json.loads(body)
+    if report.get("local_finding_index") is True and (
+            not records.get("locations.json") or
+            records["locations.json"] != report.get("local_finding_index_sha256")):
+        raise ValueError("Local finding index is missing from the manifest")
     if (report["run_id"] != manifest["run_id"] or report.get("snapshot_sha256") != manifest["snapshot_sha256"]
             or report["policy_digest"] != manifest["policy_digest"]):
         raise ValueError("Evidence manifest is bound to a different run")
@@ -126,3 +136,18 @@ def read_evidence(output: Path, *, key: bytes | None = None) -> dict:
             if records.get(media["path"]) != media["sha256"]:
                 raise ValueError("Media receipt is missing from the manifest")
     return report
+
+
+def resolve_local_finding(output: Path, alias: str) -> str:
+    if not re.fullmatch(r"source-[0-9]{3}", alias):
+        raise ValueError("Invalid source alias")
+    report = read_evidence(output)
+    pointer = output / "locations.json"
+    if report.get("local_finding_index") is not True:
+        raise ValueError("Local finding index was not requested")
+    require_private(pointer)
+    data = pointer.read_bytes()
+    if digest(data) != report["local_finding_index_sha256"]:
+        raise ValueError("Local finding index did not match the manifest")
+    location = json.loads(data)[alias]
+    return location

@@ -26,7 +26,7 @@ import verification_adapters as adapters
 import verify_core as core
 from process_boundary import contain_worker
 from private_storage import private_directory, private_write
-from run_evidence import digest as evidence_digest, plan_digest, read_evidence, set_gate_fields, write_manifest
+from run_evidence import digest as evidence_digest, plan_digest, read_evidence, resolve_local_finding, set_gate_fields, write_manifest
 
 SCHEMA_VERSION = 2
 DYNAMIC = {"tests", "browser", "interaction", "mutation", "runtime-web"}
@@ -103,10 +103,12 @@ def _protected_copy(source: Path, relative: Path, destination: Path, expected) -
         _copy_open_file(fd, destination, expected)
 
 
-def _snapshot(source: Path, destination: Path, *, protected: bool = False) -> tuple[str, list[str]]:
+def _snapshot(source: Path, destination: Path, *, protected: bool = False,
+              inventory: dict | None = None) -> tuple[str, list[str]]:
     digest = hashlib.sha256()
     omitted = []
     total = 0
+    counts = {"included_files": 0, "fixed_exclusions": 0, "private_exclusions": 0, "unsafe_or_changed": 0}
 
     def walk_error(error):
         raise error
@@ -115,6 +117,7 @@ def _snapshot(source: Path, destination: Path, *, protected: bool = False) -> tu
         current = Path(folder)
         relative = current.relative_to(source)
         (destination / relative).mkdir(parents=True, exist_ok=True)
+        counts["fixed_exclusions"] += sum(name.lower() in SNAPSHOT_EXCLUDES for name in [*dirs, *files])
         dirs[:] = sorted(name for name in dirs if name.lower() not in SNAPSHOT_EXCLUDES)
         for name in [*dirs, *sorted(files)]:
             if name.lower() in SNAPSHOT_EXCLUDES:
@@ -124,6 +127,7 @@ def _snapshot(source: Path, destination: Path, *, protected: bool = False) -> tu
             display = (relative / name).as_posix()
             private = protected and (name.lower() in PRIVATE_INPUTS or name.lower().startswith(".env."))
             if private or stat.S_ISLNK(entry.st_mode) or getattr(entry, "st_file_attributes", 0) & 1024:
+                counts["private_exclusions" if private else "unsafe_or_changed"] += 1
                 omitted.append(display)
                 if name in dirs:
                     dirs.remove(name)
@@ -134,6 +138,7 @@ def _snapshot(source: Path, destination: Path, *, protected: bool = False) -> tu
             if total > 1024 ** 3:
                 raise ValueError("Snapshot exceeds the 1 GiB verification limit")
             if not stat.S_ISREG(entry.st_mode) or (protected and entry.st_nlink != 1):
+                counts["unsafe_or_changed"] += 1
                 omitted.append(display)
                 continue
             copied = destination / relative / name
@@ -146,8 +151,12 @@ def _snapshot(source: Path, destination: Path, *, protected: bool = False) -> tu
             latest = path.lstat()
             if (entry.st_mode, entry.st_size, entry.st_mtime_ns, entry.st_ino) != (
                     latest.st_mode, latest.st_size, latest.st_mtime_ns, latest.st_ino):
+                counts["unsafe_or_changed"] += 1
                 omitted.append(display)
             digest.update(json.dumps([display, checksum], ensure_ascii=True).encode())
+            counts["included_files"] += 1
+    if inventory is not None:
+        inventory.update(counts)
     return digest.hexdigest(), omitted
 
 
@@ -389,11 +398,16 @@ def _isolated_unittest(root: Path, scope: Path, identifier: str, image: str) -> 
 
 
 def _worker(root: Path, trusted: bool, result_path: Path, policy_required: tuple[str, ...] = (),
-            sandbox_image: str | None = None, sealed: bool = False, oracle_path: Path | None = None) -> None:
+            sandbox_image: str | None = None, sealed: bool = False, oracle_path: Path | None = None,
+            local_locations: bool = False) -> None:
     oracle_policy = json.loads(oracle_path.read_bytes()) if oracle_path is not None else None
     report = _run_plan(root, trusted, policy_required, sandbox_image, oracle_policy)
     if sealed:
-        result_path.write_text(json.dumps(report_export.project_receipts(report)), encoding="utf-8")
+        locations = {} if local_locations else None
+        public = report_export.project_receipts(report, locations=locations)
+        if locations:
+            private_write(result_path.with_name("locations.json"), json.dumps(locations).encode())
+        result_path.write_text(json.dumps(public), encoding="utf-8")
         return
     for row in report["checks"]:
         evidence = row.get("evidence") or {}
@@ -499,7 +513,8 @@ class MergeConflict(ValueError):
 def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir: Path | None = None,
                 against: str | None = None, revision: str | None = None,
                 policy_path: Path | None = None, run_id: str | None = None, cancellation=None,
-                sealed: bool = False, evidence_key: bytes | None = None, progress=None) -> dict:
+                sealed: bool = False, evidence_key: bytes | None = None, progress=None,
+                local_locations: bool = False) -> dict:
     root = Path(project).expanduser().resolve()
     run_id = run_id or uuid.uuid4().hex
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", run_id):
@@ -507,6 +522,7 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
     image = os.environ.get(isolated_runtime.IMAGE_VARIABLE)
     host_execution = unsafe_local and not sealed and evidence_key is None
     sealed = not host_execution
+    local_locations = local_locations and sealed and evidence_key is None
     sandbox_image = None if host_execution else image
     context = {"schema_version": SCHEMA_VERSION, "run_id": run_id, "version": core.VERSION,
                "mode": "unsafe-local" if host_execution else "full", "isolation": "linux-container-candidate" if sandbox_image is not None
@@ -547,7 +563,8 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
                     raise ValueError("Merge verification requires a clean Git worktree")
                 source, merge = _merge_snapshot(root, against, work)
                 context["merge"] = merge
-            digest, omitted = _snapshot(source, snapshot, protected=not host_execution)
+            inventory = {}
+            digest, omitted = _snapshot(source, snapshot, protected=not host_execution, inventory=inventory)
             config = snapshot / "verify.toml"
             policy_material = {"engine": core.VERSION, "trusted": host_execution,
                                "sandbox_image": image if image and isolated_runtime.IMAGE_ID.fullmatch(image) else None,
@@ -603,12 +620,13 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
                             "from pathlib import Path; from full_verify import _wait_for_launch,_worker; "
                             "_wait_for_launch(Path(sys.argv[6])); "
                             "_worker(Path(sys.argv[2]),sys.argv[3]=='True',Path(sys.argv[4]),json.loads(sys.argv[5]),"
-                            "json.loads(sys.argv[7]),sys.argv[8]=='True', Path(sys.argv[9]) if sys.argv[9] else None)",
+                            "json.loads(sys.argv[7]),sys.argv[8]=='True', Path(sys.argv[9]) if sys.argv[9] else None,"
+                            "sys.argv[10]=='True')",
                             str(Path(__file__).resolve().parent), str(snapshot),
                             str(host_execution or sandbox_image is not None), str(result_path),
                             json.dumps(policy_required), str(launch),
                             json.dumps("" if omitted and sandbox_image is not None else sandbox_image), str(sealed),
-                            str(oracle_path) if oracle_path is not None else ""],
+                            str(oracle_path) if oracle_path is not None else "", str(local_locations)],
                            cwd=work, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            start_new_session=os.name != "nt",
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))
@@ -629,6 +647,7 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
                     raise subprocess.CalledProcessError(worker.returncode, worker.args)
             report.update(json.loads(result_path.read_text(encoding="utf-8")))
             report.update(context, snapshot_sha256=digest)
+            report["snapshot_inventory"] = inventory
             if not sealed:
                 report.update(git=git, omitted=omitted)
             if omitted:
@@ -649,6 +668,10 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
                 report["evidence_dir"] = str(run_output)
                 report = scrub(report)
             _record_checks(report, run_output, work)
+            location_data = work / "locations.json"
+            if local_locations and location_data.is_file():
+                private_write(run_output / location_data.name, location_data.read_bytes())
+                report["local_finding_index"] = True
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         if isinstance(error, MergeConflict):
             report["merge_conflict"] = True
@@ -708,6 +731,17 @@ def main(argv=None) -> int:
         from server import main as serve
         serve(argv[1:])
         return 0
+    if argv and argv[0] == "resolve-finding":
+        resolver = argparse.ArgumentParser(prog="verify-helper resolve-finding")
+        resolver.add_argument("run_directory", type=Path)
+        resolver.add_argument("source_alias")
+        options = resolver.parse_args(argv[1:])
+        try:
+            print(json.dumps({"relative_path": resolve_local_finding(options.run_directory, options.source_alias)},
+                             ensure_ascii=False))
+        except (OSError, ValueError, KeyError, TypeError):
+            resolver.error("The local finding could not be verified")
+        return 0
     unsafe = bool(argv and argv[0] == "unsafe-local-run")
     if argv and argv[0] in {"run", "unsafe-local-run"}:
         argv.pop(0)
@@ -722,6 +756,8 @@ def main(argv=None) -> int:
     parser.add_argument("--json", nargs="?", const="-", metavar="FILE")
     parser.add_argument("--sarif", type=Path)
     parser.add_argument("--list-checks", action="store_true")
+    parser.add_argument("--local-finding-index", action="store_true",
+                        help="Keep an authenticated-by-manifest source index in the local evidence directory")
     options = parser.parse_args(argv)
     if options.list_checks:
         print(core.list_checks_text())
@@ -730,7 +766,8 @@ def main(argv=None) -> int:
         parser.error("project is required")
     report = full_verify(options.project, unsafe_local=unsafe,
                          evidence_dir=options.evidence_dir, against=options.against,
-                         revision=options.revision, policy_path=options.policy_path)
+                         revision=options.revision, policy_path=options.policy_path,
+                         local_locations=options.local_finding_index)
     if options.sarif:
         private_write(options.sarif, json.dumps(report["sarif"]).encode())
     if options.json:

@@ -43,7 +43,7 @@ import shutil
 import time
 from pathlib import Path
 
-VERSION = "2.0.0rc4"
+VERSION = "2.0.0rc5.dev0"
 
 # ───────────────────────────── ① 分层 ─────────────────────────────
 # 层不是「跑哪几项」这么简单，每层有它该拦的东西和该放的东西。

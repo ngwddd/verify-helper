@@ -44,7 +44,7 @@ import yaml
 import check_specs as S
 import directions as DIR
 
-VERSION = "2.0.0rc4"
+VERSION = "2.0.0rc5.dev0"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -1884,7 +1884,7 @@ def check_custom(root: Path, files: list[Path], ctx: "Ctx") -> Check:
         c.seconds = time.time() - t0
         return c
 
-    rules = data.get("rules") or []
+    rules = data.get("rules", [])
     if not isinstance(rules, list):
         c.state = "FAIL"
         c.findings = [{"file": "verify.toml", "line": 0, "message": "rules must be an array of tables"}]

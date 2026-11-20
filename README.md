@@ -1,5 +1,7 @@
 # Verify Helper
 
+[English](#english)
+
 Verify Helper 通过 CLI 或 MCP 对项目运行完整验证，输出 PASS、FAIL 或 UNKNOWN，并留下 JSON、SARIF 和逐项证据。当前分支使用 Python MCP SDK v2，支持 MCP 2026-07-28 以及 SDK 支持的旧协议。
 
 ## 安装与运行
@@ -11,16 +13,17 @@ uv sync --locked
 uv run verify-helper run /path/to/project --json report.json
 ```
 
-RC4 是 Linux 隔离执行有限预览。默认 CLI 和 MCP 采用受保护的报告出口；隔离或覆盖证据缺失时返回 UNKNOWN。退出码为 0（PASS）、1（FAIL）或 2（UNKNOWN）。跨平台正式版仍为 NO-GO。 [RC4 整改记录](docs/v2/RC4-AUDIT.md)
+RC4 是当前已发布的 Linux 有限预览，本分支是后续加固开发。默认 CLI 和 MCP 采用受保护的报告出口。证据不足时返回 UNKNOWN。退出码为 0（PASS）、1（FAIL）或 2（UNKNOWN）。跨平台正式版仍为 NO-GO。 [当前整改记录](docs/v2/FINAL-HARDENING.md)
 
 | 参数 | 用途 |
 |---|---|
 | unsafe-local-run PROJECT | 只用于手动调试已审查的自有项目。以宿主身份执行，结果不可发布。 |
-| --against main | 对干净 Git 工作树与指定提交的合并结果运行验证 |
+| --against main | 仅限显式本地调试。受保护模式仍缺 Git 合并运行器。 |
 | --evidence-dir PATH | 指定证据根目录 |
 | --json [FILE] | 把机器可读报告写入文件，省略文件时输出到标准输出 |
 | --sarif FILE | 另存 SARIF 2.1.0 报告 |
 | --list-checks | 显示可用检查 |
+| --local-finding-index | 仅为本机 CLI 在私有证据目录保存可校验的文件别名索引。 |
 
 ## MCP
 
@@ -51,7 +54,9 @@ HTTP 服务监听 127.0.0.1，在 /mcp 提供标准接口，拒绝外部 Origin�
 
 操作者可以用 `VERIFY_HELPER_SANDBOX_IMAGE=sha256:<本机镜像 ID>` 配置独立运行环境，服务为每次任务检验可用性。Docker 容器默认断网、无宿主映射并以非 root 运行，目前只调度标准库 unittest。管理员可用 `VERIFY_HELPER_SANDBOX_TIMEOUT_SECONDS` 设置单命令 5 至 180 秒的上限，默认为 60 秒。受保护模式不运行项目的宿主命令，也不采用项目自定义的 `.verifyignore`。目前 Git 修订、合并、其他动态适配器和不完整测试覆盖均保留 UNKNOWN。 [RC4 整改记录](docs/v2/RC4-AUDIT.md)
 
-## 适用检查
+## 适用检查与当前边界
+
+下表包含静态检查与显式本机调试的适配器。受保护的动态执行目前仅覆盖 Linux 标准库 unittest 试运行和操作者配置的 Python 黑盒行为检查。
 
 | 项目 | 验证范围 |
 |---|---|
@@ -89,3 +94,17 @@ expect_output = "Save migration verified"
 每次运行的 UUID 对应一个证据目录，默认位于用户的 `.verify-helper` 目录。report.json 记录源快照 SHA-256、策略与冻结计划摘要、覆盖率账本及裁决。受保护报告只导出允许的字段，项目诊断、路径、原始日志、截图和二进制附件留在出口之外。manifest.json 绑定报告、逐项收据与 SARIF。重取报告时会重新校验其摘要。缺少必检项、写证据失败或只执行部分用例会阻止 PASS。Windows Worker 使用 Job Object 收尾子进程，Windows 客户机隔离仍待验证。
 
 从 1.x 升级请参阅 [迁移指南](docs/MIGRATION-v1-to-v2.md)。
+
+启用 `--local-finding-index` 后，可在本机运行 `verify-helper resolve-finding RUN_DIRECTORY source-001` 查询相对文件路径。默认 CLI 和 MCP 报告只返回别名及行号。
+
+## English
+
+Verify Helper runs Full Verification through a CLI or MCP server and reports PASS, FAIL, or UNKNOWN with structured JSON, SARIF and local evidence. [RC4](https://github.com/ngwddd/verify-helper/releases/tag/v2.0.0-rc4) is the published limited Linux preview. This branch contains ongoing release hardening. [Audit status](docs/v2/FINAL-HARDENING.md)
+
+1. Install Python 3.11 or later, run `uv sync --locked`, then run `uv run verify-helper run /path/to/project --json`.
+2. Connect an MCP client using `verify-helper serve --transport stdio --workspace /path/to/project`. For loopback Streamable HTTP, configure `VERIFY_HTTP_BEARER_TOKEN` before starting the service.
+3. Call `verify_run_full`, retain the run ID and poll `verify_get_report`. The result includes applicable checks and evidence coverage.
+
+Protected execution prevents host fallback. On Linux, the operator can provision a fixed local Docker image with `VERIFY_HELPER_SANDBOX_IMAGE`. Current protected runtime coverage consists of standard-library unittest observations and optional externally approved Python behavior checks. Windows guest execution, protected Git merge verification, other dynamic adapters and full release attestation are pending. Exit codes are 0 for PASS, 1 for FAIL and 2 for UNKNOWN.
+
+The opt-in `--local-finding-index` retains a private source alias map for local troubleshooting. Use `verify-helper resolve-finding RUN_DIRECTORY source-001` to resolve an alias. The MCP response contains safe aliases and line numbers.

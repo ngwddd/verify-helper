@@ -193,6 +193,14 @@ else:
         authorize_snapshot()
         assert_run("FAIL", "FAIL", 2)
 
+    def test_behavior_output_observation_refuses_oversize_output(self):
+        baseline = self.containers()
+        command = ["/usr/local/bin/python", "-c", "print('x' * 20_000)"]
+        with self.assertRaisesRegex(BoundaryUnavailable, "observation budget"):
+            run_isolated(self.source, Path("."), command, self.image, lambda: False,
+                         expected_output=b"ordinary fixture\n")
+        self.assertEqual(self.containers(), baseline)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
