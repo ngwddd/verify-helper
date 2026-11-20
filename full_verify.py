@@ -487,9 +487,11 @@ class MergeConflict(ValueError):
 def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir: Path | None = None,
                 against: str | None = None, revision: str | None = None,
                 policy_path: Path | None = None, run_id: str | None = None, cancellation=None,
-                sealed: bool = False, evidence_key: bytes | None = None) -> dict:
+                sealed: bool = False, evidence_key: bytes | None = None, progress=None) -> dict:
     root = Path(project).expanduser().resolve()
     run_id = run_id or uuid.uuid4().hex
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", run_id):
+        raise ValueError("Invalid verification run ID")
     image = os.environ.get(isolated_runtime.IMAGE_VARIABLE)
     host_execution = unsafe_local and not sealed and evidence_key is None
     sealed = not host_execution
@@ -515,6 +517,8 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
     git = _source_git(root) if host_execution else {}
     run_output = None
     try:
+        if progress:
+            progress("SNAPSHOTTING")
         scratch = Path(os.environ.get("VERIFY_SCRATCH_DIRECTORY", tempfile.gettempdir())).resolve()
         if scratch.is_relative_to(root):
             raise ValueError("Scratch directory must be outside the project")
@@ -568,6 +572,8 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
                 if default.is_dir():
                     env["PLAYWRIGHT_BROWSERS_PATH"] = str(default)
             launch = work / "launch"
+            if progress:
+                progress("VERIFYING")
             with ExitStack() as stack:
                 worker = stack.enter_context(subprocess.Popen([sys.executable, "-I", "-c",
                             "import json,sys; sys.path.insert(0,sys.argv[1]); "
@@ -611,6 +617,8 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
                 report["blockers"].append("Verification was cancelled")
             if report.get("notes"):
                 report["notes"] = [note.replace(str(snapshot), str(root)) for note in report["notes"]]
+            if progress:
+                progress("SEALING")
             output = _evidence_root(evidence_dir or Path.home() / ".verify-helper" / "cli-runs")
             run_output = output / run_id
             if not sealed:

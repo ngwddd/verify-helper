@@ -190,3 +190,11 @@ class TestProtectedVerification(unittest.TestCase):
         self.assertEqual(report["verdict"], "PASS")
         self.assertEqual(report["mode"], "unsafe-local")
         self.assertFalse(report["releasable"])
+
+    def test_custom_rule_limits_are_reported_as_missing_coverage(self):
+        (self.source / "verify.toml").write_text('[[rules]]\npattern = "literal"\n', encoding="utf-8")
+        (self.source / "content.txt").write_text("x" * 33_000, encoding="utf-8")
+        report = self.run_protected()
+        custom = next(row for row in report["checks"] if row["id"] == "custom")
+        self.assertEqual(custom["state"], "UNKNOWN")
+        self.assertEqual(custom["reason_code"], "CUSTOM_RULE_BUDGET_EXCEEDED")

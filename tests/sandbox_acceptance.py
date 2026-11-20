@@ -138,6 +138,20 @@ else:
         for path in archive.iterdir():
             self.assertNotIn(marker.encode(), path.read_bytes())
 
+    def test_second_unprivileged_user_cannot_read_receipts(self):
+        self.base.chmod(0o755)
+        store = self.base / "receipts"
+        (self.source / "README.md").write_text("Public test input.\n", encoding="utf-8")
+        report = full_verify(self.source, evidence_dir=store)
+        archive = store / report["run_id"]
+        for filename in ("report.json", "manifest.json", "results.sarif"):
+            path = archive / filename
+            self.assertTrue(path.is_file())
+            other = subprocess.run(["sudo", "-n", "-u", "nobody", "/usr/bin/stat", str(path)],
+                                   capture_output=True, env={**os.environ, "LC_ALL": "C"}, timeout=5)
+            self.assertNotEqual(other.returncode, 0)
+            self.assertIn(b"Permission denied", other.stderr)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

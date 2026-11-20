@@ -56,8 +56,24 @@ def require_private(path: Path, *, directory: bool = False) -> None:
         raise ValueError("Evidence access list grants access to another identity")
 
 
+def _require_safe_parents(path: Path) -> None:
+    for ancestor in reversed(path.absolute().parent.parents):
+        _check_parent(ancestor)
+    _check_parent(path.absolute().parent)
+
+
+def _check_parent(path: Path) -> None:
+    entry = path.lstat()
+    if not stat.S_ISDIR(entry.st_mode) or getattr(entry, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+        raise ValueError("Evidence cannot traverse a link or junction")
+    if os.name != "nt" and (entry.st_uid not in (0, os.geteuid())
+                            or entry.st_mode & 0o022 and not entry.st_mode & stat.S_ISVTX):
+        raise ValueError("Evidence parent can be replaced by another user")
+
+
 def private_directory(path: Path, *, exist_ok: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    _require_safe_parents(path)
     if os.name == "nt":
         import pywintypes
         import win32file
@@ -74,6 +90,7 @@ def private_directory(path: Path, *, exist_ok: bool = False) -> None:
 
 def private_write(path: Path, data: bytes) -> None:
     """Publish bytes atomically from a file that starts with private permissions."""
+    _require_safe_parents(path)
     temporary = path.with_name(f".vh-write-{uuid.uuid4().hex}")
     if os.name == "nt":
         import msvcrt

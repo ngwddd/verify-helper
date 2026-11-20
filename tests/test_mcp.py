@@ -73,6 +73,20 @@ class TestMcp(unittest.IsolatedAsyncioTestCase):
         _, version = await self.call(self.stdio(), "legacy")
         self.assertEqual(version, "2025-11-25")
 
+    async def test_ambiguous_workspace_requires_explicit_project(self):
+        for name in ("first", "second"):
+            project = self.root / name
+            project.mkdir()
+            (project / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+        async with Client(self.stdio()) as client:
+            ambiguous = await client.call_tool("verify_run_full", {})
+            self.assertTrue(ambiguous.is_error)
+            self.assertFalse(any(self.evidence.rglob("*.pending")))
+            explicit = await client.call_tool("verify_run_full", {"path": "first"})
+            self.assertFalse(explicit.is_error)
+            report = await self.wait_for_report(client, explicit.structured_content["run_id"])
+            self.assertEqual(report["verdict"], "UNKNOWN")
+
     async def test_cancel_and_retrieve_run_after_stdio_restart(self):
         slow = self.root / "slow"
         slow.mkdir()

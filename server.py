@@ -85,16 +85,21 @@ class RunStore:
 
     def submit(self, project, **options):
         with self.lock:
-            active = sum(not future.done() for future, _ in self.jobs.values())
+            active = sum(not future.done() for future, _, _ in self.jobs.values())
             if active >= 4:
                 raise ToolError("The verification queue is full")
             self.jobs = {key: job for key, job in self.jobs.items() if not job[0].done()}
             run_id = "vh2_" + uuid.uuid4().hex
             cancellation = threading.Event()
+            stage = {"phase": "QUEUED"}
+
+            def progress(phase):
+                stage["phase"] = phase
+
             (self.root / f"{run_id}.pending").touch(exist_ok=False)
             future = self.pool.submit(full_verify, project, evidence_dir=self.root, sealed=True, evidence_key=self.key,
-                                      run_id=run_id, cancellation=cancellation, **options)
-            self.jobs[run_id] = (future, cancellation)
+                                      run_id=run_id, cancellation=cancellation, progress=progress, **options)
+            self.jobs[run_id] = (future, cancellation, stage)
         return {"run_id": run_id, "status": "QUEUED", "scope": "FULL", "releasable": False}
 
     def report(self, run_id, *, cancel=False):
@@ -112,7 +117,8 @@ class RunStore:
                     status = "CANCELLING"
                 else:
                     status = "RUNNING" if job[0].running() else "QUEUED"
-                return {"run_id": run_id, "status": status, "scope": "FULL", "releasable": False}
+                return {"run_id": run_id, "status": status, "phase": job[2]["phase"], "scope": "FULL",
+                        "releasable": False}
         if directory.is_dir():
             try:
                 evidence = read_evidence(directory, key=self.key)
@@ -134,7 +140,7 @@ class RunStore:
 
     def close(self):
         with self.lock:
-            for _, cancellation in self.jobs.values():
+            for _, cancellation, _ in self.jobs.values():
                 cancellation.set()
         self.pool.shutdown(cancel_futures=True)
 

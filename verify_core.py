@@ -89,6 +89,8 @@ SKIP_DIRS = {
     ".pytest_cache", ".mypy_cache", ".ruff_cache", ".state", "site-packages",
     ".idea", ".vscode", "coverage", "htmlcov", ".tox", ".nuxt", "out",
 }
+PROTECTED_SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules",
+                       ".pytest_cache", ".mypy_cache", ".tox", ".verify-artifacts"}
 
 PY_EXT = {".py"}
 JS_EXT = {".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx"}
@@ -297,6 +299,7 @@ def scan_files(root: Path, limit: int = 200_000,
     skipped = 0
     ignored = 0
     root_ig = list(ignores or [])
+    skip_dirs = SKIP_DIRS if project_ignores else PROTECTED_SKIP_DIRS
     # 目录 → 该目录自己的 ignore 规则
     dir_ig: dict[Path, list[str]] = {}
 
@@ -333,7 +336,7 @@ def scan_files(root: Path, limit: int = 200_000,
         # 目录也要过滤：`_sp/` 这种规则是要整棵子树都不扫的
         keep = []
         for name in dirnames:
-            if name.lower() in SKIP_DIRS:
+            if name.lower() in skip_dirs:
                 continue
             # 备份/草稿目录默认跳过：它们和正本重名，会把同一条 finding 报两遍。
             # （实测：my-site.backup-20260924 让 each finding 翻倍）
