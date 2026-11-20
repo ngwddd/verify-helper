@@ -4,6 +4,34 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776ab.svg)](https://www.python.org/)
 
+## 中文
+
+Verify Helper 是面向项目和 MCP 客户端的验证工具，输出 PASS、FAIL 或 UNKNOWN，并提供 JSON、SARIF 和可核对的证据。
+
+[v2.0.0 RC4](https://github.com/ngwddd/verify-helper/releases/tag/v2.0.0-rc4) 是 **Linux 有限预览**。默认 CLI 和 MCP 禁止回退到宿主执行。受保护动态检查当前仅覆盖 Linux 下的标准库 unittest。证据不足时返回 UNKNOWN。跨平台 v2.0.0 正式版仍待完成完整验收及独立审计。
+
+- [下载预览版和 SHA-256 清单](https://github.com/ngwddd/verify-helper/releases/tag/v2.0.0-rc4)
+- [预览版安装、CLI 与 MCP 文档](https://github.com/ngwddd/verify-helper/blob/v2.0.0-rc4/README.md)
+- [v2.0 正式版加固进度](https://github.com/ngwddd/verify-helper/tree/release/v2.0-final-hardening)
+
+## English
+
+Verify Helper provides project verification through a CLI and an MCP server. It reports PASS, FAIL, or UNKNOWN with JSON, SARIF, and evidence records.
+
+[v2.0.0 RC4](https://github.com/ngwddd/verify-helper/releases/tag/v2.0.0-rc4) is a **limited Linux preview**. The default CLI and MCP paths prevent fallback to host execution. Protected dynamic checks currently cover standard-library unittest on Linux. Missing evidence produces UNKNOWN. The cross-platform v2.0.0 release is pending complete acceptance tests and independent review.
+
+- [Download the preview and SHA-256 checksums](https://github.com/ngwddd/verify-helper/releases/tag/v2.0.0-rc4)
+- [Preview installation, CLI, and MCP documentation](https://github.com/ngwddd/verify-helper/blob/v2.0.0-rc4/README.md)
+- [v2.0 release hardening progress](https://github.com/ngwddd/verify-helper/tree/release/v2.0-final-hardening)
+
+---
+
+## v1.x 主分支文档 / Legacy documentation
+
+以下命令适用于主分支上的 v1.x 代码。预览版请使用上方 Release 与专用文档。
+
+The commands below apply to the v1.x code on the default branch. Follow the release instructions above for the v2.0 preview.
+
 给**任意项目目录**跑一遍机械检查，返回 **PASS / FAIL / UNKNOWN** 三态结论，
 每条结论都带证据（命令、退出码、`文件:行号`）、**风险等级**和**修复建议**。
 
