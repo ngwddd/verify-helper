@@ -184,6 +184,35 @@ expect_output = "42"
         self.assertEqual(rows["contract-1"]["state"], "PASS")
         self.assertEqual(dependency.read_text(encoding="utf-8"), "export default 42;\n")
 
+    @unittest.skipUnless(shutil.which("node"), "Requires Node")
+    def test_node_standard_discovery_runs_plain_files_under_test(self):
+        self.file("a.test.js", "require('node:test')('first', () => {});\n")
+        extra = self.file("test/extra.js", "require('node:test')('extra', () => { throw Error('fixture'); });\n")
+        report, rows = self.run_full()
+        tests = rows["tests"]
+        self.assertEqual(report["verdict"], "FAIL", tests)
+        self.assertEqual(tests["coverage"], {"planned": 2, "observed": 2, "skipped": 0,
+                                             "planned_files": 2, "observed_files": 2})
+        self.assertTrue(any(finding["file"] == "test/extra.js" for finding in tests["findings"]))
+        extra.write_text("require('node:test')('extra', () => {});\n", encoding="utf-8")
+        report, rows = self.run_full()
+        self.assertEqual(report["verdict"], "PASS", rows["tests"])
+        self.assertEqual(rows["tests"]["coverage"]["observed_files"], 2)
+        extra.write_text("require('node:test').skip('extra', () => {});\n", encoding="utf-8")
+        report, rows = self.run_full()
+        self.assertEqual(report["verdict"], "UNKNOWN", rows["tests"])
+        self.assertEqual(rows["tests"]["coverage"]["skipped"], 1)
+
+    def test_node_receipt_cannot_pass_with_an_unobserved_file(self):
+        check = core.Check("tests", "Node test runner", coverage={})
+        receipt = {"version": "24.21.0", "completed": ["a.test.js"], "findings": [],
+                   "summary": {"success": True, "counts": {"tests": 1, "passed": 1, "failed": 0,
+                                                           "cancelled": 0, "skipped": 0, "todo": 0}}}
+        core._node_receipt(check, "VH_NODE_TEST " + json.dumps(receipt), ["a.test.js", "test/extra.js"], 0)
+        self.assertEqual(check.state, "UNKNOWN")
+        self.assertEqual(check.reason_code, "TEST_COVERAGE_MISSING")
+        self.assertEqual((check.coverage["planned_files"], check.coverage["observed_files"]), (2, 1))
+
     def test_command_output_budget_discards_truncated_results(self):
         with patch.object(core, "COMMAND_OUTPUT_LIMIT", 1024):
             code, result = core._run([sys.executable, "-c", "print('X' * 50000)"], self.root, 10)

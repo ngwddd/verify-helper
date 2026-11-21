@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main, 'v2.0/development', 'v2.0/rc3', 'v2.0/rc4', 'release/v2.0-final-hardening', 'release/v2.0.1-rc1', 'release/v2.0.1-rc2', 'release/v2.0.1-rc3']
+    branches: [main, 'v2.0/development', 'v2.0/rc3', 'v2.0/rc4', 'release/v2.0-final-hardening', 'release/v2.0.1-rc1', 'release/v2.0.1-rc2', 'release/v2.0.1-rc3', 'release/v2.0.1']
   pull_request:
   workflow_dispatch:
 
@@ -118,6 +118,7 @@ jobs:
             commit = $env:GITHUB_SHA
             workflow_run = $env:GITHUB_RUN_ID
             sbom_sha256 = $sbomHash
+            execution_mode = 'trusted-local'
             protected_release_approved = $false
           } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $delivery provenance.json) -Encoding utf8NoBOM
       - name: Retain candidate distribution

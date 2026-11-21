@@ -391,6 +391,7 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
         if has_python:
             languages.append("python")
         if has_js and (not html or (scope / "package.json").is_file()
+                       or core.node_test_files(scope, subfiles, root)
                        or core._detect_test_command(scope, "javascript")[0] is not None):
             languages.append("javascript")
         for language in languages:
@@ -406,7 +407,7 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
                 for finding in result.findings:
                     if finding.get("line", 0) > 0:
                         finding["file"] = (scope / finding["file"]).as_posix()
-                if language == "javascript" and result.exit_code is not None:
+                if language == "javascript" and result.exit_code is not None and not result.runtime_version:
                     code, version = core._run(["node", "--version"], target_scope, 5)
                     version = version.strip().removeprefix("v")
                     if code == 0 and re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", version):

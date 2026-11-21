@@ -45,7 +45,7 @@ import yaml
 import check_specs as S
 import directions as DIR
 
-VERSION = "2.0.1rc3"
+VERSION = "2.0.1"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -1526,14 +1526,27 @@ def _py_for(root: Path) -> str:
     return sys.executable
 
 
-def _detect_test_command(root: Path, language: str | None = None, *, allow_npm: bool = True) -> tuple[list[str] | None, str, int]:
-    if language == "javascript" and not allow_npm:
-        files, _, _, _ = scan_files(root, project_ignores=False)
-        entries = sorted("./" + path.relative_to(root).as_posix() for path in files
-                         if re.search(r"\.(?:test|spec)\.(?:js|mjs|cjs)$", path.name))
-        if entries:
-            return ["node", "--test", "--test-reporter=tap", *entries], "Node test runner", 300
-        return None, "No supported Node tests. Declare npm_test=true to run a package script.", 0
+def node_test_files(root: Path, files: list[Path], project_root: Path | None = None) -> list[str]:
+    entries = []
+    for path in files:
+        suffix = os.path.normcase(path.suffix)
+        if not path.is_relative_to(root) or suffix not in {".js", ".mjs", ".cjs", ".ts", ".mts", ".cts"}:
+            continue
+        relative = path.relative_to(root)
+        project_path = path.relative_to(project_root or root)
+        if (any(part.startswith(".") for part in project_path.parts)
+                or "node_modules" in project_path.parts[:-1]):
+            continue
+        stem = os.path.normcase(path.stem)
+        if ("test" in project_path.parts[:-1] or stem == "test" or stem.startswith("test-")
+                or stem.endswith((".test", "-test", "_test"))
+                or (stem.endswith(".spec") and suffix in {".js", ".mjs", ".cjs"})):
+            entries.append(relative.as_posix())
+    return sorted(entries)
+
+
+def _detect_test_command(root: Path, language: str | None = None, *, allow_npm: bool = True,
+                         node_inventory: list[str] | None = None) -> tuple[list[str] | None, str, int]:
     pkg = root / "package.json"
     if allow_npm and language != "python" and pkg.exists():
         try:
@@ -1543,6 +1556,13 @@ def _detect_test_command(root: Path, language: str | None = None, *, allow_npm: 
                 return ["npm", "test", "--silent"], "package.json 的 scripts.test", 300
         except Exception:
             pass
+    if language == "javascript" and (node_inventory is not None or not allow_npm):
+        entries = node_inventory if node_inventory is not None else node_test_files(
+            root, scan_files(root, project_ignores=False)[0])
+        if entries:
+            script = Path(__file__).with_name("verification_resources") / "node_test_runner.mjs"
+            return ["node", str(script)], "Node test runner file inventory", 300
+        return None, "No supported Node tests. Declare npm_test=true to run a package script.", 0
     pyproj = root / "pyproject.toml"
     if language != "javascript" and pyproj.exists():
         try:
@@ -1641,13 +1661,42 @@ def _test_counts(out: str) -> tuple[int, int]:
     return 0, 0
 
 
-def _node_coverage_matches(out: str, planned: int) -> bool:
-    if "TAP version 13" not in out:
-        return False
-    counters = dict(re.findall(r"^# (tests|pass|fail|cancelled|skipped|todo) (\d+)\s*$", out, re.M))
-    return (len(counters) == 6 and int(counters["tests"]) == planned
-            and int(counters["pass"]) == planned and all(int(counters[state]) == 0
-                for state in ("fail", "cancelled", "skipped", "todo")))
+def _node_receipt(check: Check, output: str, expected: list[str], code: int) -> None:
+    expected_files = set(expected)
+    prefix = "VH_NODE_TEST "
+    records = [line[len(prefix):] for line in output.splitlines() if line.startswith(prefix)]
+    check.reason_code = "TEST_COVERAGE_MISSING"
+    try:
+        if len(records) != 1:
+            return
+        receipt = json.loads(records[0])
+        actual = set(receipt["completed"])
+        if len(actual) != len(receipt["completed"]) or not actual.issubset(expected_files):
+            return
+        version = receipt["version"]
+        if re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", version):
+            check.runtime_version = version
+        check.coverage.update(planned_files=len(expected), observed_files=len(actual))
+        summary = receipt["summary"]
+        if summary is None:
+            check.reason_code = "TEST_RUNTIME_UNAVAILABLE"
+            return
+        counts = summary["counts"]
+        tests, passed, failed, cancelled, skipped, todo = (
+            counts[key] for key in ("tests", "passed", "failed", "cancelled", "skipped", "todo"))
+        if (any(type(value) is not int or value < 0 for value in (tests, passed, failed, cancelled, skipped, todo))
+                or tests != passed + failed + cancelled + skipped + todo):
+            return
+        check.coverage.update(planned=tests, observed=passed + failed, skipped=skipped + todo)
+        check.findings = [{"file": file, "line": line, "message": "TEST_FAILURE"}
+                          for file, line in receipt["findings"]
+                          if file in expected_files and type(line) is int and 0 < line <= 1_000_000]
+        if code == 1 and summary["success"] is False:
+            check.state, check.reason_code = "FAIL", ""
+        elif code == 0 and summary["success"] is True and len(actual) == len(expected) and tests and passed == tests:
+            check.state, check.reason_code = "PASS", ""
+    except (ValueError, KeyError, TypeError):
+        return
 
 
 def _test_locations(out: str, root: Path, files: list[Path]) -> list[dict]:
@@ -1676,8 +1725,11 @@ def check_tests(root: Path, files: list[Path], ctx: "Ctx", language: str | None 
                                         and path.is_relative_to(root)
                                         and path.relative_to(project_root or root).as_posix() not in registered_smoke
                                         for path in files)
-    cmd, why, timeout = _detect_test_command(root, language, allow_npm=allow_npm)
-    planned_files = []
+    node_inventory = (node_test_files(root, files, project_root)
+                      if language == "javascript" and (source_root is not None or not allow_npm) else None)
+    cmd, why, timeout = _detect_test_command(root, language, allow_npm=allow_npm, node_inventory=node_inventory)
+    node_runner = node_inventory is not None and cmd is not None and cmd[0] == "node"
+    planned_files = node_inventory if node_runner else []
     python_runner = None
     if language == "python" and source_root is not None:
         python_files = sorted(path.relative_to(root).as_posix() for path in files
@@ -1702,11 +1754,14 @@ def check_tests(root: Path, files: list[Path], ctx: "Ctx", language: str | None 
         c.reason_code = "NO_TEST_ENTRY"
         c.detail = why
         return c
-    if python_runner:
+    if python_runner or node_runner:
         with tempfile.TemporaryDirectory(prefix="vh-test-list-") as directory:
             inventory = Path(directory) / "tests.json"
             inventory.write_text(json.dumps(planned_files), encoding="utf-8")
-            code, out = _run([*cmd, str(inventory), str(project_root or root)], root, min(timeout, ctx.test_timeout))
+            args = [*cmd, str(inventory)]
+            if python_runner:
+                args.append(str(project_root or root))
+            code, out = _run(args, root, min(timeout, ctx.test_timeout))
     else:
         code, out = _run(cmd, root, min(timeout, ctx.test_timeout))
     c.command = " ".join(cmd)
@@ -1720,6 +1775,13 @@ def check_tests(root: Path, files: list[Path], ctx: "Ctx", language: str | None 
                          "TEST_TIMEOUT_OR_CANCELLED" if code == 124 or out == "Verification was cancelled"
                          else "TEST_RUNTIME_UNAVAILABLE")
         c.detail = f"测试运行环境不可用（{code}）：{why}"
+    elif node_runner:
+        c.coverage = {"planned": 0, "observed": 0, "skipped": 0,
+                      "planned_files": len(planned_files), "observed_files": 0}
+        _node_receipt(c, out, planned_files, code)
+        c.detail = why
+        c.seconds = time.time() - t0
+        return c
     elif python_runner:
         prefix = "VH_PY_TEST "
         records = [line[len(prefix):] for line in out.splitlines() if line.startswith(prefix)]
@@ -1761,9 +1823,7 @@ def check_tests(root: Path, files: list[Path], ctx: "Ctx", language: str | None 
     elif code == 1 and ran == 0 and re.search(r"^.+: No module named pytest\s*$", out, re.M):
         c.reason_code = "TEST_RUNTIME_UNAVAILABLE"
         c.detail = "pytest is not installed in the selected Python environment"
-    elif (code == 5 or "no tests ran" in out.lower() or
-          (code == 0 and (ran <= skipped or (cmd[:2] == ["node", "--test"] and source_root is not None
-                                           and "--test-reporter=tap" in cmd and not _node_coverage_matches(out, ran))))):
+    elif code == 5 or "no tests ran" in out.lower() or (code == 0 and ran <= skipped):
         c.reason_code = "TEST_COVERAGE_MISSING"
         c.detail = f"{why}；缺少实际执行证据，收集 {ran}，跳过 {skipped}"
     else:

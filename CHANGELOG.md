@@ -1,3 +1,10 @@
+## [2.0.1]
+
+- 按 Node 标准规则发现测试，包括 `test/` 下的普通脚本。验证器核对预计和已完成的测试文件，未覆盖的文件或跳过的用例不能产生完整 PASS。
+- Discover tests using standard Node rules, including plain scripts under `test/`. The verifier reconciles planned files with completed files and requires full execution coverage for PASS.
+- 公开说明本机依赖复用、npm 自定义测试脚本和 Git 运行环境的限制。
+- Document the limits of local dependency reuse, custom npm scripts, and Git verification environments.
+
 ## [2.0.1 RC3]
 
 - 补齐 unittest 标准发现范围，记录 pytest 被过滤的用例。区分声明的依赖缺失与项目导入错误。
