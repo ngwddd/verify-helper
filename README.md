@@ -1,19 +1,20 @@
-# Verify Helper
+# Verify Helper · 验证助手
 
 [English](#english)
 
-Verify Helper 通过 CLI 或 MCP 对项目运行完整验证，输出 PASS、FAIL 或 UNKNOWN，并留下 JSON、SARIF 和逐项证据。当前分支使用 Python MCP SDK v2，支持 MCP 2026-07-28 以及 SDK 支持的旧协议。
+Verify Helper 通过 CLI 或 MCP 验证单个文件和项目，输出 PASS、FAIL 或 UNKNOWN，并生成 JSON、SARIF 和逐项证据。支持 stdio 和 Streamable HTTP。 [下载 v2.0.0](https://github.com/ngwddd/verify-helper/releases/tag/v2.0.0)
 
 ## 安装与运行
 
-需要 Python 3.11 或更新版本。开发版可使用以下命令。
+需要 Python 3.11 或更新版本。下载 Release 中的 wheel 后运行以下命令。
 
 ```sh
-uv sync --locked
-uv run verify-helper run /path/to/project --json report.json
+python -m pip install ./verify_helper-2.0.0-py3-none-any.whl
+verify-helper run /path/to/file.py --json
+verify-helper run /path/to/project --json report.json
 ```
 
-RC4 是当前已发布的 Linux 有限预览，本分支是后续加固开发。默认 CLI 和 MCP 采用受保护的报告出口。证据不足时返回 UNKNOWN。退出码为 0（PASS）、1（FAIL）或 2（UNKNOWN）。跨平台正式版仍为 NO-GO。 [当前整改记录](docs/v2/FINAL-HARDENING.md)
+单文件运行检查所选文件的适用内容，例如 Python 或配置语法、编码和敏感信息，以及交付归档完整性。目录运行也会检查跨文件关系和项目适用的测试。PASS 表示所选范围内所有必检项通过。缺少工具或运行证据时返回 UNKNOWN。退出码为 0（PASS）、1（FAIL）或 2（UNKNOWN）。
 
 | 参数 | 用途 |
 |---|---|
@@ -49,9 +50,9 @@ verify-helper serve --workspace /path/to/projects --transport streamable-http --
 
 HTTP 服务监听 127.0.0.1，在 /mcp 提供标准接口，拒绝外部 Origin。跨主机连接需要加密通道。启动 HTTP 模式前必须配置 VERIFY_HTTP_BEARER_TOKEN，所有 HTTP 请求均须携带对应的 Bearer 凭据。MCP 仅在 Linux 隔离候选由操作者显式启用时进行支持的动态检查。
 
-工具 `verify_run_full` 接收工作区相对 `path`，可选 `policy_path`、`revision` 或合并基准 `source_ref`。使用返回的 `run_id` 调用 `verify_get_report`，直到任务结束。用 `verify_list_capabilities` 探测运行环境，用 `verify_cancel` 请求取消。Agent 应读取 `verdict` 与 `releasable` 决定是否放行。
+工具 `verify_run_full` 接收工作区内的相对文件或目录路径，可选 `policy_path`。目录还支持 `revision` 和合并基准 `source_ref`。使用返回的 `run_id` 调用 `verify_get_report`，直到任务结束。用 `verify_list_capabilities` 查看运行环境，用 `verify_cancel` 请求取消。日常文件和项目验证使用 `verdict`，`releasable` 是单独的发布证据字段。
 
-### Linux 隔离候选
+### 可选的 Linux 隔离执行
 
 操作者可以用 `VERIFY_HELPER_SANDBOX_IMAGE=sha256:<本机镜像 ID>` 配置运行环境。Docker 容器默认断网、无宿主映射并以非 root 运行。按镜像工具链可观察标准库 unittest、检查 JavaScript 语法，或运行由操作者预先授权的 Python/JavaScript 行为用例。管理员可用 `VERIFY_HELPER_SANDBOX_TIMEOUT_SECONDS` 设置单命令 5 至 180 秒的上限，默认为 60 秒。受保护模式不运行项目的宿主命令，也不采用项目自定义的 `.verifyignore`。适用但缺证据的检查保留 UNKNOWN。 [当前整改记录](docs/v2/FINAL-HARDENING.md)
 
@@ -100,9 +101,9 @@ expect_output = "Save migration verified"
 
 ## English
 
-Verify Helper runs Full Verification through a CLI or MCP server and reports PASS, FAIL, or UNKNOWN with structured JSON, SARIF and local evidence. [RC4](https://github.com/ngwddd/verify-helper/releases/tag/v2.0.0-rc4) is the published limited Linux preview. This branch contains ongoing release hardening. [Audit status](docs/v2/FINAL-HARDENING.md)
+Verify Helper checks files and projects through a CLI or MCP server. It reports PASS, FAIL, or UNKNOWN with structured JSON, SARIF and local evidence. A file run checks the selected file. A directory run also considers project-wide checks and applicable tests. [Download v2.0.0](https://github.com/ngwddd/verify-helper/releases/tag/v2.0.0)
 
-1. Install Python 3.11 or later, run `uv sync --locked`, then run `uv run verify-helper run /path/to/project --json`.
+1. With Python 3.11 or later, install the downloaded wheel with `python -m pip install ./verify_helper-2.0.0-py3-none-any.whl`. Run `verify-helper run /path/to/file.py --json` or select a project directory.
 2. Connect an MCP client using `verify-helper serve --transport stdio --workspace /path/to/project`. For loopback Streamable HTTP, configure `VERIFY_HTTP_BEARER_TOKEN` before starting the service.
 3. Call `verify_run_full`, retain the run ID and poll `verify_get_report`. The result includes applicable checks and evidence coverage.
 

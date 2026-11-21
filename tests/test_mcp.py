@@ -85,7 +85,17 @@ class TestMcp(unittest.IsolatedAsyncioTestCase):
             explicit = await client.call_tool("verify_run_full", {"path": "first"})
             self.assertFalse(explicit.is_error)
             report = await self.wait_for_report(client, explicit.structured_content["run_id"])
-            self.assertEqual(report["verdict"], "UNKNOWN")
+            self.assertEqual(report["verdict"], "PASS")
+            self.assertEqual(report["security_status"], "NOT_REQUIRED")
+
+    async def test_verify_single_file_ignores_other_workspace_files(self):
+        async with Client(self.stdio()) as client:
+            started = await client.call_tool("verify_run_full", {"path": "README.md"})
+            self.assertFalse(started.is_error)
+            report = await self.wait_for_report(client, started.structured_content["run_id"])
+            self.assertEqual(report["verdict"], "PASS")
+            self.assertEqual(report["target_kind"], "file")
+            self.assertFalse(report["releasable"])
 
     async def test_cancel_and_retrieve_run_after_stdio_restart(self):
         slow = self.root / "slow"

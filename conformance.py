@@ -325,7 +325,7 @@ def run_extra(verbose: bool):
         make_case(tmp / "valid", {"README.md": "Valid documentation.\n"})
         r = subprocess.run([sys.executable, str(ROOT / "verify_core.py"), str(tmp / "valid")],
                            capture_output=True, text=True, encoding="utf-8")
-        check("受保护模式缺少隔离证明时退出码 2", r.returncode == 2, f"exit={r.returncode}")
+        check("仅适用静态检查的项目通过时退出码 0", r.returncode == 0, f"exit={r.returncode}")
         r = subprocess.run([sys.executable, str(ROOT / "verify_core.py"), "unsafe-local-run", str(tmp / "valid")],
                            capture_output=True, text=True, encoding="utf-8")
         check("显式可信 CLI 全过时退出码 0", r.returncode == 0, f"exit={r.returncode}")

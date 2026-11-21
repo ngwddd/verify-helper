@@ -45,6 +45,7 @@
       "enum": [
         "ENFORCED",
         "VIOLATED",
+        "NOT_REQUIRED",
         "UNAVAILABLE"
       ]
     },

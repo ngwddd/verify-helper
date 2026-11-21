@@ -44,7 +44,7 @@ import yaml
 import check_specs as S
 import directions as DIR
 
-VERSION = "2.0.0rc5.dev0"
+VERSION = "2.0.0"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:

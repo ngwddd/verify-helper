@@ -91,7 +91,8 @@ def mcp_report(report: dict, run_id: str, version: str) -> dict:
     public.update(schema_version=2, run_id=run_id, version=version,
                   status=status if status in {"COMPLETED", "CANCELLED", "ERROR"} else "ERROR",
                   verdict=verdict if verdict in VERDICTS else "UNKNOWN")
-    public["security_status"] = security if security in {"ENFORCED", "VIOLATED"} else "UNAVAILABLE"
+    public["security_status"] = security if security in {"ENFORCED", "VIOLATED", "NOT_REQUIRED"} else "UNAVAILABLE"
+    public["target_kind"] = "file" if report.get("target_kind") == "file" else "project"
     if public["security_status"] == "UNAVAILABLE":
         reason = report.get("reason_code")
         public["reason_code"] = reason if reason == "GIT_SNAPSHOT_UNAVAILABLE" else "ISOLATION_UNAVAILABLE"

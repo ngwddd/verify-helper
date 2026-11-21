@@ -1,3 +1,12 @@
+## [2.0.0]
+
+- CLI 和 MCP 支持验证单个文件与项目目录。结果包含 PASS、FAIL、UNKNOWN、JSON、SARIF 和逐项证据。
+- CLI and MCP now verify both individual files and project directories, with PASS, FAIL and UNKNOWN verdicts, JSON, SARIF and per-check evidence.
+- 项目检查根据内容确定适用项。没有工具或运行证据的必检项保留 UNKNOWN。
+- A project run selects applicable checks. Missing tools or execution evidence produce UNKNOWN for required checks.
+- 加入 Git 提交和合并树核对、归档完整性检查，以及可选的 Linux 隔离运行。
+- Added Git revision and merge-tree verification, archive integrity checking, and optional isolated execution on Linux.
+
 ## [1.10.7] - 2026-10-27
 
 两件事：**浏览器截图终于成了可复核的证据**，以及**跑测试不再往 %TEMP% 倒垃圾**。

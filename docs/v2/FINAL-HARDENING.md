@@ -2,9 +2,9 @@
 
 基线 / Baseline: `52ef43fa88226d19d4e604f2965c4a655362ff64`
 
-**通用正式版 NO-GO。RC4 维持 Linux 有限预览。**
+这是 RC4 之后关于跨平台受保护执行的历史记录。v2.0.0 按通用文件和项目验证工具的范围发布。尚未验证的执行能力仍记录在下表。 [当前产品范围](../../README.md)
 
-**General release NO-GO. RC4 remains a limited Linux preview.**
+This historical record tracks cross-platform execution assurance after RC4. v2.0.0 ships as a general-purpose file and project verifier. The table records the execution capabilities that still lack evidence. [Current product scope](../../README.md)
 
 | 编号 | 进度与证据 |
 |---|---|

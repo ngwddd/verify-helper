@@ -191,6 +191,18 @@ class TestProtectedVerification(unittest.TestCase):
         self.assertEqual(report["mode"], "unsafe-local")
         self.assertFalse(report["releasable"])
 
+    def test_single_source_file_has_a_separate_static_scope(self):
+        (self.source / "other.py").write_text("invalid = @\n", encoding="utf-8")
+        selected = self.source / "entry.py"
+        selected.write_text("value = 1\n", encoding="utf-8")
+        report = full_verify(selected, evidence_dir=self.output)
+        self.assertEqual(report["verdict"], "PASS")
+        self.assertEqual(report["target_kind"], "file")
+        self.assertEqual(report["security_status"], "NOT_REQUIRED")
+        self.assertNotIn("tests", report["plan"])
+        self.assertFalse(report["releasable"])
+        self.assertEqual(self.run_protected()["verdict"], "FAIL")
+
     def test_custom_rule_limits_are_reported_as_missing_coverage(self):
         (self.source / "verify.toml").write_text(
             '[[rules]]\npattern = "literal"\npaths = ["content.txt"]\n', encoding="utf-8")

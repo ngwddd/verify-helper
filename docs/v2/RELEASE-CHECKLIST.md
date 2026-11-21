@@ -1,4 +1,8 @@
-# v2.0 正式版冻结清单 / General release checklist
+# 跨平台执行证明核验 / Cross-platform execution assurance checklist
+
+本清单用于独立认证的跨平台执行证明。v2.0.0 的文件和项目验证工具按实际支持范围单独发布。 [v2.0.0 使用说明](../../README.md)
+
+This checklist applies to independent cross-platform execution certification. The v2.0.0 verifier ships with the capabilities documented in its README. [v2.0.0 documentation](../../README.md)
 
 | 冻结项 / Freeze item | 记录 / Record |
 |---|---|

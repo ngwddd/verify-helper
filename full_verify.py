@@ -161,6 +161,30 @@ def _snapshot(source: Path, destination: Path, *, protected: bool = False,
     return digest.hexdigest(), omitted
 
 
+def _snapshot_single_file(path: Path, destination: Path, inventory: dict) -> tuple[str, list[str]]:
+    name = path.name
+    entry = path.lstat()
+    private = name.lower() in PRIVATE_INPUTS or name.lower().startswith(".env.")
+    inventory.update(included_files=0, fixed_exclusions=0, private_exclusions=int(private), unsafe_or_changed=0)
+    if private or not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1 or entry.st_size > 1024 ** 3:
+        inventory["unsafe_or_changed"] = int(not private)
+        return evidence_digest(b""), [name]
+    copied = destination / name
+    if os.name == "nt" or sys.platform == "linux":
+        _protected_copy(path.parent, Path(name), copied, entry)
+    else:
+        shutil.copy2(path, copied)
+    with copied.open("rb") as stream:
+        checksum = hashlib.file_digest(stream, "sha256").hexdigest()
+    latest = path.lstat()
+    if (latest.st_dev, latest.st_ino, latest.st_size, latest.st_mtime_ns) != (
+            entry.st_dev, entry.st_ino, entry.st_size, entry.st_mtime_ns):
+        inventory["unsafe_or_changed"] = 1
+        return evidence_digest(b""), [name]
+    inventory["included_files"] = 1
+    return evidence_digest(json.dumps([name, checksum], ensure_ascii=True).encode()), []
+
+
 def _source_git(root: Path) -> dict:
     if not (root / ".git").exists():
         return {}
@@ -177,24 +201,31 @@ def _scope(root: Path, files: list[Path]) -> list[Path]:
 
 
 def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
-              sandbox_image: str | None = None, oracle_policy: dict | None = None) -> dict:
+              sandbox_image: str | None = None, oracle_policy: dict | None = None,
+              single_file: bool = False) -> dict:
     protected = not trusted or sandbox_image is not None
     files, _, large, _ = core.scan_files(root, project_ignores=not protected)
+    selected = next(root.iterdir(), None) if single_file else None
+    archive_target = selected if selected and selected.name.lower().endswith((".zip", ".whl", ".tar.gz", ".tgz")) else None
     ctx = core.Ctx(core.Cache(False))
     config_error = None
     try:
-        config = adapters.read_config(root)
+        config = {} if single_file else adapters.read_config(root)
     except (ValueError, OSError) as error:
         config = {}
         config_error = adapters.check("configuration", str(error), "FAIL")
 
     static = [identifier for identifier in check_specs.ordered_ids()
-              if identifier not in DYNAMIC | {"git"}]
+              if identifier not in DYNAMIC | {"git"} and (not single_file or identifier != "custom")]
     report = core._verify_checks(str(root), checks=static, use_cache=False, artifacts=False,
                          review_md=False, allow_host_tools=not protected, project_ignores=not protected)
     required = {}
     tasks = []
     rows = report["checks"]
+    if single_file:
+        links = next(row for row in rows if row["id"] == "links")
+        if links["applicable"]:
+            links.update(state="UNKNOWN", applicable=False, findings=[], detail="Verify the containing project to check links")
     for row in rows:
         if row["applicable"] and (row["blocking"] or row["id"] == "custom"):
             required[row["id"]] = "Applicable source and configuration checks"
@@ -241,16 +272,12 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
 
     if config_error is not None:
         add(config_error, "Verification configuration must parse")
-    if sandbox_image is not None:
-        boundary = adapters.check("execution-isolation", "Isolation requires platform attestation")
-        boundary.reason_code = "ISOLATION_UNAVAILABLE"
-        add(boundary, "The configured isolation boundary must be independently attested")
-    if large or len(files) >= 200_000:
+    if (large and archive_target is None) or len(files) >= 200_000:
         add(adapters.check("scan-coverage", "The source scan reached a size or file count limit"),
             "All applicable project inputs must be inventoried")
 
     html = any(file.suffix.lower() in core.HTML_EXT for file in files)
-    if html:
+    if html and not single_file:
         run("runtime-web", "HTML pages must be served over HTTP",
             lambda target: core.check_runtime_web(target, [target / p.relative_to(root) for p in files], ctx))
         run("browser", "HTML pages must load in a browser",
@@ -259,11 +286,11 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
         flow_data = core.tomllib.loads((root / "verify.toml").read_text(encoding="utf-8-sig"))
     except (ValueError, OSError):
         flow_data = {}
-    if "flows" in flow_data:
+    if "flows" in flow_data and not single_file:
         run("interaction", "Configured browser flow assertions must execute",
             lambda target: core.check_interaction(target, [target / p.relative_to(root) for p in files], ctx))
 
-    scopes = _scope(root, files)
+    scopes = [] if single_file else _scope(root, files)
     for scope in scopes:
         prefix = "" if scope == root else scope.relative_to(root).as_posix() + ":"
         subfiles = [file for file in files if file.is_relative_to(scope) and
@@ -353,11 +380,25 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
             run(identifier, "Detected delivery file", lambda target, identifier=identifier, path=path:
                 adapters.archive(identifier, path),
                 requires_trust=False)
+    if archive_target is not None:
+        run("delivery-1", "Selected archive integrity", lambda target: adapters.archive("delivery-1", archive_target),
+            requires_trust=False)
+    if selected is not None and selected.suffix.lower() in adapters.TYPESCRIPT:
+        add(adapters.check("typescript", "Select the project to verify TypeScript with its compiler configuration"),
+            "TypeScript source requires compiler evidence")
 
     for identifier in policy_required:
         required.setdefault(identifier, "Required by operator policy")
     if oracle_policy is not None:
         required["behavior-contract"] = "Operator-approved black-box behavior"
+    if sandbox_image is not None and (any(task[2] for task in tasks) or oracle_policy is not None):
+        boundary = adapters.check("execution-isolation", "Isolation requires platform attestation")
+        boundary.reason_code = "ISOLATION_UNAVAILABLE"
+        add(boundary, "The configured isolation boundary must be independently attested")
+    report["static_only"] = not (
+        any(task[2] for task in tasks) or oracle_policy is not None
+        or any(key.endswith(("build-native", "runtime-native")) for key in required)
+    )
     report["plan"] = required
     report["plan_digest"] = plan_digest(required)
     if sandbox_image and config_error is None and not any(
@@ -429,12 +470,13 @@ def _isolated_unittest(root: Path, scope: Path, identifier: str, image: str) -> 
 
 def _worker(root: Path, trusted: bool, result_path: Path, policy_required: tuple[str, ...] = (),
             sandbox_image: str | None = None, sealed: bool = False, oracle_path: Path | None = None,
-            local_locations: bool = False) -> None:
+            local_locations: bool = False, single_file: bool = False) -> None:
     oracle_policy = json.loads(oracle_path.read_bytes()) if oracle_path is not None else None
-    report = _run_plan(root, trusted, policy_required, sandbox_image, oracle_policy)
+    report = _run_plan(root, trusted, policy_required, sandbox_image, oracle_policy, single_file)
     if sealed:
         locations = {} if local_locations else None
         public = report_export.project_receipts(report, locations=locations)
+        public["static_only"] = report["static_only"]
         if locations:
             private_write(result_path.with_name("locations.json"), json.dumps(locations).encode())
         result_path.write_text(json.dumps(public), encoding="utf-8")
@@ -546,15 +588,17 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
                 sealed: bool = False, evidence_key: bytes | None = None, progress=None,
                 local_locations: bool = False) -> dict:
     root = Path(project).expanduser().resolve()
+    single_file = root.is_file()
     run_id = run_id or uuid.uuid4().hex
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", run_id):
         raise ValueError("Invalid verification run ID")
     image = os.environ.get(isolated_runtime.IMAGE_VARIABLE)
-    host_execution = unsafe_local and not sealed and evidence_key is None
+    host_execution = unsafe_local and not single_file and not sealed and evidence_key is None
     sealed = not host_execution
     local_locations = local_locations and sealed and evidence_key is None
     sandbox_image = None if host_execution else image
     context = {"schema_version": SCHEMA_VERSION, "run_id": run_id, "version": core.VERSION,
+               "target_kind": "file" if single_file else "project",
                "mode": "unsafe-local" if host_execution else "full", "isolation": "linux-container-candidate" if sandbox_image is not None
                else "temporary-source-snapshot",
                "trusted_project_code": host_execution, "platform": platform.system(),
@@ -567,8 +611,8 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
     else:
         context["project"] = str(root)
     report = {**context, "checks": [], "plan": {}, "blockers": []}
-    if not root.is_dir():
-        report["blockers"].append("Project directory is unavailable")
+    if not single_file and not root.is_dir():
+        report["blockers"].append("Verification target is unavailable")
         _finalize(report, None)
         return report
 
@@ -584,6 +628,8 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
             work = Path(directory).resolve()
             snapshot = work / "project"
             source = root
+            if single_file and (revision or against):
+                raise ValueError("Git revision and merge checks require a project directory")
             if (revision or against) and not host_execution:
                 source, git_context = _protected_git_source(root, work, revision, against)
                 context.update(git_context)
@@ -596,14 +642,18 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
                     source, merge = _merge_snapshot(root, against, work)
                     context["merge"] = merge
             inventory = {}
-            digest, omitted = _snapshot(source, snapshot, protected=not host_execution, inventory=inventory)
+            if single_file:
+                snapshot.mkdir()
+                digest, omitted = _snapshot_single_file(root, snapshot, inventory)
+            else:
+                digest, omitted = _snapshot(source, snapshot, protected=not host_execution, inventory=inventory)
             config = snapshot / "verify.toml"
             policy_material = {"engine": core.VERSION, "trusted": host_execution,
                                "sandbox_image": image if image and isolated_runtime.IMAGE_ID.fullmatch(image) else None,
                                "project_contract": evidence_digest(config.read_bytes()) if config.is_file() else None}
             oracle_path = None
             configured_oracle = os.environ.get(protected_oracle.POLICY_VARIABLE)
-            if sealed and configured_oracle is not None:
+            if sealed and not single_file and configured_oracle is not None:
                 oracle_path = work / "operator-oracle.json"
                 try:
                     policy_raw, operator_oracle = protected_oracle.load(Path(configured_oracle), root, digest)
@@ -653,12 +703,12 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
                             "_wait_for_launch(Path(sys.argv[6])); "
                             "_worker(Path(sys.argv[2]),sys.argv[3]=='True',Path(sys.argv[4]),json.loads(sys.argv[5]),"
                             "json.loads(sys.argv[7]),sys.argv[8]=='True', Path(sys.argv[9]) if sys.argv[9] else None,"
-                            "sys.argv[10]=='True')",
+                            "sys.argv[10]=='True', sys.argv[11]=='True')",
                             str(Path(__file__).resolve().parent), str(snapshot),
                             str(host_execution or sandbox_image is not None), str(result_path),
                             json.dumps(policy_required), str(launch),
                             json.dumps("" if omitted and sandbox_image is not None else sandbox_image), str(sealed),
-                            str(oracle_path) if oracle_path is not None else "", str(local_locations)],
+                            str(oracle_path) if oracle_path is not None else "", str(local_locations), str(single_file)],
                            cwd=work, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            start_new_session=os.name != "nt",
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))
@@ -678,6 +728,9 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
                 if worker.returncode:
                     raise subprocess.CalledProcessError(worker.returncode, worker.args)
             report.update(json.loads(result_path.read_text(encoding="utf-8")))
+            if sealed and report.pop("static_only", False):
+                context["security_status"] = "NOT_REQUIRED"
+                context.pop("reason_code", None)
             report.update(context, snapshot_sha256=digest)
             report["snapshot_inventory"] = inventory
             if not sealed:

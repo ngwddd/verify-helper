@@ -163,10 +163,10 @@ def create_server(workspace: Path, *, evidence_dir: Path | None = None,
                                             idempotentHint=False, openWorldHint=True))
     def verify_run_full(path: str = ".", policy_path: str | None = None, revision: str | None = None,
                         source_ref: str | None = None) -> dict[str, Any]:
-        """Queue full verification of the current project. 验证助手：完整验证指定项目，随后轮询报告。"""
+        """Queue verification of a file or project. 验证指定文件或项目，随后轮询报告。"""
         root = (workspace / path).resolve()
-        if not root.is_relative_to(workspace) or not root.is_dir():
-            raise ToolError("Project must be a directory in the configured workspace")
+        if not root.is_relative_to(workspace) or not (root.is_dir() or root.is_file()):
+            raise ToolError("Verification target must be a file or directory in the configured workspace")
         policy = (workspace / policy_path).resolve() if policy_path is not None else None
         if policy is not None and (not policy.is_relative_to(workspace) or not policy.is_file()):
             raise ToolError("Policy must be a JSON file in the configured workspace")
