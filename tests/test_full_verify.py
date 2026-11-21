@@ -406,6 +406,7 @@ members = ["README.md"]
                             *args], cwd=self.root, check=True, capture_output=True)
 
         git("init", "-qb", "main")
+        git("config", "core.autocrlf", "false")
         git("add", "README.md")
         git("commit", "-qm", "base")
         git("switch", "-qc", "other")
