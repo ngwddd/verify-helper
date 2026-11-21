@@ -48,12 +48,46 @@ class TestMcp(unittest.IsolatedAsyncioTestCase):
             failed = await self.wait_for_report(client, second_id)
             self.assertEqual(failed["verdict"], "FAIL")
             finding = next(row for row in failed["checks"] if row["id"] == "tests")["findings"][0]
-            self.assertEqual(finding, {"file": "source-001", "line": 3, "message": "TEST_FAILURE"})
+            self.assertRegex(finding["file"], r"^source-h[0-9a-f]{32}$")
+            self.assertEqual((finding["line"], finding["message"]), (3, "TEST_FAILURE"))
             diff = await client.call_tool("verify_compare_runs",
                                           {"first_run_id": first_id, "second_run_id": second_id})
             self.assertEqual(diff.structured_content["status"], "COMPARABLE")
             changed = next(row for row in diff.structured_content["changes"] if row["check_id"] == "tests")
             self.assertIn(finding, changed["after"]["findings"])
+
+    async def test_compare_distinguishes_same_line_in_different_nested_files(self):
+        project = self.root / "monorepo"
+        scoped = project / "private-package"
+        scoped.mkdir(parents=True)
+        (scoped / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+        failure = "import unittest\nclass Example(unittest.TestCase):\n    def test_example(self): self.fail()\n"
+        first_file = scoped / "testOne.py"
+        first_file.write_text(failure, encoding="utf-8")
+        async with Client(self.stdio()) as client:
+            async def run():
+                queued = await client.call_tool("verify_run_full", {"path": "monorepo"})
+                run_id = queued.structured_content["run_id"]
+                report = await self.wait_for_report(client, run_id)
+                self.assertEqual(report["verdict"], "FAIL")
+                self.assertNotIn("private-package", json.dumps(report))
+                result = next(row for row in report["checks"] if row.get("findings"))
+                self.assertRegex(result["id"], r"^check-\d+$")
+                return run_id, result["id"], result["findings"][0]
+
+            first_id, check, first = await run()
+            _, _, same_file = await run()
+            self.assertEqual(first, same_file)
+            first_file.rename(scoped / "testTwo.py")
+            second_id, _, second = await run()
+            self.assertEqual(first["line"], second["line"])
+            self.assertNotEqual(first["file"], second["file"])
+            compared = await client.call_tool("verify_compare_runs", {"first_run_id": first_id,
+                                                                      "second_run_id": second_id})
+            result = compared.structured_content
+            self.assertEqual(result["status"], "COMPARABLE")
+            change = next(row for row in result["changes"] if row["check_id"] == check)
+            self.assertEqual((change["before"]["findings"], change["after"]["findings"]), ([first], [second]))
 
     @unittest.skipUnless(os.environ.get("VERIFY_PLAYWRIGHT_ROOT"), "Requires Chromium")
     async def test_browser_pass_keeps_private_evidence(self):

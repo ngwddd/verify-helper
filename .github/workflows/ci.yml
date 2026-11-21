@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main, 'v2.0/development', 'v2.0/rc3', 'v2.0/rc4', 'release/v2.0-final-hardening', 'release/v2.0.1-rc1', 'release/v2.0.1-rc2']
+    branches: [main, 'v2.0/development', 'v2.0/rc3', 'v2.0/rc4', 'release/v2.0-final-hardening', 'release/v2.0.1-rc1', 'release/v2.0.1-rc2', 'release/v2.0.1-rc3']
   pull_request:
   workflow_dispatch:
 
@@ -31,7 +31,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: uv sync --locked
       - name: Unit and MCP protocol tests
-        run: uv run --group release python -m unittest discover -s tests -v
+        run: uv run --group release --group test python -m unittest discover -s tests -v
       - name: Conformance
         run: uv run python conformance.py
       - name: Language and browser acceptance
@@ -75,7 +75,7 @@ jobs:
           $env:VERIFY_PLAYWRIGHT_ROOT = $toolchain
           $env:VERIFY_TSC = Join-Path $toolchain "node_modules/.bin/tsc$suffix"
           $env:VERIFY_NATIVE_FIXTURE = '1'
-          uv run python -m unittest discover -s tests -p test_full_verify.py -v
+          uv run --group test python -m unittest discover -s tests -p test_full_verify.py -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           uv run python -m unittest discover -s tests -p test_mcp.py -k test_browser_pass_keeps_private_evidence -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

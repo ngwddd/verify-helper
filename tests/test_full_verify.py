@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -79,16 +80,64 @@ class FullVerification(unittest.TestCase):
     def test_python_inventory_includes_nested_suffix_tests(self):
         self.file("app.py", "def value(): return 42\n")
         self.file("tests/test_app.py", PASSING_TEST)
-        self.file("tests/nested/broken_test.py", PASSING_TEST.replace("42", "43"))
+        self.file("tests/nested/broken_test.py", PASSING_TEST)
+        api = self.file("tests/testAPI.py", PASSING_TEST.replace("42", "43"))
+        self.file("tests/testmodels.py", PASSING_TEST)
         report, rows = self.run_full()
         self.assertEqual(report["verdict"], "FAIL")
-        self.assertEqual(rows["tests"]["coverage"], {"planned": 2, "observed": 2, "skipped": 0,
-                                                      "planned_files": 2, "observed_files": 2})
-        self.file("tests/nested/broken_test.py", "import vh_missing_fixture_dependency\n")
+        self.assertEqual(rows["tests"]["coverage"], {"planned": 4, "observed": 4, "skipped": 0,
+                                                      "planned_files": 4, "observed_files": 4})
+        api.write_text(PASSING_TEST, encoding="utf-8")
+        suite = self.file("tests/nested/broken_test.py", "import vh_missing_fixture_dependency\n")
+        self.file("pyproject.toml", '[project]\ndependencies = ["vh-missing-fixture-dependency"]\n')
         report, rows = self.run_full()
         self.assertEqual(report["verdict"], "UNKNOWN")
         self.assertEqual(rows["tests"]["reason_code"], "TEST_RUNTIME_UNAVAILABLE")
-        self.assertEqual(rows["tests"]["coverage"]["observed_files"], 1)
+        self.assertEqual(rows["tests"]["coverage"]["observed_files"], 3)
+        suite.write_text("import app.nonexistent_module\n", encoding="utf-8")
+        report, rows = self.run_full()
+        self.assertEqual(report["verdict"], "FAIL")
+        self.assertEqual(rows["tests"]["findings"][0]["file"], "tests/nested/broken_test.py")
+
+    def test_explicit_unittest_patterns_and_registered_smoke(self):
+        self.file("app.py", "def value(): return 42\n")
+        self.file("cases/proof_case.py", PASSING_TEST)
+        self.file("cases/test_unrelated.py", PASSING_TEST.replace("42", "43"))
+        self.file("smoke_fixture.py", 'print("smoke passed")\n')
+        self.file("smoke_manual.py", 'raise RuntimeError("manual only")\n')
+        self.file("verify.toml", """[verification]
+unittest_patterns = ["*_case.py"]
+[[verification.contracts]]
+argv = ["python", "-u", "smoke_fixture.py"]
+expect_output = "smoke passed"
+""")
+        report, rows = self.run_full()
+        self.assertEqual(report["verdict"], "PASS")
+        self.assertEqual(rows["tests"]["coverage"]["planned_files"], 1)
+        self.assertEqual(rows["tests"]["unregistered_candidates"], 1)
+
+    @unittest.skipUnless(importlib.util.find_spec("pytest"), "Requires the pytest test group")
+    def test_pytest_counts_deselection_and_distinguishes_import_failures(self):
+        config = self.file("pytest.ini", "[pytest]\npython_files = *_case.py\naddopts = -k selected\n")
+        suite = self.file("tests/proof_case.py", "def test_selected(): pass\ndef test_hidden(): assert False\n")
+        report, rows = self.run_full()
+        self.assertEqual(report["verdict"], "UNKNOWN")
+        self.assertEqual(rows["tests"]["reason_code"], "TESTS_DESELECTED")
+        self.assertEqual(rows["tests"]["coverage"], {"planned": 2, "observed": 1, "skipped": 0,
+                                                      "planned_files": 1, "observed_files": 1,
+                                                      "collected": 1, "deselected": 1})
+        config.write_text("[pytest]\npython_files = *_case.py\n", encoding="utf-8")
+        report, _ = self.run_full()
+        self.assertEqual(report["verdict"], "FAIL")
+        self.file("requirements.txt", "vh-missing-pytest-fixture>=1\n")
+        suite.write_text("import vh_missing_pytest_fixture\n", encoding="utf-8")
+        report, rows = self.run_full()
+        self.assertEqual(report["verdict"], "UNKNOWN")
+        self.assertEqual(rows["tests"]["reason_code"], "TEST_RUNTIME_UNAVAILABLE")
+        suite.write_text("import wrong_internal_import_name\n", encoding="utf-8")
+        report, rows = self.run_full()
+        self.assertEqual(report["verdict"], "FAIL")
+        self.assertEqual(rows["tests"]["state"], "FAIL")
 
     def test_python_uses_original_project_virtual_environment(self):
         subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(self.root / ".venv")],
@@ -124,9 +173,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 test('value', () => assert.equal(value, 42));
 """)
+        self.file("proof.mjs", "import value from 'fixture';\nconsole.log(value);\n")
+        self.file("verify.toml", """[[verification.contracts]]
+argv = ["node", "proof.mjs"]
+expect_output = "42"
+""")
         report, rows = self.run_full()
         self.assertEqual(report["verdict"], "PASS", rows["tests"])
         self.assertEqual(rows["tests"]["coverage"]["observed"], 1)
+        self.assertEqual(rows["contract-1"]["state"], "PASS")
         self.assertEqual(dependency.read_text(encoding="utf-8"), "export default 42;\n")
 
     def test_command_output_budget_discards_truncated_results(self):

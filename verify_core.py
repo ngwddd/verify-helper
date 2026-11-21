@@ -45,7 +45,7 @@ import yaml
 import check_specs as S
 import directions as DIR
 
-VERSION = "2.0.1rc2"
+VERSION = "2.0.1rc3"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -222,6 +222,7 @@ class Check:
     coverage: dict | None = None
     reason_code: str = ""
     unregistered_candidates: int = 0
+    runtime_version: str = ""
 
     def as_dict(self) -> dict:
         d = asdict(self)
@@ -1549,7 +1550,8 @@ def _detect_test_command(root: Path, language: str | None = None, *, allow_npm: 
                 return [_py_for(root), "-m", "pytest", "-q"], "pytest", 300
         except Exception:
             pass
-    if language != "javascript" and ((root / "pytest.ini").exists() or (root / "conftest.py").exists()):
+    pytest_configs = ("pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml", "conftest.py")
+    if language != "javascript" and any((root / name).is_file() for name in pytest_configs):
         return [_py_for(root), "-m", "pytest", "-q"], "pytest", 300
     tests = root / "tests"
     if tests.is_dir():
@@ -1664,25 +1666,32 @@ def _test_locations(out: str, root: Path, files: list[Path]) -> list[dict]:
 
 
 def check_tests(root: Path, files: list[Path], ctx: "Ctx", language: str | None = None, *,
-                allow_npm: bool = True, source_root: Path | None = None) -> Check:
+                allow_npm: bool = True, source_root: Path | None = None,
+                project_root: Path | None = None, unittest_patterns: tuple[str, ...] | None = None,
+                registered_smoke: frozenset[str] = frozenset()) -> Check:
     c = Check("tests", "测试：跑得起来，且真的通过")
     t0 = time.time()
     if language == "python":
         c.unregistered_candidates = sum(path.suffix == ".py" and path.name.startswith("smoke_")
-                                        and path.is_relative_to(root) for path in files)
+                                        and path.is_relative_to(root)
+                                        and path.relative_to(project_root or root).as_posix() not in registered_smoke
+                                        for path in files)
     cmd, why, timeout = _detect_test_command(root, language, allow_npm=allow_npm)
     planned_files = []
     python_runner = None
     if language == "python" and source_root is not None:
-        planned_files = sorted(path.relative_to(root).as_posix() for path in files
-                               if path.is_relative_to(root) and path.suffix == ".py"
-                               and (path.name.startswith("test_") or path.name.endswith("_test.py")))
+        python_files = sorted(path.relative_to(root).as_posix() for path in files
+                              if path.is_relative_to(root) and path.suffix == ".py")
+        patterns = unittest_patterns or ("test*.py", "*_test.py")
+        planned_files = [name for name in python_files
+                         if any(fnmatch.fnmatchcase(Path(name).name, pattern) for pattern in patterns)]
         python = _py_for(source_root)
-        if (cmd is None and planned_files) or (cmd and cmd[1:3] == ["-m", "unittest"]):
+        if unittest_patterns or (cmd is None and planned_files) or (cmd and cmd[1:3] == ["-m", "unittest"]):
             python_runner = "unittest"
             why, timeout = "Explicit unittest file inventory", 300
         elif cmd and cmd[1:3] == ["-m", "pytest"]:
             python_runner = "pytest"
+            planned_files = python_files
         elif cmd:
             cmd[0] = python
         if python_runner:
@@ -1697,7 +1706,7 @@ def check_tests(root: Path, files: list[Path], ctx: "Ctx", language: str | None 
         with tempfile.TemporaryDirectory(prefix="vh-test-list-") as directory:
             inventory = Path(directory) / "tests.json"
             inventory.write_text(json.dumps(planned_files), encoding="utf-8")
-            code, out = _run([*cmd, str(inventory)], root, min(timeout, ctx.test_timeout))
+            code, out = _run([*cmd, str(inventory), str(project_root or root)], root, min(timeout, ctx.test_timeout))
     else:
         code, out = _run(cmd, root, min(timeout, ctx.test_timeout))
     c.command = " ".join(cmd)
@@ -1716,23 +1725,32 @@ def check_tests(root: Path, files: list[Path], ctx: "Ctx", language: str | None 
         records = [line[len(prefix):] for line in out.splitlines() if line.startswith(prefix)]
         try:
             observed = json.loads(records[-1])
-            keys = {"files", "planned", "executed", "skipped", "failed", "missing", "errors"}
+            version = observed.pop("python_version", "")
+            keys = {"planned_files", "files", "planned", "collected", "executed", "deselected",
+                    "skipped", "failed", "missing", "errors"}
             if (len(records) != 1 or observed.keys() != keys or
                     any(type(value) is not int or value < 0 for value in observed.values())):
-                raise ValueError("Invalid unittest receipt")
+                raise ValueError("Invalid Python test receipt")
+            if isinstance(version, str) and re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", version):
+                c.runtime_version = version
         except (IndexError, ValueError, AttributeError):
             observed = None
         if observed:
             ran = observed["planned"]
             skipped = observed["skipped"]
+            expected_files = len(planned_files) if python_runner == "unittest" else observed["planned_files"]
             c.coverage = {"planned": ran, "observed": max(0, observed["executed"] - skipped),
-                          "skipped": skipped, "planned_files": len(planned_files), "observed_files": observed["files"]}
+                          "skipped": skipped, "planned_files": expected_files, "observed_files": observed["files"]}
+            if python_runner == "pytest":
+                c.coverage.update(collected=observed["collected"], deselected=observed["deselected"])
             c.state = ("FAIL" if observed["failed"] or observed["errors"] else
-                       "PASS" if code == 0 and observed["files"] == len(planned_files)
-                       and ran == observed["executed"] and ran > 0 and not skipped and not observed["missing"]
+                       "PASS" if code == 0 and observed["files"] == expected_files
+                       and ran == observed["collected"] == observed["executed"] and ran > 0
+                       and not skipped and not observed["missing"] and not observed["deselected"]
                        else "UNKNOWN")
-            c.reason_code = "TEST_RUNTIME_UNAVAILABLE" if observed["missing"] else (
-                "TEST_COVERAGE_MISSING" if c.state == "UNKNOWN" else "")
+            if c.state == "UNKNOWN":
+                c.reason_code = ("TEST_RUNTIME_UNAVAILABLE" if observed["missing"] else
+                                 "TESTS_DESELECTED" if observed["deselected"] else "TEST_COVERAGE_MISSING")
         else:
             c.reason_code = "TEST_COVERAGE_MISSING"
         c.detail = why

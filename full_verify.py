@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import platform
@@ -14,7 +15,7 @@ import sys
 import tempfile
 import time
 import uuid
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from pathlib import Path
 
 import check_specs
@@ -57,11 +58,12 @@ def scrub(value):
     return value
 
 
-def _copy_open_file(fd: int, destination: Path, expected) -> None:
+def _copy_open_file(fd: int, destination: Path, expected) -> str:
     actual = os.fstat(fd)
     if (not stat.S_ISREG(actual.st_mode) or actual.st_nlink != 1 or
             (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino)):
         raise ValueError("Snapshot source changed before it could be opened")
+    checksum = hashlib.sha256()
     with os.fdopen(fd, "rb", closefd=False) as stream, destination.open("xb") as target:
         remaining = expected.st_size
         while remaining:
@@ -69,13 +71,15 @@ def _copy_open_file(fd: int, destination: Path, expected) -> None:
             if not chunk:
                 raise ValueError("Snapshot source shrank while being copied")
             target.write(chunk)
+            checksum.update(chunk)
             remaining -= len(chunk)
         if stream.read(1):
             raise ValueError("Snapshot source grew while being copied")
     destination.chmod(0o700 if actual.st_mode & stat.S_IXUSR else 0o600)
+    return checksum.hexdigest()
 
 
-def _protected_copy(source: Path, relative: Path, destination: Path, expected) -> None:
+def _protected_copy(source: Path, relative: Path, destination: Path, expected) -> str:
     if os.name == "nt":
         import msvcrt
         import win32file
@@ -85,10 +89,9 @@ def _protected_copy(source: Path, relative: Path, destination: Path, expected) -
             name = win32file.GetFinalPathNameByHandle(msvcrt.get_osfhandle(fd), 0)
             if Path(name) != Path("\\\\?\\" + str(source / relative)):
                 raise ValueError("Snapshot file handle resolved outside its expected path")
-            _copy_open_file(fd, destination, expected)
+            return _copy_open_file(fd, destination, expected)
         finally:
             os.close(fd)
-        return
     with ExitStack() as handles:
         directory_flags = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_RDONLY
         parent = os.open(source, directory_flags)
@@ -98,7 +101,7 @@ def _protected_copy(source: Path, relative: Path, destination: Path, expected) -
             handles.callback(os.close, parent)
         fd = os.open(relative.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
         handles.callback(os.close, fd)
-        _copy_open_file(fd, destination, expected)
+        return _copy_open_file(fd, destination, expected)
 
 
 def _snapshot(source: Path, destination: Path, *, protected: bool = False,
@@ -141,11 +144,11 @@ def _snapshot(source: Path, destination: Path, *, protected: bool = False,
                 continue
             copied = destination / relative / name
             if protected and (os.name == "nt" or sys.platform == "linux"):
-                _protected_copy(source, relative / name, copied, entry)
+                checksum = _protected_copy(source, relative / name, copied, entry)
             else:
                 shutil.copy2(path, copied)
-            with copied.open("rb") as stream:
-                checksum = hashlib.file_digest(stream, "sha256").hexdigest()
+                with copied.open("rb") as stream:
+                    checksum = hashlib.file_digest(stream, "sha256").hexdigest()
             latest = path.lstat()
             if (entry.st_mode, entry.st_size, entry.st_mtime_ns, entry.st_ino) != (
                     latest.st_mode, latest.st_size, latest.st_mtime_ns, latest.st_ino):
@@ -168,11 +171,11 @@ def _snapshot_single_file(path: Path, destination: Path, inventory: dict) -> tup
         return evidence_digest(b""), [name]
     copied = destination / name
     if os.name == "nt" or sys.platform == "linux":
-        _protected_copy(path.parent, Path(name), copied, entry)
+        checksum = _protected_copy(path.parent, Path(name), copied, entry)
     else:
         shutil.copy2(path, copied)
-    with copied.open("rb") as stream:
-        checksum = hashlib.file_digest(stream, "sha256").hexdigest()
+        with copied.open("rb") as stream:
+            checksum = hashlib.file_digest(stream, "sha256").hexdigest()
     latest = path.lstat()
     if (latest.st_dev, latest.st_ino, latest.st_size, latest.st_mtime_ns) != (
             entry.st_dev, entry.st_ino, entry.st_size, entry.st_mtime_ns):
@@ -195,6 +198,49 @@ def _scope(root: Path, files: list[Path]) -> list[Path]:
     manifests = {"pyproject.toml", "package.json", "CMakeLists.txt", "pytest.ini"}
     return [root, *sorted({file.parent for file in files
                            if file.name in manifests and file.parent != root})]
+
+
+def _link_dependencies(stack: ExitStack, target: Path, source: Path, scopes) -> None:
+    for scope in scopes:
+        original = source / scope
+        dependencies = original / "node_modules"
+        if (not dependencies.is_dir() or not original.resolve().is_relative_to(source.resolve())
+                or not dependencies.resolve().is_relative_to(original.resolve())):
+            continue
+        link = target / scope / "node_modules"
+        if os.name == "nt":
+            import _winapi
+            _winapi.CreateJunction(str(dependencies), str(link))
+            stack.callback(_remove_junction, link)
+        else:
+            link.symlink_to(dependencies, target_is_directory=True)
+            stack.callback(link.unlink, missing_ok=True)
+
+
+def _remove_junction(path: Path) -> None:
+    with suppress(FileNotFoundError):
+        path.rmdir()
+
+
+def _declared_smoke(config: dict) -> frozenset[str]:
+    declared = set()
+    for row in (config.get("build"), config.get("runtime"), *config.get("contracts", [])):
+        argv = row.get("argv") if isinstance(row, dict) else None
+        if not isinstance(argv, list) or not argv or not all(isinstance(value, str) for value in argv):
+            continue
+        command = Path(argv[0]).stem.lower()
+        if command not in {"python", "python3"}:
+            continue
+        for index, value in enumerate(argv[1:], 1):
+            if value == "-m" and index + 1 < len(argv):
+                declared.add(argv[index + 1].replace(".", "/") + ".py")
+                break
+            if value == "-c":
+                break
+            if not value.startswith("-"):
+                declared.add(Path(value.replace("\\", "/")).as_posix())
+                break
+    return frozenset(declared)
 
 
 def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
@@ -283,6 +329,19 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
             copy_project=False)
 
     scopes = [] if single_file else _scope(root, files)
+    relative_scopes = [scope.relative_to(root) for scope in scopes]
+    original = source_root or root
+    registered_smoke = _declared_smoke(config)
+
+    def with_dependencies(target, scopes, action):
+        with ExitStack() as stack:
+            _link_dependencies(stack, target, original, scopes)
+            return action()
+
+    def contract(target, name, declaration):
+        return with_dependencies(target, relative_scopes,
+                                 lambda: adapters.contract(name, declaration, target, source_root=source_root))
+
     for scope in scopes:
         prefix = "" if scope == root else scope.relative_to(root).as_posix() + ":"
         subfiles = [file for file in files if file.is_relative_to(scope) and
@@ -326,7 +385,8 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
                        if file.suffix.lower() in adapters.TYPESCRIPT]
             run(prefix + "typescript", "TypeScript and JSX require a compiler check",
                 lambda target, scope=relative_scope, configs=configs, sources=sources:
-                adapters.typescript(target / scope, configs, sources))
+                with_dependencies(target, {Path("."), scope},
+                                  lambda: adapters.typescript(target / scope, configs, sources)))
         languages = []
         if has_python:
             languages.append("python")
@@ -338,29 +398,20 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
 
             def local_tests(target, scope=relative_scope, files=relative_files, language=language):
                 target_scope = target / scope
-                source_scope = (source_root or root) / scope
-                dependencies = source_scope / "node_modules"
-                link = target_scope / "node_modules"
-                linked = (language == "javascript" and dependencies.is_dir()
-                          and dependencies.resolve().is_relative_to(source_scope))
-                if linked:
-                    if os.name == "nt":
-                        import _winapi
-                        _winapi.CreateJunction(str(dependencies), str(link))
-                    else:
-                        link.symlink_to(dependencies, target_is_directory=True)
-                try:
-                    return core.check_tests(target_scope, [target / p for p in files], ctx, language,
-                                            allow_npm=config.get("npm_test", False), source_root=source_scope)
-                finally:
-                    if linked:
-                        if os.name == "nt":
-                            try:
-                                link.rmdir()
-                            except FileNotFoundError:
-                                pass
-                        else:
-                            link.unlink(missing_ok=True)
+                result = with_dependencies(target, {Path("."), scope} if language == "javascript" else (),
+                    lambda: core.check_tests(target_scope, [target / p for p in files], ctx, language,
+                                             allow_npm=config.get("npm_test", False), source_root=original / scope,
+                                             project_root=target, unittest_patterns=config.get("unittest_patterns"),
+                                             registered_smoke=registered_smoke))
+                for finding in result.findings:
+                    if finding.get("line", 0) > 0:
+                        finding["file"] = (scope / finding["file"]).as_posix()
+                if language == "javascript" and result.exit_code is not None:
+                    code, version = core._run(["node", "--version"], target_scope, 5)
+                    version = version.strip().removeprefix("v")
+                    if code == 0 and re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", version):
+                        result.runtime_version = version
+                return result
 
             run(prefix + suffix, f"{language} code requires test evidence",
                 local_tests)
@@ -378,12 +429,12 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
     for name in ("build", "runtime"):
         if name in config:
             run(name, f"Project {name} assertion",
-                lambda target, name=name: adapters.contract(name, config[name], target, source_root=source_root))
+                lambda target, name=name: contract(target, name, config[name]))
     for index, row in enumerate(config.get("contracts", []), 1):
         identifier = f"contract-{index}"
         run(identifier, "Project business contract assertion",
             lambda target, identifier=identifier, row=row:
-                adapters.contract(identifier, row, target, source_root=source_root))
+                contract(target, identifier, row))
     for index, row in enumerate(config.get("delivery", []), 1):
         identifier = f"delivery-{index}"
         run(identifier, "Delivery archive contents and digest",
@@ -519,6 +570,17 @@ def _finalize(report: dict, output: Path | None, *, evidence_key: bytes | None =
     write_manifest(report, output, key=evidence_key)
 
 
+def _stable_findings(report: dict, locations: Path, key: bytes) -> None:
+    if not locations.is_file():
+        return
+    lookup = json.loads(locations.read_bytes())
+    for row in report["checks"]:
+        for finding in row.get("findings", ()):
+            relative = lookup[finding["file"]]
+            identity = json.dumps([report["target_identity"], os.path.normcase(relative)]).encode()
+            finding["file"] = "source-h" + hmac.digest(key, identity, "sha256").hex()[:32]
+
+
 def _evidence_root(path: Path) -> Path:
     path = path.absolute()
     for part in (path, *path.parents):
@@ -584,6 +646,7 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
             if revision or against:
                 source, git_context = _protected_git_source(root, work, revision, against)
                 context.update(git_context)
+                context["dependency_assurance"] = "HOST_UNPINNED"
             inventory = {}
             if single_file:
                 snapshot.mkdir()
@@ -639,7 +702,8 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
                             "sys.argv[7]=='True',sys.argv[8]=='True',sys.argv[9]=='True',Path(sys.argv[10]))",
                             str(Path(__file__).resolve().parent), str(snapshot),
                             str(host_execution and not omitted), str(result_path),
-                            json.dumps(policy_required), str(launch), str(sealed), str(local_locations), str(single_file),
+                            json.dumps(policy_required), str(launch), str(sealed),
+                            str(local_locations or evidence_key is not None), str(single_file),
                             str(root)],
                            cwd=work, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            start_new_session=os.name != "nt",
@@ -685,8 +749,10 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
             if not sealed:
                 report["evidence_dir"] = str(run_output)
                 report = scrub(report)
-            _record_checks(report, run_output, work)
             location_data = work / "locations.json"
+            if evidence_key is not None:
+                _stable_findings(report, location_data, evidence_key)
+            _record_checks(report, run_output, work)
             if local_locations and location_data.is_file():
                 private_write(run_output / location_data.name, location_data.read_bytes())
                 report["local_finding_index"] = True

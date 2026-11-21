@@ -13,6 +13,7 @@ REASONS = {"JAVASCRIPT_SYNTAX_UNAVAILABLE", "ISOLATION_UNAVAILABLE",
            "ISOLATED_TEST_ORACLE_UNVERIFIED", "ISOLATED_PROCESS_NONZERO",
            "UNSUPPORTED_ISOLATED_ADAPTER", "CUSTOM_RULE_BUDGET_EXCEEDED", "EXECUTION_NOT_RUN", "NO_TEST_ENTRY",
            "TEST_RUNTIME_UNAVAILABLE", "TEST_TIMEOUT_OR_CANCELLED", "TEST_COVERAGE_MISSING", "TEST_OUTPUT_LIMIT",
+           "TESTS_DESELECTED",
            "MISSING_BROWSER_DEPENDENCY",
            "BEHAVIOR_CONTRACT_UNAVAILABLE", "BEHAVIOR_CONTRACT_MATCHED", "BEHAVIOR_CONTRACT_MISMATCH",
            "BEHAVIOR_CONTRACT_INCOMPLETE", "GIT_MERGE_CONFLICT", "GIT_SNAPSHOT_UNAVAILABLE"}
@@ -20,6 +21,9 @@ PUBLIC_CHECKS = frozenset(check_specs.ordered_ids()) | {
     "execution-isolation", "scan-coverage", "configuration", "behavior-contract", "git-snapshot",
     "tests-python", "tests-javascript", "typescript", "build-native", "runtime-native", "tests-native",
 }
+FINDING_KINDS = {"syntax": "SOURCE_SYNTAX_INVALID", "tests": "TEST_FAILURE",
+                 "tests-python": "TEST_FAILURE", "tests-javascript": "TEST_FAILURE"}
+SOURCE_ALIAS = re.compile(r"source-(?:[0-9]{3,6}|h[0-9a-f]{32})")
 
 
 def project_receipts(report: dict, *, locations: dict | None = None) -> dict:
@@ -33,6 +37,7 @@ def project_receipts(report: dict, *, locations: dict | None = None) -> dict:
     public_plan = {ids[key]: "Required verification check" for key in plan}
     public_checks = []
     aliases = {}
+    sealed = report.get("export_policy") == "sealed"
     for row in checks:
         identifier = ids[row["id"]]
         state = row.get("state")
@@ -43,30 +48,40 @@ def project_receipts(report: dict, *, locations: dict | None = None) -> dict:
         reason = row.get("reason_code")
         if reason in REASONS:
             public["reason_code"] = reason
-        kind = row["id"].rsplit(":", 1)[-1]
-        finding_code = {"syntax": "SOURCE_SYNTAX_INVALID", "tests": "TEST_FAILURE",
-                        "tests-python": "TEST_FAILURE", "tests-javascript": "TEST_FAILURE"}.get(kind)
-        if kind == identifier and finding_code and state == "FAIL":
+        if state == "FAIL":
             findings = []
             for finding in (row.get("findings") or [])[:100]:
                 file, line = finding.get("file"), finding.get("line")
-                if isinstance(file, str) and type(line) is int and 0 < line <= 1_000_000:
+                if not isinstance(file, str) or type(line) is not int or not 0 < line <= 1_000_000:
+                    continue
+                if sealed:
+                    finding_code = finding.get("message")
+                    if finding_code not in FINDING_KINDS.values() or not SOURCE_ALIAS.fullmatch(file):
+                        continue
+                    alias = file
+                else:
+                    finding_code = FINDING_KINDS.get(row["id"].rsplit(":", 1)[-1])
+                    if not finding_code:
+                        continue
                     alias = aliases.setdefault(file, f"source-{len(aliases) + 1:03}")
                     if locations is not None:
                         locations[alias] = file
-                    findings.append({"file": alias, "line": line, "message": finding_code})
+                findings.append({"file": alias, "line": line, "message": finding_code})
             if findings:
                 public["findings"] = findings
-                public["remediation"] = ("Check the source syntax at the reported line." if kind == "syntax"
+                public["remediation"] = ("Check the source syntax at the reported line." if identifier == "syntax"
                                          else "Inspect the failing test and assertion at the reported line.")
         coverage = row.get("coverage")
-        keys = ("planned", "observed", "skipped", "planned_files", "observed_files")
+        keys = ("planned", "observed", "skipped", "planned_files", "observed_files", "collected", "deselected")
         if coverage and all(type(coverage.get(key, 0)) is int and 0 <= coverage.get(key, 0) <= 200_000
                             for key in keys):
             public["coverage"] = {key: coverage.get(key, 0) for key in keys
                                   if key in coverage or key in ("planned", "observed", "skipped")}
         if type(row.get("exit_code")) is int and -65536 <= row["exit_code"] <= 65536:
             public["exit_code"] = row["exit_code"]
+        version = row.get("runtime_version")
+        if isinstance(version, str) and re.fullmatch(r"[0-9]{1,4}(?:\.[0-9]{1,4}){2}", version):
+            public["runtime_version"] = version
         if type(row.get("unregistered_candidates")) is int and 0 < row["unregistered_candidates"] <= 200000:
             public["unregistered_candidates"] = row["unregistered_candidates"]
         seconds = row.get("seconds")
@@ -106,6 +121,8 @@ def mcp_report(report: dict, run_id: str, version: str) -> dict:
             public["python_version"] = report["python"]
     if report.get("reason_code") == "GIT_SNAPSHOT_UNAVAILABLE":
         public["reason_code"] = "GIT_SNAPSHOT_UNAVAILABLE"
+    if report.get("dependency_assurance") == "HOST_UNPINNED":
+        public["dependency_assurance"] = "HOST_UNPINNED"
     omitted = report.get("protected_input")
     if isinstance(omitted, dict) and type(omitted.get("excluded_count")) is int:
         public["protected_input"] = {"reason_code": "PROTECTED_INPUT_EXCLUDED",

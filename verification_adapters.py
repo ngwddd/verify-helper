@@ -273,7 +273,13 @@ def read_config(root: Path) -> dict:
     data = document.get("verification", {})
     if not isinstance(data, dict):
         raise ValueError("verification must be a TOML table")
-    extra = set(data) - {"contracts", "delivery", "build", "runtime", "mutation", "npm_test"}
+    extra = set(data) - {"contracts", "delivery", "build", "runtime", "mutation", "npm_test", "unittest_patterns"}
+    if "unittest_patterns" in data:
+        patterns = data["unittest_patterns"]
+        if (not isinstance(patterns, list) or not patterns or not all(
+                isinstance(pattern, str) and pattern.endswith(".py") and not {"/", "\\"}.intersection(pattern)
+                for pattern in patterns)):
+            raise ValueError("unittest_patterns must be a nonempty list of Python file name patterns")
     if "npm_test" in data and type(data["npm_test"]) is not bool:
         raise ValueError("npm_test must be a boolean")
     if extra:

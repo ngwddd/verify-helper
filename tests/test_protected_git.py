@@ -52,12 +52,17 @@ class TestProtectedGit(unittest.TestCase):
         self.assertEqual(self.verify(revision=head)["reason_code"], "GIT_SNAPSHOT_UNAVAILABLE")
 
     def test_exact_revision_uses_packed_objects_and_requires_clean_input(self):
-        head = self.run_git("rev-parse", "HEAD")
+        self.write("testAPI.py", "import unittest\nclass Case(unittest.TestCase):\n    def test_revision(self): pass\n")
+        head = self.commit("Add runtime coverage fixture")
         self.run_git("gc", "--quiet")
         self.run_git("pack-refs", "--all")
         report = self.verify(revision=head)
         self.assertEqual(report["git"]["head"], head)
         self.assertFalse(report["git"]["dirty"])
+        self.assertEqual(report["verdict"], "PASS")
+        self.assertEqual(report["dependency_assurance"], "HOST_UNPINNED")
+        row = next(row for row in report["checks"] if row["id"] == "tests")
+        self.assertRegex(row["runtime_version"], r"^\d+\.\d+\.\d+$")
         self.assertFalse(report["releasable"])
         self.write("entry.py", "value = 2\n")
         dirty = self.verify(revision=head)

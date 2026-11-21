@@ -16,8 +16,8 @@ jobs:
       - name: Install the approved Verify Helper candidate
         working-directory: ${{ runner.temp }}
         run: |
-          wheel=verify_helper-2.0.1rc2-py3-none-any.whl
-          release='https://github.com/ngwddd/verify-helper/releases/download/v2.0.1-rc2'
+          wheel=verify_helper-2.0.1rc3-py3-none-any.whl
+          release='https://github.com/ngwddd/verify-helper/releases/download/v2.0.1-rc3'
           curl --fail --location --proto '=https' --output "$wheel" \
             "$release/$wheel"
           curl --fail --location --proto '=https' --output SHA256SUMS "$release/SHA256SUMS"

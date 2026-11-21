@@ -221,6 +221,8 @@ def create_server(workspace: Path, *, evidence_dir: Path | None = None,
         def checks(report):
             safe = project_receipts(report)
             return {row["id"]: {"verdict": row["state"], "coverage": row.get("coverage"),
+                                "reason_code": row.get("reason_code"),
+                                "runtime_version": row.get("runtime_version"),
                                 "findings": sorted(row.get("findings", []),
                                                    key=lambda item: (item["file"], item["line"], item["message"]))}
                     for row in safe["checks"] if row["id"] in safe["plan"]}

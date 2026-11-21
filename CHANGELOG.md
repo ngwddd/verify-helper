@@ -1,3 +1,12 @@
+## [2.0.1 RC3]
+
+- 补齐 unittest 标准发现范围，记录 pytest 被过滤的用例。区分声明的依赖缺失与项目导入错误。
+- Covers standard unittest discovery, records pytest deselection, and distinguishes missing declared dependencies from project import errors.
+- MCP 跨轮对比使用工作区内稳定的文件标识，保留子项目测试失败位置。
+- MCP compares stable workspace-scoped file identifiers and retains nested project test locations.
+- 已安装的 Node 依赖同时支持测试、构建和业务契约。Git 验证报告选用的运行时版本及本机依赖限制。
+- Reuses installed Node dependencies for tests, builds, and contracts. Git verification reports the selected runtime version and local dependency assurance.
+
 ## [2.0.1 RC2]
 
 - Python 测试核对文件清单与实际运行覆盖，复用本机项目的 Python 虚拟环境和 Node 依赖。

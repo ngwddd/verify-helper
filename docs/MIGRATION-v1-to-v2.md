@@ -13,6 +13,6 @@ The full verification command and MCP tool use the same gate. Exit codes are 0 f
 | `DSH_TEST_PYTHON` | Operator-provided `VERIFY_HELPER_TEST_PYTHON` |
 | MCP `against` input | `source_ref` supplies the merge base for the clean checkout |
 
-The CLI accepts `--json FILE`, `--json` for stdout and `--evidence-dir DIR` for a dedicated artifact directory. The default CLI report location is under the local user state outside the project. MCP stores runs by workspace and principal namespace. Check the `releasable` and `verdict` fields before accepting a project run. Keep OAuth, TLS and system isolation requirements in deployment policy.
+The CLI accepts `--json FILE`, `--json` for stdout and `--evidence-dir DIR` for a dedicated artifact directory. The default CLI report location is under the local user state outside the project. MCP stores runs by workspace and principal namespace. Verify Helper 2.0.1 runs installed project tools as the current user. Use it for trusted projects. `verdict` describes the checks that ran. The historical `releasable` field remains for report compatibility and is false for local project runs.
 
 The last 1.x GitHub release remains available as v1.10.7. [v1.10.7 release](https://github.com/ngwddd/verify-helper/releases/tag/v1.10.7)
