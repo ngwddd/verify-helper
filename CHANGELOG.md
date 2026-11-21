@@ -1,3 +1,12 @@
+## [2.0.1 RC2]
+
+- Python 测试核对文件清单与实际运行覆盖，复用本机项目的 Python 虚拟环境和 Node 依赖。
+- Python checks reconcile discovered test files with actual execution. Project runs reuse existing Python virtual environments and Node dependencies.
+- 修复 MCP 浏览器截图证据与完整裁决的冲突，增加测试失败位置、跨轮对比和命令日志预算。
+- MCP retains private browser evidence for the final verdict and adds safe test locations, run comparison, and an output budget.
+- 2.0.1 系列在当前用户身份下运行可信项目的测试及命令，具备本机文件及网络访问权限。
+- The 2.0.1 series runs trusted project tests and commands as the current user, with access to local files and the network.
+
 ## [2.0.0]
 
 - CLI 和 MCP 支持验证单个文件与项目目录。结果包含 PASS、FAIL、UNKNOWN、JSON、SARIF 和逐项证据。

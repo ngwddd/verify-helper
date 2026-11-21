@@ -121,7 +121,7 @@ def typescript(root: Path, configs: list[Path], sources: list[Path]) -> core.Che
     return result
 
 
-def contract(identifier: str, row: object, root: Path) -> core.Check:
+def contract(identifier: str, row: object, root: Path, *, source_root: Path | None = None) -> core.Check:
     if not isinstance(row, dict):
         return check(identifier, "No executable contract configured")
     argv = row.get("argv")
@@ -129,7 +129,7 @@ def contract(identifier: str, row: object, root: Path) -> core.Check:
             any(not isinstance(part, str) or not part for part in argv)):
         return check(identifier, "Contract argv must be a nonempty array of strings", "FAIL")
     if argv[0] == "python":
-        argv = [core._py_for(root), *argv[1:]]
+        argv = [core._py_for(source_root or root), *argv[1:]]
     marker = row.get("expect_output")
     if not isinstance(marker, str) or not marker.strip():
         return check(identifier, "Contract must declare a nonempty expect_output line", "FAIL")

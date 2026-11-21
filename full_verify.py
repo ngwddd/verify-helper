@@ -378,11 +378,12 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
     for name in ("build", "runtime"):
         if name in config:
             run(name, f"Project {name} assertion",
-                lambda target, name=name: adapters.contract(name, config[name], target))
+                lambda target, name=name: adapters.contract(name, config[name], target, source_root=source_root))
     for index, row in enumerate(config.get("contracts", []), 1):
         identifier = f"contract-{index}"
         run(identifier, "Project business contract assertion",
-            lambda target, identifier=identifier, row=row: adapters.contract(identifier, row, target))
+            lambda target, identifier=identifier, row=row:
+                adapters.contract(identifier, row, target, source_root=source_root))
     for index, row in enumerate(config.get("delivery", []), 1):
         identifier = f"delivery-{index}"
         run(identifier, "Delivery archive contents and digest",

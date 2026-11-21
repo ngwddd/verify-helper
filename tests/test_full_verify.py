@@ -101,9 +101,19 @@ class LocalEnvironment(unittest.TestCase):
         self.assertEqual(Path(sys.prefix).name, ".venv")
         self.assertFalse(Path(".venv").exists())
 """)
+        self.file("smoke_local.py", """import sys
+from pathlib import Path
+assert Path(sys.prefix).name == ".venv"
+print("smoke passed")
+""")
+        self.file("verify.toml", """[[verification.contracts]]
+argv = ["python", "smoke_local.py"]
+expect_output = "smoke passed"
+""")
         with patch.dict(os.environ, {"VERIFY_HELPER_TEST_PYTHON": ""}):
             report, rows = self.run_full()
         self.assertEqual(report["verdict"], "PASS", rows["tests"])
+        self.assertEqual(rows["contract-1"]["state"], "PASS")
 
     @unittest.skipUnless(shutil.which("node"), "Requires Node")
     def test_node_uses_existing_es_module_dependency(self):
