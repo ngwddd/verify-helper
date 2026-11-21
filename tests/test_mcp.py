@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 import socket
 import subprocess
@@ -36,17 +38,45 @@ class TestMcp(unittest.IsolatedAsyncioTestCase):
             cases = next(row for row in result["checks"] if row["id"] == "tests")
             self.assertEqual(result["verdict"], "PASS")
             self.assertEqual(result["execution_mode"], "local-host")
-            self.assertEqual(cases["coverage"], {"planned": 38, "observed": 38, "skipped": 0})
+            self.assertEqual(cases["coverage"], {"planned": 38, "observed": 38, "skipped": 0,
+                                                 "planned_files": 1, "observed_files": 1})
             self.assertEqual(cases["unregistered_candidates"], 4)
             suite.write_text(suite.read_text().replace("assertEqual(1, 1)", "assertEqual(1, 2)", 1),
                              encoding="utf-8")
             second = await client.call_tool("verify_run_full", {"path": "python-suite"})
             second_id = second.structured_content["run_id"]
-            self.assertEqual((await self.wait_for_report(client, second_id))["verdict"], "FAIL")
+            failed = await self.wait_for_report(client, second_id)
+            self.assertEqual(failed["verdict"], "FAIL")
+            finding = next(row for row in failed["checks"] if row["id"] == "tests")["findings"][0]
+            self.assertEqual(finding, {"file": "source-001", "line": 3, "message": "TEST_FAILURE"})
             diff = await client.call_tool("verify_compare_runs",
                                           {"first_run_id": first_id, "second_run_id": second_id})
             self.assertEqual(diff.structured_content["status"], "COMPARABLE")
-            self.assertTrue(any(row["check_id"] == "tests" for row in diff.structured_content["changes"]))
+            changed = next(row for row in diff.structured_content["changes"] if row["check_id"] == "tests")
+            self.assertIn(finding, changed["after"]["findings"])
+
+    @unittest.skipUnless(os.environ.get("VERIFY_PLAYWRIGHT_ROOT"), "Requires Chromium")
+    async def test_browser_pass_keeps_private_evidence(self):
+        fixture = self.root / "browser"
+        fixture.mkdir()
+        (fixture / "index.html").write_text(
+            '<!doctype html><html lang="en"><head><title>Fixture</title></head><body><h1>Ready</h1></body></html>',
+            encoding="utf-8")
+        async with Client(self.stdio()) as client:
+            first = await client.call_tool("verify_run_full", {"path": "browser"})
+            run_id = first.structured_content["run_id"]
+            report = await self.wait_for_report(client, run_id)
+        browser = next(row for row in report["checks"] if row["id"] == "browser")
+        self.assertEqual(report["verdict"], "PASS", report)
+        self.assertGreater(browser["media_count"], 0)
+        self.assertNotIn("media", browser)
+        saved_run = next(self.evidence.glob(f"*/{run_id}"))
+        manifest = json.loads((saved_run / "manifest.json").read_bytes())
+        screenshots = list(saved_run.glob("*.png"))
+        self.assertEqual(len(screenshots), browser["media_count"])
+        for screenshot in screenshots:
+            self.assertEqual(hashlib.sha256(screenshot.read_bytes()).hexdigest(),
+                             manifest["files"][screenshot.name])
 
     def setUp(self):
         self.workspace = tempfile.TemporaryDirectory()
@@ -93,9 +123,11 @@ class TestMcp(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.05)
 
     def stdio(self):
+        browser_env = {key: os.environ[key] for key in
+                       ("VERIFY_PLAYWRIGHT_ROOT", "PLAYWRIGHT_BROWSERS_PATH") if key in os.environ}
         return StdioServerParameters(command=sys.executable,
                                      args=[str(SERVER), "--workspace", str(self.root),
-                                           "--evidence-dir", str(self.evidence)])
+                                           "--evidence-dir", str(self.evidence)], env=browser_env)
 
     async def test_legacy_stdio(self):
         _, version = await self.call(self.stdio(), "legacy")

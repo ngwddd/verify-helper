@@ -24,7 +24,7 @@ from starlette.responses import Response
 
 from full_verify import _evidence_root, full_verify
 from private_storage import private_directory, require_private
-from report_export import mcp_report
+from report_export import mcp_report, project_receipts
 from run_evidence import json_bytes, read_evidence
 from verify_core import VERSION
 
@@ -219,8 +219,11 @@ def create_server(workspace: Path, *, evidence_dir: Path | None = None,
         if first["plan"] != second["plan"]:
             return {"status": "NOT_COMPARABLE", "reason": "PLAN_CHANGED"}
         def checks(report):
-            return {row["id"]: {"verdict": row["state"], "coverage": row.get("coverage")}
-                    for row in report["checks"] if row["id"] in report["plan"]}
+            safe = project_receipts(report)
+            return {row["id"]: {"verdict": row["state"], "coverage": row.get("coverage"),
+                                "findings": sorted(row.get("findings", []),
+                                                   key=lambda item: (item["file"], item["line"], item["message"]))}
+                    for row in safe["checks"] if row["id"] in safe["plan"]}
         prior, current = checks(first), checks(second)
         return {"status": "COMPARABLE", "first_verdict": first["verdict"], "second_verdict": second["verdict"],
                 "snapshot_changed": first.get("snapshot_sha256") != second.get("snapshot_sha256"),

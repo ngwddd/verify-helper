@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "verify-helper"
-version = "2.0.1rc1"
+version = "2.0.1rc2"
 description = "Evidence-based full project verification for MCP clients"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,7 +19,7 @@ verify-helper-mcp = "server:main"
 release = ["cryptography>=45"]
 
 [tool.setuptools]
-py-modules = ["verify_core", "full_verify", "run_evidence", "process_boundary", "verification_adapters", "server", "lifecycle", "check_specs", "directions", "sarif", "report_export", "private_storage", "protected_git"]
+py-modules = ["verify_core", "full_verify", "run_evidence", "process_boundary", "verification_adapters", "server", "lifecycle", "check_specs", "directions", "sarif", "report_export", "private_storage", "protected_git", "unittest_runner"]
 
 [tool.setuptools.package-data]
 verification_resources = ["*.mjs"]

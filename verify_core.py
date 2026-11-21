@@ -31,6 +31,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
@@ -44,7 +45,7 @@ import yaml
 import check_specs as S
 import directions as DIR
 
-VERSION = "2.0.1rc1"
+VERSION = "2.0.1rc2"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -465,33 +466,53 @@ def _terminate_process(proc: subprocess.Popen, *, process_group: bool = True) ->
         proc.kill()
 
 
+COMMAND_OUTPUT_LIMIT = 8 * 1024 * 1024
+OUTPUT_LIMIT_MESSAGE = "Command output exceeded its byte limit"
+
+
 def _run(cmd: list[str], cwd: Path, timeout: int) -> tuple[int, str]:
     if _worker_cancelled():
         return 125, "Verification was cancelled"
     argv = [_which(cmd[0])] + list(cmd[1:])
     try:
         with subprocess.Popen(argv, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              text=True, encoding="utf-8", errors="replace",
+                              bufsize=0,
                               start_new_session=os.name != "nt",
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as proc:
-            deadline = time.monotonic() + timeout
-            while True:
+            output = bytearray()
+            drained = threading.Event()
+            over_limit = False
+
+            def read_output():
+                nonlocal over_limit
                 try:
-                    remaining = max(0, deadline - time.monotonic())
-                    window = min(0.25, remaining) if os.environ.get("VERIFY_HELPER_CANCEL_FILE") else remaining
-                    output, _ = proc.communicate(timeout=window)
-                    return proc.returncode, output or ""
-                except subprocess.TimeoutExpired as error:
-                    if _worker_cancelled():
-                        _terminate_process(proc)
-                        return 125, "Verification was cancelled"
-                    if time.monotonic() < deadline:
-                        continue
+                    while chunk := proc.stdout.read(65536):
+                        if len(output) + len(chunk) > COMMAND_OUTPUT_LIMIT:
+                            over_limit = True
+                            break
+                        output.extend(chunk)
+                except (OSError, ValueError):
+                    return
+                finally:
+                    drained.set()
+
+            threading.Thread(target=read_output, daemon=True).start()
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if _worker_cancelled():
                     _terminate_process(proc)
-                    partial = error.output or ""
-                    if isinstance(partial, bytes):
-                        partial = partial.decode("utf-8", "replace")
-                    return 124, f"超时（>{timeout}s）：{' '.join(cmd)}\n{_tail(partial, 12000)}"
+                    return 125, "Verification was cancelled"
+                remaining = max(0, deadline - time.monotonic())
+                if drained.wait(min(0.1, remaining)):
+                    if over_limit:
+                        _terminate_process(proc)
+                        return 125, OUTPUT_LIMIT_MESSAGE
+                    try:
+                        return proc.wait(timeout=min(0.1, remaining)), output.decode("utf-8", "replace")
+                    except subprocess.TimeoutExpired:
+                        continue
+            _terminate_process(proc)
+            return 124, f"超时（>{timeout}s）：{' '.join(cmd)}\n{_tail(output.decode('utf-8', 'replace'), 12000)}"
     except FileNotFoundError:
         return 127, f"命令不存在：{cmd[0]}"
     except subprocess.TimeoutExpired:
@@ -1024,12 +1045,12 @@ def check_bom(root: Path, files: list[Path], ctx: "Ctx") -> Check:
 # 这一层真的把页面跑起来，抓 JS 异常、console.error、资源 404。
 # 没有 playwright 就老实记 UNKNOWN —— 不假装验过。
 # ──────────────────────────────────────────────────────────────────────
-def _find_playwright(root: Path) -> Path | None:
+def _find_playwright(root: Path, source_root: Path | None = None) -> Path | None:
     """找一个 node 能 require 到 playwright 的目录。"""
     here = Path(__file__).resolve().parent
     home = Path.home()
     configured = Path(os.environ.get("VERIFY_PLAYWRIGHT_ROOT", str(here)))
-    for d in (configured, root, here, home / "AppData/Roaming/npm", home / ".npm-global",
+    for d in (configured, root, source_root or root, here, home / "AppData/Roaming/npm", home / ".npm-global",
               Path.home() / "node_modules"):
         try:
             if (d / "node_modules" / "playwright").is_dir():
@@ -1039,7 +1060,7 @@ def _find_playwright(root: Path) -> Path | None:
     return None
 
 
-def check_browser(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+def check_browser(root: Path, files: list[Path], ctx: "Ctx", *, source_root: Path | None = None) -> Check:
     c = Check("browser", "浏览器运行时：页面跑起来有没有报错")
     t0 = time.time()
     htmls = [p for p in files if p.suffix.lower() in HTML_EXT]
@@ -1052,7 +1073,8 @@ def check_browser(root: Path, files: list[Path], ctx: "Ctx") -> Check:
         c.state, c.applicable = "UNKNOWN", False
         c.detail = "没有 index.html，无法确定站点根"
         return c
-    pw_dir = _find_playwright(root) or _find_playwright(site_root)
+    original_site = source_root / site_root.relative_to(root) if source_root else None
+    pw_dir = _find_playwright(root, source_root) or _find_playwright(site_root, original_site)
     if pw_dir is None:
         c.state, c.applicable = "UNKNOWN", False
         c.detail = "没找到 playwright（npm i -D playwright && npx playwright install chromium）"
@@ -1239,7 +1261,7 @@ def _load_flows(root: Path) -> tuple[list[dict], str]:
     return flows, ""
 
 
-def check_interaction(root: Path, files: list[Path], ctx: "Ctx") -> Check:
+def check_interaction(root: Path, files: list[Path], ctx: "Ctx", *, source_root: Path | None = None) -> Check:
     c = Check("interaction", "交互测试：点击 / 表单 / 跳转之后对不对")
     t0 = time.time()
     flows, why = _load_flows(root)
@@ -1250,7 +1272,8 @@ def check_interaction(root: Path, files: list[Path], ctx: "Ctx") -> Check:
 
     htmls = [p for p in files if p.suffix.lower() in HTML_EXT]
     site_root = _find_site_root(root, htmls) or root
-    pw_dir = _find_playwright(root) or _find_playwright(site_root)
+    original_site = source_root / site_root.relative_to(root) if source_root else None
+    pw_dir = _find_playwright(root, source_root) or _find_playwright(site_root, original_site)
     if pw_dir is None:
         c.state, c.applicable = "UNKNOWN", False
         c.detail = "没找到 playwright，交互测试跑不了"
@@ -1598,8 +1621,9 @@ def _test_counts(out: str) -> tuple[int, int]:
     """Return collected and skipped counts from supported runner summaries."""
     unittest_count = re.findall(r"^Ran (\d+) tests? in ", out, re.M)
     if unittest_count:
-        skipped = re.findall(r"^OK \(skipped=(\d+)[,)]", out, re.M)
-        return int(unittest_count[-1]), int(skipped[-1]) if skipped else 0
+        summary = re.findall(r"^(?:OK|FAILED) \(([^)]+)\)", out, re.M)
+        skipped = re.findall(r"(?:skipped|expected failures)=(\d+)", summary[-1]) if summary else []
+        return int(unittest_count[-1]), sum(map(int, skipped))
     tap = re.search(r"^(?:#|ℹ) tests (\d+)\s*$", out, re.M)
     if tap:
         skipped = re.search(r"^(?:#|ℹ) skipped (\d+)\s*$", out, re.M)
@@ -1615,37 +1639,122 @@ def _test_counts(out: str) -> tuple[int, int]:
     return 0, 0
 
 
-def check_tests(root: Path, files: list[Path], ctx: "Ctx", language: str | None = None, *, allow_npm: bool = True) -> Check:
+def _node_coverage_matches(out: str, planned: int) -> bool:
+    if "TAP version 13" not in out:
+        return False
+    counters = dict(re.findall(r"^# (tests|pass|fail|cancelled|skipped|todo) (\d+)\s*$", out, re.M))
+    return (len(counters) == 6 and int(counters["tests"]) == planned
+            and int(counters["pass"]) == planned and all(int(counters[state]) == 0
+                for state in ("fail", "cancelled", "skipped", "todo")))
+
+
+def _test_locations(out: str, root: Path, files: list[Path]) -> list[dict]:
+    known = {path.relative_to(root).as_posix() for path in files if path.is_relative_to(root)}
+    locations = set()
+    for filename, line in re.findall(r'File "([^"]+)", line (\d+)', out):
+        path = Path(filename)
+        if path.is_absolute() and path.is_relative_to(root):
+            locations.add((path.relative_to(root).as_posix(), int(line)))
+    for filename, line in re.findall(r"^[ \t]*([^\r\n]+?\.py):(\d+):\s*(?:[A-Za-z]+Error|Failed)", out, re.M):
+        locations.add((filename.replace("\\", "/"), int(line)))
+    for filename in re.findall(r"^not ok \d+ - ([^\r\n]+)", out, re.M):
+        locations.add((filename.replace("\\\\", "/").replace("\\", "/"), 1))
+    return [{"file": path, "line": line, "message": "TEST_FAILURE"}
+            for path, line in sorted(locations) if path in known][:100]
+
+
+def check_tests(root: Path, files: list[Path], ctx: "Ctx", language: str | None = None, *,
+                allow_npm: bool = True, source_root: Path | None = None) -> Check:
     c = Check("tests", "测试：跑得起来，且真的通过")
     t0 = time.time()
     if language == "python":
         c.unregistered_candidates = sum(path.suffix == ".py" and path.name.startswith("smoke_")
                                         and path.is_relative_to(root) for path in files)
     cmd, why, timeout = _detect_test_command(root, language, allow_npm=allow_npm)
+    planned_files = []
+    python_runner = None
+    if language == "python" and source_root is not None:
+        planned_files = sorted(path.relative_to(root).as_posix() for path in files
+                               if path.is_relative_to(root) and path.suffix == ".py"
+                               and (path.name.startswith("test_") or path.name.endswith("_test.py")))
+        python = _py_for(source_root)
+        if (cmd is None and planned_files) or (cmd and cmd[1:3] == ["-m", "unittest"]):
+            python_runner = "unittest"
+            why, timeout = "Explicit unittest file inventory", 300
+        elif cmd and cmd[1:3] == ["-m", "pytest"]:
+            python_runner = "pytest"
+        elif cmd:
+            cmd[0] = python
+        if python_runner:
+            launcher = Path(__file__).with_name("unittest_runner.py")
+            cmd = [python, str(launcher), python_runner]
     if cmd is None:
         c.state, c.applicable = "UNKNOWN", False
         c.reason_code = "NO_TEST_ENTRY"
         c.detail = why
         return c
-    code, out = _run(cmd, root, min(timeout, ctx.test_timeout))
+    if python_runner:
+        with tempfile.TemporaryDirectory(prefix="vh-test-list-") as directory:
+            inventory = Path(directory) / "tests.json"
+            inventory.write_text(json.dumps(planned_files), encoding="utf-8")
+            code, out = _run([*cmd, str(inventory)], root, min(timeout, ctx.test_timeout))
+    else:
+        code, out = _run(cmd, root, min(timeout, ctx.test_timeout))
     c.command = " ".join(cmd)
     c.exit_code = code
     failure = re.search(r"^(?:FAIL|ERROR):\s+\S+", out, re.M)
     c.output = (out[failure.start():failure.start() + 12000] if code and failure
                 else _tail(out, 12000))
     ran, skipped = _test_counts(out)
-    c.coverage = {"planned": ran, "observed": max(0, ran - skipped), "skipped": skipped}
     if code in (124, 125, 126, 127) or code < 0:
-        c.reason_code = "TEST_TIMEOUT_OR_CANCELLED" if code == 124 else "TEST_RUNTIME_UNAVAILABLE"
+        c.reason_code = ("TEST_OUTPUT_LIMIT" if out == OUTPUT_LIMIT_MESSAGE else
+                         "TEST_TIMEOUT_OR_CANCELLED" if code == 124 or out == "Verification was cancelled"
+                         else "TEST_RUNTIME_UNAVAILABLE")
         c.detail = f"测试运行环境不可用（{code}）：{why}"
-    elif code == 5 or "no tests ran" in out.lower() or (code == 0 and ran <= skipped):
+    elif python_runner:
+        prefix = "VH_PY_TEST "
+        records = [line[len(prefix):] for line in out.splitlines() if line.startswith(prefix)]
+        try:
+            observed = json.loads(records[-1])
+            keys = {"files", "planned", "executed", "skipped", "failed", "missing", "errors"}
+            if (len(records) != 1 or observed.keys() != keys or
+                    any(type(value) is not int or value < 0 for value in observed.values())):
+                raise ValueError("Invalid unittest receipt")
+        except (IndexError, ValueError, AttributeError):
+            observed = None
+        if observed:
+            ran = observed["planned"]
+            skipped = observed["skipped"]
+            c.coverage = {"planned": ran, "observed": max(0, observed["executed"] - skipped),
+                          "skipped": skipped, "planned_files": len(planned_files), "observed_files": observed["files"]}
+            c.state = ("FAIL" if observed["failed"] or observed["errors"] else
+                       "PASS" if code == 0 and observed["files"] == len(planned_files)
+                       and ran == observed["executed"] and ran > 0 and not skipped and not observed["missing"]
+                       else "UNKNOWN")
+            c.reason_code = "TEST_RUNTIME_UNAVAILABLE" if observed["missing"] else (
+                "TEST_COVERAGE_MISSING" if c.state == "UNKNOWN" else "")
+        else:
+            c.reason_code = "TEST_COVERAGE_MISSING"
+        c.detail = why
+        c.seconds = time.time() - t0
+        if c.state == "FAIL":
+            c.findings = _test_locations(out, root, files)
+        return c
+    elif code == 1 and ran == 0 and re.search(r"^.+: No module named pytest\s*$", out, re.M):
+        c.reason_code = "TEST_RUNTIME_UNAVAILABLE"
+        c.detail = "pytest is not installed in the selected Python environment"
+    elif (code == 5 or "no tests ran" in out.lower() or
+          (code == 0 and (ran <= skipped or (cmd[:2] == ["node", "--test"] and source_root is not None
+                                           and "--test-reporter=tap" in cmd and not _node_coverage_matches(out, ran))))):
         c.reason_code = "TEST_COVERAGE_MISSING"
         c.detail = f"{why}；缺少实际执行证据，收集 {ran}，跳过 {skipped}"
     else:
         c.state = "FAIL" if code else "UNKNOWN" if skipped else "PASS"
         c.detail = f"{why}；退出码 {code}，收集 {ran}，跳过 {skipped}"
         names = re.findall(r"^(?:FAIL|ERROR):\s+(\S+)", out, re.M)[:10]
-        c.findings = [{"file": why, "line": 0, "message": n} for n in names]
+        c.findings = _test_locations(out, root, files) or [
+            {"file": why, "line": 0, "message": n} for n in names]
+    c.coverage = {"planned": ran, "observed": max(0, ran - skipped), "skipped": skipped}
     c.seconds = time.time() - t0
     return c
 

@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -74,6 +75,54 @@ class FullVerification(unittest.TestCase):
         self.assertEqual(rows["syntax"]["state"], "PASS")
         self.assertEqual(rows["tests"]["state"], "UNKNOWN")
         self.assertEqual(report["verdict"], "UNKNOWN")
+
+    def test_python_inventory_includes_nested_suffix_tests(self):
+        self.file("app.py", "def value(): return 42\n")
+        self.file("tests/test_app.py", PASSING_TEST)
+        self.file("tests/nested/broken_test.py", PASSING_TEST.replace("42", "43"))
+        report, rows = self.run_full()
+        self.assertEqual(report["verdict"], "FAIL")
+        self.assertEqual(rows["tests"]["coverage"], {"planned": 2, "observed": 2, "skipped": 0,
+                                                      "planned_files": 2, "observed_files": 2})
+        self.file("tests/nested/broken_test.py", "import vh_missing_fixture_dependency\n")
+        report, rows = self.run_full()
+        self.assertEqual(report["verdict"], "UNKNOWN")
+        self.assertEqual(rows["tests"]["reason_code"], "TEST_RUNTIME_UNAVAILABLE")
+        self.assertEqual(rows["tests"]["coverage"]["observed_files"], 1)
+
+    def test_python_uses_original_project_virtual_environment(self):
+        subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(self.root / ".venv")],
+                       check=True, timeout=30)
+        self.file("tests/test_env.py", """import sys
+import unittest
+from pathlib import Path
+class LocalEnvironment(unittest.TestCase):
+    def test_uses_project_environment(self):
+        self.assertEqual(Path(sys.prefix).name, ".venv")
+        self.assertFalse(Path(".venv").exists())
+""")
+        with patch.dict(os.environ, {"VERIFY_HELPER_TEST_PYTHON": ""}):
+            report, rows = self.run_full()
+        self.assertEqual(report["verdict"], "PASS", rows["tests"])
+
+    @unittest.skipUnless(shutil.which("node"), "Requires Node")
+    def test_node_uses_existing_es_module_dependency(self):
+        self.file("node_modules/fixture/package.json", '{"type":"module","exports":"./index.js"}')
+        dependency = self.file("node_modules/fixture/index.js", "export default 42;\n")
+        self.file("proof.test.mjs", """import value from 'fixture';
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+test('value', () => assert.equal(value, 42));
+""")
+        report, rows = self.run_full()
+        self.assertEqual(report["verdict"], "PASS", rows["tests"])
+        self.assertEqual(rows["tests"]["coverage"]["observed"], 1)
+        self.assertEqual(dependency.read_text(encoding="utf-8"), "export default 42;\n")
+
+    def test_command_output_budget_discards_truncated_results(self):
+        with patch.object(core, "COMMAND_OUTPUT_LIMIT", 1024):
+            code, result = core._run([sys.executable, "-c", "print('X' * 50000)"], self.root, 10)
+        self.assertEqual((code, result), (125, core.OUTPUT_LIMIT_MESSAGE))
 
     def test_partial_and_all_skipped_never_certify_complete_coverage(self):
         self.file("app.py", "def value(): return 42\n")

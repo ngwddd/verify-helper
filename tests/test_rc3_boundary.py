@@ -149,7 +149,7 @@ class TestProtectedVerification(unittest.TestCase):
             if os.name != "nt":
                 self.assertEqual(entry.stat().st_mode & 0o777, 0o600)
 
-    def test_legacy_cli_switch_is_rejected_without_executing(self):
+    def test_legacy_cli_switch_is_rejected_and_full_mode_runs_locally(self):
         witness = self.base / "host-witness"
         (self.source / "test_app.py").write_text(
             f"from pathlib import Path\nPath({str(witness)!r}).touch()\n", encoding="utf-8")
@@ -160,7 +160,8 @@ class TestProtectedVerification(unittest.TestCase):
         self.assertIn("unrecognized arguments", rejected.stderr)
         self.assertFalse(witness.exists())
         report = self.run_protected()
-        self.assertFalse(witness.exists())
+        self.assertTrue(witness.exists())
+        self.assertEqual(report["verdict"], "UNKNOWN")
         self.assertFalse(report["releasable"])
 
     def test_unsafe_success_is_not_releasable(self):

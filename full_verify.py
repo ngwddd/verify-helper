@@ -198,7 +198,7 @@ def _scope(root: Path, files: list[Path]) -> list[Path]:
 
 
 def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
-              single_file: bool = False) -> dict:
+              single_file: bool = False, source_root: Path | None = None) -> dict:
     files, _, large, _ = core.scan_files(root, project_ignores=False)
     selected = next(root.iterdir(), None) if single_file else None
     archive_target = selected if selected and selected.name.lower().endswith((".zip", ".whl", ".tar.gz", ".tgz")) else None
@@ -235,11 +235,12 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
         required[result.id] = reason
         record(result)
 
-    def run(identifier: str, description: str, action, *, requires_trust: bool = True):
+    def run(identifier: str, description: str, action, *, requires_trust: bool = True,
+            copy_project: bool = True):
         required[identifier] = description
-        tasks.append((identifier, action, requires_trust))
+        tasks.append((identifier, action, requires_trust, copy_project))
 
-    def execute(identifier, action, requires_trust):
+    def execute(identifier, action, requires_trust, copy_project):
         if core._worker_cancelled():
             result = adapters.check(identifier, "Verification was cancelled")
         elif requires_trust and (not trusted or config_error is not None or any(
@@ -249,7 +250,7 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
                 result.reason_code = "EXECUTION_NOT_RUN"
         else:
             try:
-                if requires_trust:
+                if requires_trust and copy_project:
                     with tempfile.TemporaryDirectory(prefix="vh-check-") as directory:
                         target = Path(directory) / "project"
                         shutil.copytree(root, target, ignore=shutil.ignore_patterns(*SNAPSHOT_EXCLUDES))
@@ -269,16 +270,17 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
     html = any(file.suffix.lower() in core.HTML_EXT for file in files)
     if html and not single_file:
         run("runtime-web", "HTML pages must be served over HTTP",
-            lambda target: core.check_runtime_web(target, [target / p.relative_to(root) for p in files], ctx))
+            lambda target: core.check_runtime_web(target, files, ctx), copy_project=False)
         run("browser", "HTML pages must load in a browser",
-            lambda target: core.check_browser(target, [target / p.relative_to(root) for p in files], ctx))
+            lambda target: core.check_browser(target, files, ctx, source_root=source_root), copy_project=False)
     try:
         flow_data = core.tomllib.loads((root / "verify.toml").read_text(encoding="utf-8-sig"))
     except (ValueError, OSError):
         flow_data = {}
     if "flows" in flow_data and not single_file:
         run("interaction", "Configured browser flow assertions must execute",
-            lambda target: core.check_interaction(target, [target / p.relative_to(root) for p in files], ctx))
+            lambda target: core.check_interaction(target, files, ctx, source_root=source_root),
+            copy_project=False)
 
     scopes = [] if single_file else _scope(root, files)
     for scope in scopes:
@@ -333,10 +335,35 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
             languages.append("javascript")
         for language in languages:
             suffix = f"tests-{language}" if len(languages) > 1 else "tests"
+
+            def local_tests(target, scope=relative_scope, files=relative_files, language=language):
+                target_scope = target / scope
+                source_scope = (source_root or root) / scope
+                dependencies = source_scope / "node_modules"
+                link = target_scope / "node_modules"
+                linked = (language == "javascript" and dependencies.is_dir()
+                          and dependencies.resolve().is_relative_to(source_scope))
+                if linked:
+                    if os.name == "nt":
+                        import _winapi
+                        _winapi.CreateJunction(str(dependencies), str(link))
+                    else:
+                        link.symlink_to(dependencies, target_is_directory=True)
+                try:
+                    return core.check_tests(target_scope, [target / p for p in files], ctx, language,
+                                            allow_npm=config.get("npm_test", False), source_root=source_scope)
+                finally:
+                    if linked:
+                        if os.name == "nt":
+                            try:
+                                link.rmdir()
+                            except FileNotFoundError:
+                                pass
+                        else:
+                            link.unlink(missing_ok=True)
+
             run(prefix + suffix, f"{language} code requires test evidence",
-                lambda target, scope=relative_scope, files=relative_files, language=language:
-                core.check_tests(target / scope, [target / p for p in files], ctx, language,
-                                 allow_npm=config.get("npm_test", False)))
+                local_tests)
 
     if config.get("mutation"):
         def mutation(target):
@@ -382,8 +409,8 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
     report["static_only"] = not any(task[2] for task in tasks)
     report["plan"] = required
     report["plan_digest"] = plan_digest(required)
-    for identifier, action, requires_trust in tasks:
-        execute(identifier, action, requires_trust)
+    for task in tasks:
+        execute(*task)
     by_id = {row["id"]: row for row in rows}
     for identifier in required:
         if identifier in by_id:
@@ -394,16 +421,9 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
 
 
 def _worker(root: Path, trusted: bool, result_path: Path, policy_required: tuple[str, ...] = (),
-            sealed: bool = False, local_locations: bool = False, single_file: bool = False) -> None:
-    report = _run_plan(root, trusted, policy_required, single_file)
-    if sealed:
-        locations = {} if local_locations else None
-        public = report_export.project_receipts(report, locations=locations)
-        public["static_only"] = report["static_only"]
-        if locations:
-            private_write(result_path.with_name("locations.json"), json.dumps(locations).encode())
-        result_path.write_text(json.dumps(public), encoding="utf-8")
-        return
+            sealed: bool = False, local_locations: bool = False, single_file: bool = False,
+            source_root: Path | None = None) -> None:
+    report = _run_plan(root, trusted, policy_required, single_file, source_root)
     for row in report["checks"]:
         evidence = row.get("evidence") or {}
         source = evidence.get("dir")
@@ -411,11 +431,22 @@ def _worker(root: Path, trusted: bool, result_path: Path, policy_required: tuple
             continue
         destination = result_path.parent / "media" / hashlib.sha256(row["id"].encode()).hexdigest()
         destination.mkdir(parents=True, exist_ok=True)
-        for path in Path(source).glob("*.png"):
-            if path.is_file() and not path.is_symlink():
+        for path in sorted(Path(source).glob("*.png"))[:100]:
+            if path.is_file() and not path.is_symlink() and path.stat().st_size <= 16 * 1024 * 1024:
                 name = hashlib.sha256(path.name.encode()).hexdigest() + ".png"
                 shutil.copy2(path, destination / name)
         row["evidence"] = {"dir": str(destination), "count": len(list(destination.iterdir()))}
+    if sealed:
+        locations = {} if local_locations else None
+        public = report_export.project_receipts(report, locations=locations)
+        public["static_only"] = report["static_only"]
+        for receipt, row in zip(public["checks"], report["checks"], strict=True):
+            if "evidence" in row:
+                receipt["evidence"] = row["evidence"]
+        if locations:
+            private_write(result_path.with_name("locations.json"), json.dumps(locations).encode())
+        result_path.write_text(json.dumps(public), encoding="utf-8")
+        return
     result_path.write_text(json.dumps(scrub(report), ensure_ascii=False), encoding="utf-8")
 
 
@@ -586,6 +617,9 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
                         "PYTHONUTF8": "1", "PYTHONNOUSERSITE": "1",
                         "PYTHONDONTWRITEBYTECODE": "1", "GIT_CONFIG_NOSYSTEM": "1",
                         "NPM_CONFIG_OFFLINE": "true", "NPM_CONFIG_AUDIT": "false"})
+            if os.name == "nt" and os.environ.get("USERPROFILE"):
+                # Installed Chrome and Edge need the account profile to start their own browser sandbox.
+                env["USERPROFILE"] = os.environ["USERPROFILE"]
             if "PLAYWRIGHT_BROWSERS_PATH" not in env:
                 default = (Path(os.environ["LOCALAPPDATA"]) / "ms-playwright"
                            if os.name == "nt" and "LOCALAPPDATA" in os.environ else
@@ -601,10 +635,11 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
                             "from pathlib import Path; from full_verify import _wait_for_launch,_worker; "
                             "_wait_for_launch(Path(sys.argv[6])); "
                             "_worker(Path(sys.argv[2]),sys.argv[3]=='True',Path(sys.argv[4]),json.loads(sys.argv[5]),"
-                            "sys.argv[7]=='True',sys.argv[8]=='True',sys.argv[9]=='True')",
+                            "sys.argv[7]=='True',sys.argv[8]=='True',sys.argv[9]=='True',Path(sys.argv[10]))",
                             str(Path(__file__).resolve().parent), str(snapshot),
                             str(host_execution and not omitted), str(result_path),
-                            json.dumps(policy_required), str(launch), str(sealed), str(local_locations), str(single_file)],
+                            json.dumps(policy_required), str(launch), str(sealed), str(local_locations), str(single_file),
+                            str(root)],
                            cwd=work, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            start_new_session=os.name != "nt",
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))

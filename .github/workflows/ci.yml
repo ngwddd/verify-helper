@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main, 'v2.0/development', 'v2.0/rc3', 'v2.0/rc4', 'release/v2.0-final-hardening', 'release/v2.0.1-rc1']
+    branches: [main, 'v2.0/development', 'v2.0/rc3', 'v2.0/rc4', 'release/v2.0-final-hardening', 'release/v2.0.1-rc1', 'release/v2.0.1-rc2']
   pull_request:
   workflow_dispatch:
 
@@ -34,8 +34,8 @@ jobs:
         run: uv run --group release python -m unittest discover -s tests -v
       - name: Conformance
         run: uv run python conformance.py
-      - name: Optional language and browser acceptance
-        if: github.event_name == 'workflow_dispatch' && matrix.python == '3.12'
+      - name: Language and browser acceptance
+        if: matrix.python == '3.12'
         shell: pwsh
         run: |
           $toolchain = Join-Path $env:RUNNER_TEMP vh-toolchain
@@ -76,6 +76,8 @@ jobs:
           $env:VERIFY_TSC = Join-Path $toolchain "node_modules/.bin/tsc$suffix"
           $env:VERIFY_NATIVE_FIXTURE = '1'
           uv run python -m unittest discover -s tests -p test_full_verify.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run python -m unittest discover -s tests -p test_mcp.py -k test_browser_pass_keeps_private_evidence -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "VERIFY_PLAYWRIGHT_ROOT=$env:VERIFY_PLAYWRIGHT_ROOT" >> $env:GITHUB_ENV
           "VERIFY_TSC=$env:VERIFY_TSC" >> $env:GITHUB_ENV
