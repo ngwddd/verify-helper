@@ -44,7 +44,7 @@ import yaml
 import check_specs as S
 import directions as DIR
 
-VERSION = "2.0.0"
+VERSION = "2.0.1rc1"
 
 
 def _wrap(text: str, width: int = 50) -> list[str]:
@@ -220,7 +220,7 @@ class Check:
     evidence: dict | None = None
     coverage: dict | None = None
     reason_code: str = ""
-    isolation_receipt: dict | None = None
+    unregistered_candidates: int = 0
 
     def as_dict(self) -> dict:
         d = asdict(self)
@@ -1502,9 +1502,16 @@ def _py_for(root: Path) -> str:
     return sys.executable
 
 
-def _detect_test_command(root: Path, language: str | None = None) -> tuple[list[str] | None, str, int]:
+def _detect_test_command(root: Path, language: str | None = None, *, allow_npm: bool = True) -> tuple[list[str] | None, str, int]:
+    if language == "javascript" and not allow_npm:
+        files, _, _, _ = scan_files(root, project_ignores=False)
+        entries = sorted("./" + path.relative_to(root).as_posix() for path in files
+                         if re.search(r"\.(?:test|spec)\.(?:js|mjs|cjs)$", path.name))
+        if entries:
+            return ["node", "--test", "--test-reporter=tap", *entries], "Node test runner", 300
+        return None, "No supported Node tests. Declare npm_test=true to run a package script.", 0
     pkg = root / "package.json"
-    if language != "python" and pkg.exists():
+    if allow_npm and language != "python" and pkg.exists():
         try:
             data = json.loads(pkg.read_text(encoding="utf-8"))
             script = (data.get("scripts") or {}).get("test") or ""
@@ -1550,7 +1557,7 @@ def _detect_test_command(root: Path, language: str | None = None) -> tuple[list[
                      if (root / x).is_dir()]
     if language != "python" and _has(["*.test.js", "*.test.mjs", "*.test.cjs", "*.spec.js", "*.spec.mjs"], dirs):
         return ["node", "--test"], "node --test 自动发现 *.test.*", 300
-    if language != "python" and _has(["*.test.ts", "*.spec.ts"], dirs):
+    if allow_npm and language != "python" and _has(["*.test.ts", "*.spec.ts"], dirs):
         return ["npx", "--no-install", "vitest", "run"], "vitest（TypeScript 测试）", 420
     # 散落的 test_*.py：必须记清是**哪个目录**命中的 ——
     # 命中 root/tests 却用默认 start dir（=root）去 discover，会收集 0 个用例，
@@ -1569,7 +1576,7 @@ def _detect_test_command(root: Path, language: str | None = None) -> tuple[list[
             if not real:
                 suspects += [f"{d.name}/{p.name}" if d != root else p.name for p in hits[:3]]
                 continue
-            cmd = [sys.executable, "-m", "unittest", "discover"]
+            cmd = [_py_for(root), "-m", "unittest", "discover"]
             if d != root:
                 cmd += ["-s", d.name]
             # 关键：把**真正命中的模式**带进去。
@@ -1608,12 +1615,16 @@ def _test_counts(out: str) -> tuple[int, int]:
     return 0, 0
 
 
-def check_tests(root: Path, files: list[Path], ctx: "Ctx", language: str | None = None) -> Check:
+def check_tests(root: Path, files: list[Path], ctx: "Ctx", language: str | None = None, *, allow_npm: bool = True) -> Check:
     c = Check("tests", "测试：跑得起来，且真的通过")
     t0 = time.time()
-    cmd, why, timeout = _detect_test_command(root, language)
+    if language == "python":
+        c.unregistered_candidates = sum(path.suffix == ".py" and path.name.startswith("smoke_")
+                                        and path.is_relative_to(root) for path in files)
+    cmd, why, timeout = _detect_test_command(root, language, allow_npm=allow_npm)
     if cmd is None:
         c.state, c.applicable = "UNKNOWN", False
+        c.reason_code = "NO_TEST_ENTRY"
         c.detail = why
         return c
     code, out = _run(cmd, root, min(timeout, ctx.test_timeout))
@@ -1625,11 +1636,13 @@ def check_tests(root: Path, files: list[Path], ctx: "Ctx", language: str | None 
     ran, skipped = _test_counts(out)
     c.coverage = {"planned": ran, "observed": max(0, ran - skipped), "skipped": skipped}
     if code in (124, 125, 126, 127) or code < 0:
+        c.reason_code = "TEST_TIMEOUT_OR_CANCELLED" if code == 124 else "TEST_RUNTIME_UNAVAILABLE"
         c.detail = f"测试运行环境不可用（{code}）：{why}"
     elif code == 5 or "no tests ran" in out.lower() or (code == 0 and ran <= skipped):
+        c.reason_code = "TEST_COVERAGE_MISSING"
         c.detail = f"{why}；缺少实际执行证据，收集 {ran}，跳过 {skipped}"
     else:
-        c.state = "PASS" if code == 0 else "FAIL"
+        c.state = "FAIL" if code else "UNKNOWN" if skipped else "PASS"
         c.detail = f"{why}；退出码 {code}，收集 {ran}，跳过 {skipped}"
         names = re.findall(r"^(?:FAIL|ERROR):\s+(\S+)", out, re.M)[:10]
         c.findings = [{"file": why, "line": 0, "message": n} for n in names]

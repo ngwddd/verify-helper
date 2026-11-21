@@ -93,6 +93,7 @@ class FullVerification(unittest.TestCase):
     @unittest.skipUnless(shutil.which("node") and shutil.which("npm"), "Requires Node and npm")
     def test_zero_exit_without_tests_from_dsh_balance_class(self):
         self.file("package.json", '{"scripts":{"test":"node live.mjs"}}')
+        self.file("verify.toml", "[verification]\nnpm_test = true\n")
         self.file("live.mjs", "console.log('SKIP live runtime unavailable');\n")
         report, rows = self.run_full()
         self.assertEqual(rows["tests"]["exit_code"], 0)
@@ -108,6 +109,20 @@ class FullVerification(unittest.TestCase):
         report, rows = self.run_full()
         self.assertEqual(rows["tests-python"]["state"], "PASS")
         self.assertEqual(rows["tests-javascript"]["state"], "PASS", rows["tests-javascript"])
+        self.assertEqual(report["verdict"], "PASS")
+
+    @unittest.skipUnless(shutil.which("node"), "Requires Node")
+    def test_runs_four_node_suites_and_declared_data_contract(self):
+        for number in range(4):
+            self.file(f"suite{number}.spec.mjs",
+                      "import { test } from 'node:test'; test('fixture', () => {});\n")
+        self.file("package.json", '{"scripts":{"test":"node unsupported-script.js"}}')
+        self.file("tools/validate-data.js", "console.log('dataset validated');\n")
+        self.file("verify.toml", '[[verification.contracts]]\nargv=["node","tools/validate-data.js"]\n'
+                                 'expect_output="dataset validated"\n')
+        report, rows = self.run_full()
+        self.assertEqual(rows["tests"]["coverage"]["observed"], 4)
+        self.assertEqual(rows["contract-1"]["state"], "PASS")
         self.assertEqual(report["verdict"], "PASS")
 
     def test_evidence_failure_cannot_yield_pass(self):
@@ -307,7 +322,7 @@ class FullVerification(unittest.TestCase):
 
     def test_secret_does_not_appear_in_report_or_artifacts(self):
         sentinel = "sk-" + "X" * 28
-        self.file(".env", f"SERVICE_KEY={sentinel}\n")
+        self.file("config.py", f'SERVICE_KEY = "{sentinel}"\n')
         report, rows = self.run_full()
         self.assertEqual(report["verdict"], "FAIL")
         self.assertEqual(rows["secrets"]["state"], "FAIL")

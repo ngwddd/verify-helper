@@ -39,6 +39,18 @@ class TestProtectedGit(unittest.TestCase):
     def verify(self, **options):
         return full_verify(self.repo, evidence_dir=self.base / "receipts", **options)
 
+    def test_modified_or_deleted_tracked_files_in_excluded_directory(self):
+        folder = self.repo / "node_modules"
+        folder.mkdir()
+        tracked = folder / "tracked.js"
+        tracked.write_bytes(b"const value = 1;\n")
+        head = self.commit("track an excluded file")
+        self.assertFalse(self.verify(revision=head)["git"]["dirty"])
+        tracked.write_bytes(b"const value = 2;\n")
+        self.assertEqual(self.verify(revision=head)["reason_code"], "GIT_SNAPSHOT_UNAVAILABLE")
+        tracked.unlink()
+        self.assertEqual(self.verify(revision=head)["reason_code"], "GIT_SNAPSHOT_UNAVAILABLE")
+
     def test_exact_revision_uses_packed_objects_and_requires_clean_input(self):
         head = self.run_git("rev-parse", "HEAD")
         self.run_git("gc", "--quiet")

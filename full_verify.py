@@ -18,9 +18,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 import check_specs
-import isolated_runtime
 import protected_git
-import protected_oracle
 import report_export
 import sarif
 import verification_adapters as adapters
@@ -38,7 +36,6 @@ EXEC_ENV = {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "LANG", "LC_AL
             "VERIFY_HELPER_TEST_PYTHON", "VERIFY_TSC", "VERIFY_PLAYWRIGHT_ROOT", "PLAYWRIGHT_BROWSERS_PATH",
             "VERIFY_NATIVE_FIXTURE", "VERIFY_SCRATCH_DIRECTORY", "CC", "CXX", "CMAKE_GENERATOR",
             "INCLUDE", "LIB", "LIBPATH",
-            isolated_runtime.TIME_VARIABLE,
             "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "PROGRAMDATA", "SYSTEMDRIVE",
             "PROCESSOR_ARCHITECTURE", "ZIG_GLOBAL_CACHE_DIR"}
 PRIVATE_INPUTS = {".ssh", ".aws", ".azure", ".kube", ".gnupg", ".docker", ".netrc",
@@ -201,10 +198,8 @@ def _scope(root: Path, files: list[Path]) -> list[Path]:
 
 
 def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
-              sandbox_image: str | None = None, oracle_policy: dict | None = None,
               single_file: bool = False) -> dict:
-    protected = not trusted or sandbox_image is not None
-    files, _, large, _ = core.scan_files(root, project_ignores=not protected)
+    files, _, large, _ = core.scan_files(root, project_ignores=False)
     selected = next(root.iterdir(), None) if single_file else None
     archive_target = selected if selected and selected.name.lower().endswith((".zip", ".whl", ".tar.gz", ".tgz")) else None
     ctx = core.Ctx(core.Cache(False))
@@ -218,7 +213,7 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
     static = [identifier for identifier in check_specs.ordered_ids()
               if identifier not in DYNAMIC | {"git"} and (not single_file or identifier != "custom")]
     report = core._verify_checks(str(root), checks=static, use_cache=False, artifacts=False,
-                         review_md=False, allow_host_tools=not protected, project_ignores=not protected)
+                         review_md=False, allow_host_tools=True, project_ignores=False)
     required = {}
     tasks = []
     rows = report["checks"]
@@ -240,23 +235,18 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
         required[result.id] = reason
         record(result)
 
-    def run(identifier: str, description: str, action, *, requires_trust: bool = True, isolated=None):
+    def run(identifier: str, description: str, action, *, requires_trust: bool = True):
         required[identifier] = description
-        tasks.append((identifier, action, requires_trust, isolated))
+        tasks.append((identifier, action, requires_trust))
 
-    def execute(identifier, action, requires_trust, isolated):
+    def execute(identifier, action, requires_trust):
         if core._worker_cancelled():
             result = adapters.check(identifier, "Verification was cancelled")
         elif requires_trust and (not trusted or config_error is not None or any(
                 row["id"] == "secrets" and row["state"] == "FAIL" for row in rows)):
             result = adapters.check(identifier, "Project code execution is unavailable")
             if not trusted:
-                result.reason_code = "ISOLATION_UNAVAILABLE"
-        elif requires_trust and sandbox_image is not None:
-            result = adapters.check(identifier, "Adapter is unavailable under the isolated execution policy")
-            result.reason_code = "UNSUPPORTED_ISOLATED_ADAPTER"
-            if isolated is not None:
-                result = _isolated_unittest(root, isolated, identifier, sandbox_image)
+                result.reason_code = "EXECUTION_NOT_RUN"
         else:
             try:
                 if requires_trust:
@@ -345,8 +335,8 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
             suffix = f"tests-{language}" if len(languages) > 1 else "tests"
             run(prefix + suffix, f"{language} code requires test evidence",
                 lambda target, scope=relative_scope, files=relative_files, language=language:
-                core.check_tests(target / scope, [target / p for p in files], ctx, language),
-                isolated=relative_scope if language == "python" else None)
+                core.check_tests(target / scope, [target / p for p in files], ctx, language,
+                                 allow_npm=config.get("npm_test", False)))
 
     if config.get("mutation"):
         def mutation(target):
@@ -389,31 +379,11 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
 
     for identifier in policy_required:
         required.setdefault(identifier, "Required by operator policy")
-    if oracle_policy is not None:
-        required["behavior-contract"] = "Operator-approved black-box behavior"
-    if sandbox_image is not None and (any(task[2] for task in tasks) or oracle_policy is not None):
-        boundary = adapters.check("execution-isolation", "Isolation requires platform attestation")
-        boundary.reason_code = "ISOLATION_UNAVAILABLE"
-        add(boundary, "The configured isolation boundary must be independently attested")
-    report["static_only"] = not (
-        any(task[2] for task in tasks) or oracle_policy is not None
-        or any(key.endswith(("build-native", "runtime-native")) for key in required)
-    )
+    report["static_only"] = not any(task[2] for task in tasks)
     report["plan"] = required
     report["plan_digest"] = plan_digest(required)
-    if sandbox_image and config_error is None and not any(
-            row["id"] == "secrets" and row["state"] == "FAIL" for row in rows):
-        _complete_isolated_js_syntax(root, files, rows, sandbox_image)
-    for identifier, action, requires_trust, isolated in tasks:
-        execute(identifier, action, requires_trust, isolated)
-    if oracle_policy is not None:
-        oracle = adapters.check("behavior-contract", "Operator behavior evidence is unavailable")
-        oracle.reason_code = "BEHAVIOR_CONTRACT_UNAVAILABLE"
-        if (oracle_policy and sandbox_image and config_error is None
-                and not any(row["id"] == "secrets" and row["state"] == "FAIL" for row in rows)):
-            oracle.state, oracle.reason_code, oracle.coverage = protected_oracle.run(
-                root, oracle_policy, sandbox_image, core._worker_cancelled)
-        record(oracle)
+    for identifier, action, requires_trust in tasks:
+        execute(identifier, action, requires_trust)
     by_id = {row["id"]: row for row in rows}
     for identifier in required:
         if identifier in by_id:
@@ -423,56 +393,9 @@ def _run_plan(root: Path, trusted: bool, policy_required: tuple[str, ...] = (),
     return report
 
 
-def _complete_isolated_js_syntax(root: Path, files: list[Path], rows: list[dict], image: str) -> None:
-    syntax = next(row for row in rows if row["id"] == "syntax")
-    if syntax.get("reason_code") != "JAVASCRIPT_SYNTAX_UNAVAILABLE":
-        return
-    sources = [path for path in files if path.suffix.lower() in {".js", ".mjs", ".cjs"}]
-    for file in sources[:12]:
-        if core._worker_cancelled():
-            break
-        relative = file.relative_to(root).as_posix()
-        try:
-            result = isolated_runtime.run_isolated(
-                root, Path("."), ["/usr/local/bin/node", "--check", "/workspace/" + relative],
-                image, core._worker_cancelled,
-            )
-        except (OSError, ValueError, subprocess.SubprocessError, KeyError, TypeError):
-            break
-        syntax["coverage"]["observed"] += 1
-        if result.exit_code == 1:
-            syntax["state"] = "FAIL"
-            syntax["findings"].append({"file": relative, "line": 0, "message": "SOURCE_SYNTAX_INVALID"})
-    if syntax["coverage"]["observed"] == syntax["coverage"]["planned"]:
-        syntax["reason_code"] = ""
-        if syntax["state"] != "FAIL":
-            syntax["state"] = "PASS"
-
-
-def _isolated_unittest(root: Path, scope: Path, identifier: str, image: str) -> core.Check:
-    command, _, _ = core._detect_test_command(root / scope, "python")
-    result = adapters.check(identifier, "A supported isolated test adapter is required")
-    result.reason_code = "UNSUPPORTED_ISOLATED_ADAPTER"
-    if not command or command[1:3] != ["-m", "unittest"]:
-        return result
-    try:
-        observed = isolated_runtime.run_isolated(root, scope, ["/usr/local/bin/python", *command[1:]],
-                                                 image, core._worker_cancelled)
-    except (OSError, ValueError, subprocess.SubprocessError, KeyError, TypeError):
-        result.reason_code = "ISOLATION_UNAVAILABLE"
-    else:
-        result.reason_code = ("ISOLATED_TEST_ORACLE_UNVERIFIED" if observed.exit_code == 0
-                              else "ISOLATED_PROCESS_NONZERO")
-        result.isolation_receipt = {"engine_version": observed.engine_version, "image_digest": image,
-                                    "time_limit_seconds": observed.time_limit}
-    return result
-
-
 def _worker(root: Path, trusted: bool, result_path: Path, policy_required: tuple[str, ...] = (),
-            sandbox_image: str | None = None, sealed: bool = False, oracle_path: Path | None = None,
-            local_locations: bool = False, single_file: bool = False) -> None:
-    oracle_policy = json.loads(oracle_path.read_bytes()) if oracle_path is not None else None
-    report = _run_plan(root, trusted, policy_required, sandbox_image, oracle_policy, single_file)
+            sealed: bool = False, local_locations: bool = False, single_file: bool = False) -> None:
+    report = _run_plan(root, trusted, policy_required, single_file)
     if sealed:
         locations = {} if local_locations else None
         public = report_export.project_receipts(report, locations=locations)
@@ -512,7 +435,7 @@ def decide(report: dict) -> str:
             report.get("lifecycle", {}).get("security", {}).get("blocked") or
             any(rows.get(key, {}).get("state") == "FAIL" for key in required)):
         return "FAIL"
-    if (report.get("security_status") == "UNAVAILABLE" or not required
+    if (not required
             or report.get("blockers") or report.get("lifecycle_error")
             or report.get("plan_digest") != plan_digest(required)):
         return "UNKNOWN"
@@ -592,22 +515,18 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
     run_id = run_id or uuid.uuid4().hex
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", run_id):
         raise ValueError("Invalid verification run ID")
-    image = os.environ.get(isolated_runtime.IMAGE_VARIABLE)
-    host_execution = unsafe_local and not single_file and not sealed and evidence_key is None
-    sealed = not host_execution
+    host_execution = not single_file
+    sealed = sealed or not unsafe_local or single_file or evidence_key is not None
     local_locations = local_locations and sealed and evidence_key is None
-    sandbox_image = None if host_execution else image
     context = {"schema_version": SCHEMA_VERSION, "run_id": run_id, "version": core.VERSION,
-               "target_kind": "file" if single_file else "project",
-               "mode": "unsafe-local" if host_execution else "full", "isolation": "linux-container-candidate" if sandbox_image is not None
-               else "temporary-source-snapshot",
-               "trusted_project_code": host_execution, "platform": platform.system(),
-               "python": platform.python_version(),
+               "target_kind": "file" if single_file else "project", "mode": "full",
+               "execution_mode": "local-host" if host_execution else "static",
+               "security_assurance": "NOT_PROVIDED", "isolation_enforced": False,
+               "platform": platform.system(), "python": platform.python_version(),
+               "target_identity": evidence_digest(os.path.normcase(str(root)).encode()),
                "policy_digest": "sha256:" + evidence_digest(f"{core.VERSION}:{host_execution}".encode())}
     if sealed:
         context["export_policy"] = "sealed"
-        context["security_status"] = "UNAVAILABLE"
-        context["reason_code"] = "ISOLATION_UNAVAILABLE"
     else:
         context["project"] = str(root)
     report = {**context, "checks": [], "plan": {}, "blockers": []}
@@ -616,7 +535,7 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
         _finalize(report, None)
         return report
 
-    git = _source_git(root) if host_execution else {}
+    git = {}
     run_output = None
     try:
         if progress:
@@ -630,38 +549,18 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
             source = root
             if single_file and (revision or against):
                 raise ValueError("Git revision and merge checks require a project directory")
-            if (revision or against) and not host_execution:
+            if revision or against:
                 source, git_context = _protected_git_source(root, work, revision, against)
                 context.update(git_context)
-            elif host_execution:
-                if revision and (revision != git.get("head") or git.get("dirty") is not False):
-                    raise ValueError("Requested revision does not match a clean Git checkout")
-                if against:
-                    if not git.get("head") or git.get("dirty") is not False:
-                        raise ValueError("Merge verification requires a clean Git worktree")
-                    source, merge = _merge_snapshot(root, against, work)
-                    context["merge"] = merge
             inventory = {}
             if single_file:
                 snapshot.mkdir()
                 digest, omitted = _snapshot_single_file(root, snapshot, inventory)
             else:
-                digest, omitted = _snapshot(source, snapshot, protected=not host_execution, inventory=inventory)
+                digest, omitted = _snapshot(source, snapshot, protected=True, inventory=inventory)
             config = snapshot / "verify.toml"
-            policy_material = {"engine": core.VERSION, "trusted": host_execution,
-                               "sandbox_image": image if image and isolated_runtime.IMAGE_ID.fullmatch(image) else None,
+            policy_material = {"engine": core.VERSION, "execution_mode": context["execution_mode"],
                                "project_contract": evidence_digest(config.read_bytes()) if config.is_file() else None}
-            oracle_path = None
-            configured_oracle = os.environ.get(protected_oracle.POLICY_VARIABLE)
-            if sealed and not single_file and configured_oracle is not None:
-                oracle_path = work / "operator-oracle.json"
-                try:
-                    policy_raw, operator_oracle = protected_oracle.load(Path(configured_oracle), root, digest)
-                    policy_material["operator_oracle"] = evidence_digest(policy_raw)
-                except (OSError, ValueError):
-                    operator_oracle = {}
-                    policy_material["operator_oracle"] = "unavailable"
-                private_write(oracle_path, json.dumps(operator_oracle).encode())
             policy_required = []
             if policy_path is not None:
                 policy_bytes = policy_path.read_bytes()
@@ -702,13 +601,10 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
                             "from pathlib import Path; from full_verify import _wait_for_launch,_worker; "
                             "_wait_for_launch(Path(sys.argv[6])); "
                             "_worker(Path(sys.argv[2]),sys.argv[3]=='True',Path(sys.argv[4]),json.loads(sys.argv[5]),"
-                            "json.loads(sys.argv[7]),sys.argv[8]=='True', Path(sys.argv[9]) if sys.argv[9] else None,"
-                            "sys.argv[10]=='True', sys.argv[11]=='True')",
+                            "sys.argv[7]=='True',sys.argv[8]=='True',sys.argv[9]=='True')",
                             str(Path(__file__).resolve().parent), str(snapshot),
-                            str(host_execution or sandbox_image is not None), str(result_path),
-                            json.dumps(policy_required), str(launch),
-                            json.dumps("" if omitted and sandbox_image is not None else sandbox_image), str(sealed),
-                            str(oracle_path) if oracle_path is not None else "", str(local_locations), str(single_file)],
+                            str(host_execution and not omitted), str(result_path),
+                            json.dumps(policy_required), str(launch), str(sealed), str(local_locations), str(single_file)],
                            cwd=work, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            start_new_session=os.name != "nt",
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))
@@ -734,7 +630,8 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
             report.update(context, snapshot_sha256=digest)
             report["snapshot_inventory"] = inventory
             if not sealed:
-                report.update(git=git, omitted=omitted)
+                report.setdefault("git", git)
+                report["omitted"] = omitted
             if omitted:
                 report["blockers"].append("Source snapshot contains omitted or changed entries")
                 if sealed:
@@ -760,7 +657,7 @@ def full_verify(project: str | Path, *, unsafe_local: bool = False, evidence_dir
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         if isinstance(error, (MergeConflict, protected_git.ProtectedMergeConflict)):
             report["merge_conflict"] = True
-        elif (revision or against) and not host_execution and not context.get("git"):
+        elif (revision or against) and not context.get("git"):
             report["reason_code"] = "GIT_SNAPSHOT_UNAVAILABLE"
         report["blockers"].append(f"Verification infrastructure failed ({type(error).__name__})")
         if sealed and (revision or against) and not context.get("git") and run_output is None:
@@ -795,6 +692,26 @@ def _protected_git_source(root: Path, work: Path, revision: str | None, against:
     head_tree = repo.checkpoint(head)
     committed = work / "committed"
     repo.materialize(head_tree, committed)
+    index = root / ".git" / "index"
+    _protected_copy(root, index.relative_to(root), repo.repo / "index", index.lstat())
+    if repo.in_repo("diff-index", "--cached", "--quiet", head, "--", check=False).returncode:
+        raise ValueError("Git index differs from the selected commit or could not be checked")
+    for entry in committed.rglob("*"):
+        if not entry.is_file():
+            continue
+        relative = entry.relative_to(committed)
+        original = root / relative
+        metadata = original.lstat()
+        with tempfile.TemporaryDirectory(dir=work) as directory:
+            comparison = Path(directory) / "tracked"
+            _protected_copy(root, relative, comparison, metadata)
+            if (comparison.stat().st_size != entry.stat().st_size
+                    or (os.name != "nt" and bool(metadata.st_mode & stat.S_IXUSR) !=
+                        bool(entry.stat().st_mode & stat.S_IXUSR))):
+                raise ValueError("A tracked Git file differs from the selected commit")
+            with comparison.open("rb") as live, entry.open("rb") as saved:
+                if hashlib.file_digest(live, "sha256").digest() != hashlib.file_digest(saved, "sha256").digest():
+                    raise ValueError("A tracked Git file differs from the selected commit")
     live_digest, live_omitted = _snapshot(root, work / "worktree-input", protected=True)
     committed_digest, committed_omitted = _snapshot(committed, work / "commit-input", protected=True)
     if live_omitted or committed_omitted or live_digest != committed_digest:
@@ -808,46 +725,6 @@ def _protected_git_source(root: Path, work: Path, revision: str | None, against:
     repo.materialize(merged_tree, merged)
     context["merge"] = {"base_commit": base, "tree": merged_tree}
     return merged, context
-
-
-def _merge_snapshot(root: Path, base: str, work: Path) -> tuple[Path, dict]:
-    import tarfile
-
-    def git(*arguments):
-        return subprocess.run(["git", *arguments], cwd=root, capture_output=True, timeout=60, check=True)
-
-    commit = git("rev-parse", "--verify", "--end-of-options", base + "^{commit}").stdout.decode().strip()
-    try:
-        tree = git("merge-tree", "--write-tree", "HEAD", commit).stdout.decode().splitlines()[0]
-    except subprocess.CalledProcessError as error:
-        if error.returncode == 1:
-            raise MergeConflict("Git reported a merge conflict") from error
-        raise
-    archive = work / "merge.tar"
-    with archive.open("wb") as stream:
-        subprocess.run(["git", "archive", tree], cwd=root, stdout=stream,
-                       stderr=subprocess.DEVNULL, timeout=60, check=True)
-    destination = work / "merged"
-    destination.mkdir()
-    with tarfile.open(archive) as package:
-        package.extractall(destination, filter="data")
-    entries = git("ls-tree", "-r", "-z", tree).stdout.split(b"\0")
-    for entry in filter(None, entries):
-        meta, filename = entry.split(b"\t", 1)
-        mode, kind, digest = meta.decode("ascii").split()
-        file = destination / os.fsdecode(filename)
-        if mode == "120000":
-            continue  # Snapshot validation records symbolic links as omissions.
-        if kind != "blob" or not file.is_file():
-            raise ValueError("Git archive did not provide every merged file")
-        with file.open("rb") as stream:
-            hash_ = hashlib.new("sha1" if len(digest) == 40 else "sha256")
-            hash_.update(f"blob {file.stat().st_size}\0".encode())
-            while chunk := stream.read(256 * 1024):
-                hash_.update(chunk)
-        if hash_.hexdigest() != digest:
-            raise ValueError("Git archive changed a file from the merged tree")
-    return destination, {"base_commit": commit, "tree": tree}
 
 
 def main(argv=None) -> int:
@@ -867,7 +744,8 @@ def main(argv=None) -> int:
         except (OSError, ValueError, KeyError, TypeError):
             resolver.error("The local finding could not be verified")
         return 0
-    unsafe = bool(argv and argv[0] == "unsafe-local-run")
+    if argv and argv[0] == "unsafe-local-run":
+        print("unsafe-local-run is deprecated. Use verify-helper run for local execution.", file=sys.stderr)
     if argv and argv[0] in {"run", "unsafe-local-run"}:
         argv.pop(0)
     parser = argparse.ArgumentParser(prog="verify-helper", description="Run full project verification")
@@ -889,7 +767,7 @@ def main(argv=None) -> int:
         return 0
     if not options.project:
         parser.error("project is required")
-    report = full_verify(options.project, unsafe_local=unsafe,
+    report = full_verify(options.project,
                          evidence_dir=options.evidence_dir, against=options.against,
                          revision=options.revision, policy_path=options.policy_path,
                          local_locations=options.local_finding_index)

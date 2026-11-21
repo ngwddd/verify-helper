@@ -36,9 +36,10 @@ class TestAllSkippedIsUnknown(unittest.TestCase):
         self.assertEqual(c.state, "UNKNOWN", c.detail)
         self.assertIn("跳过", c.detail)
 
-    def test_partial_skip_still_pass(self) -> None:
+    def test_partial_skip_leaves_coverage_unknown(self) -> None:
         c = self._check_with("Ran 20 tests in 1.2s\n\nOK (skipped=3)\n")
-        self.assertEqual(c.state, "PASS", c.detail)
+        self.assertEqual(c.state, "UNKNOWN", c.detail)
+        self.assertEqual(c.coverage["observed"], 17)
 
     def test_real_failure_still_fail(self) -> None:
         c = self._check_with("Ran 5 tests in 0.1s\n\nFAILED (failures=1)\n", code=1)

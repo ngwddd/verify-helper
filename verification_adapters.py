@@ -273,7 +273,9 @@ def read_config(root: Path) -> dict:
     data = document.get("verification", {})
     if not isinstance(data, dict):
         raise ValueError("verification must be a TOML table")
-    extra = set(data) - {"contracts", "delivery", "build", "runtime", "mutation"}
+    extra = set(data) - {"contracts", "delivery", "build", "runtime", "mutation", "npm_test"}
+    if "npm_test" in data and type(data["npm_test"]) is not bool:
+        raise ValueError("npm_test must be a boolean")
     if extra:
         raise ValueError("Unknown verification configuration fields")
     for key in ("contracts", "delivery"):

@@ -6,10 +6,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from full_verify import full_verify
-from isolated_runtime import IMAGE_VARIABLE, BoundaryUnavailable, run_isolated
 from private_storage import require_private
 from report_export import mcp_report
 from run_evidence import digest, json_bytes, read_evidence, resolve_local_finding
@@ -27,20 +25,18 @@ class TestProtectedVerification(unittest.TestCase):
     def run_protected(self, **kwargs):
         return full_verify(self.source, evidence_dir=self.output, run_id="vh_rc3_fixture", **kwargs)
 
-    def test_private_inputs_and_invalid_image_do_not_fall_back_to_host(self):
+    def test_excluded_private_inputs_block_project_execution(self):
         witness = self.base / "host-witness"
         (self.source / "test_app.py").write_text(
             "import unittest\nfrom pathlib import Path\n"
             "class Fixture(unittest.TestCase):\n"
             f"    def test_run(self): Path({str(witness)!r}).touch()\n", encoding="utf-8")
         (self.source / ".env.fixture").write_text("synthetic private input", encoding="utf-8")
-        with patch.dict(os.environ, {IMAGE_VARIABLE: "invalid-image"}):
-            report = self.run_protected()
+        report = self.run_protected()
         self.assertFalse(witness.exists())
         self.assertEqual(report["verdict"], "UNKNOWN")
         self.assertFalse(report["releasable"])
-        self.assertEqual(report["security_status"], "UNAVAILABLE")
-        self.assertIn("ISOLATION_UNAVAILABLE", {row.get("reason_code") for row in report["checks"]})
+        self.assertEqual(report["security_assurance"], "NOT_PROVIDED")
         self.assertNotIn(str(self.source), json.dumps(report))
         self.assertNotIn(".env.fixture", json.dumps(report))
         self.assertEqual(report, read_evidence(self.output / report["run_id"]))
@@ -71,22 +67,6 @@ class TestProtectedVerification(unittest.TestCase):
         public = mcp_report(report, "vh_rc3_fixture", "test-version")
         self.assertEqual(public["verdict"], "FAIL")
         self.assertNotIn(marker, json.dumps(public))
-
-    def test_no_project_runtime_in_mcp_without_isolation(self):
-        witness = self.base / "host-witness"
-        (self.source / "test_app.py").write_text(
-            f"from pathlib import Path\nPath({str(witness)!r}).touch()\n", encoding="utf-8")
-        with patch.dict(os.environ):
-            os.environ.pop(IMAGE_VARIABLE, None)
-            report = self.run_protected(sealed=True)
-        self.assertFalse(witness.exists())
-        self.assertEqual(report["verdict"], "UNKNOWN")
-
-    def test_invalid_image_is_refused_before_launch(self):
-        with patch("isolated_runtime.subprocess.Popen") as launch:
-            with self.assertRaises(BoundaryUnavailable):
-                run_isolated(self.source, Path("."), ["/usr/local/bin/python"], "python:latest", lambda: False)
-            launch.assert_not_called()
 
     def test_snapshot_omits_hardlink_to_host_file(self):
         witness = self.base / "host-witness"
@@ -138,8 +118,7 @@ class TestProtectedVerification(unittest.TestCase):
         (self.source / "verify.toml").write_text(
             '[verification]\nnetwork = "unrestricted"\nsandbox = "off"\n', encoding="utf-8")
         (self.source / "test_app.py").write_text("import unittest\n", encoding="utf-8")
-        with patch.dict(os.environ, {IMAGE_VARIABLE: "invalid-image"}):
-            report = self.run_protected()
+        report = self.run_protected()
         rows = {row["id"]: row for row in report["checks"]}
         self.assertEqual(rows["configuration"]["state"], "FAIL")
         self.assertEqual(rows["tests"]["state"], "UNKNOWN")
@@ -188,7 +167,7 @@ class TestProtectedVerification(unittest.TestCase):
         (self.source / "README.md").write_text("Developer fixture.\n", encoding="utf-8")
         report = self.run_protected(unsafe_local=True)
         self.assertEqual(report["verdict"], "PASS")
-        self.assertEqual(report["mode"], "unsafe-local")
+        self.assertEqual(report["execution_mode"], "local-host")
         self.assertFalse(report["releasable"])
 
     def test_single_source_file_has_a_separate_static_scope(self):

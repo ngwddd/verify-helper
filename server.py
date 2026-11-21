@@ -23,7 +23,6 @@ from mcp.types import ToolAnnotations
 from starlette.responses import Response
 
 from full_verify import _evidence_root, full_verify
-from isolated_runtime import IMAGE_VARIABLE, provider_available
 from private_storage import private_directory, require_private
 from report_export import mcp_report
 from run_evidence import json_bytes, read_evidence
@@ -35,6 +34,7 @@ TOOL_ARGUMENTS = {
     "verify_get_report": {"run_id"},
     "verify_list_capabilities": set(),
     "verify_cancel": {"run_id"},
+    "verify_compare_runs": {"first_run_id", "second_run_id"},
 }
 
 
@@ -153,7 +153,7 @@ def create_server(workspace: Path, *, evidence_dir: Path | None = None,
     namespace = hashlib.sha256(json_bytes({"workspace": str(workspace), "owner": owner,
                                           "storage": "private-v1"})).hexdigest()[:32]
     store_root = _evidence_root(evidence_dir or Path.home() / ".verify-helper" / "runs")
-    if store_root.is_relative_to(workspace):
+    if store_root.is_relative_to(workspace) and workspace != Path.home().resolve():
         raise ValueError("MCP evidence storage must be outside the verified workspace")
     runs = RunStore(store_root / namespace)
     server = StrictServer("verify-helper", version=VERSION)
@@ -167,6 +167,10 @@ def create_server(workspace: Path, *, evidence_dir: Path | None = None,
         root = (workspace / path).resolve()
         if not root.is_relative_to(workspace) or not (root.is_dir() or root.is_file()):
             raise ToolError("Verification target must be a file or directory in the configured workspace")
+        if root.is_relative_to(store_root) or (root.is_dir() and store_root.is_relative_to(root)):
+            raise ToolError("Select an explicit project or file outside the evidence directory")
+        if root == Path.home().resolve():
+            raise ToolError("Select a project or file within the home directory")
         policy = (workspace / policy_path).resolve() if policy_path is not None else None
         if policy is not None and (not policy.is_relative_to(workspace) or not policy.is_file()):
             raise ToolError("Policy must be a JSON file in the configured workspace")
@@ -187,17 +191,41 @@ def create_server(workspace: Path, *, evidence_dir: Path | None = None,
     @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
     def verify_list_capabilities() -> dict[str, Any]:
         """List supported adapters and detected executables without running project code."""
-        image = os.environ.get(IMAGE_VARIABLE)
-        available = provider_available(image)
-        return {"scope": "FULL", "trusted_project_execution": False,
-                "isolation_configured": IMAGE_VARIABLE in os.environ,
-                "isolation_available": available,
-                "isolation_attested": False,
-                "isolated_adapters": [],
-                "candidate_adapters": ["python-unittest", "python-behavior", "javascript-syntax",
-                                       "javascript-behavior", "native-single-source-behavior"] if available else [],
+        return {"scope": "FULL", "execution_mode": "local-host", "security_assurance": "NOT_PROVIDED",
+                "warning": "Runs trusted project code with the current user's file and network access.",
+                "python_version": ".".join(map(str, sys.version_info[:3])),
                 "tools": {"python": True, **{name: shutil.which(name) is not None for name in
                           ("node", "npm", "cmake", "ctest", "git", "tsc")}}}
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    def verify_compare_runs(first_run_id: str, second_run_id: str) -> dict[str, Any]:
+        """Compare completed reports for the same target in this workspace."""
+        reports = []
+        for run_id in (first_run_id, second_run_id):
+            if not re.fullmatch(r"vh2_[a-f0-9]{32}", run_id):
+                raise ToolError("Unknown run ID")
+            try:
+                report = read_evidence(runs.root / run_id, key=runs.key)
+                if report["run_id"] != run_id or report.get("status") != "COMPLETED":
+                    raise ValueError("Run not complete")
+                reports.append(report)
+            except (OSError, ValueError, KeyError, TypeError):
+                return {"status": "NOT_COMPARABLE", "reason": "EVIDENCE_UNAVAILABLE"}
+        first, second = reports
+        if not first.get("target_identity") or first["target_identity"] != second.get("target_identity"):
+            return {"status": "NOT_COMPARABLE", "reason": "TARGET_MISMATCH"}
+        if first.get("version") != second.get("version") or first["policy_digest"] != second["policy_digest"]:
+            return {"status": "NOT_COMPARABLE", "reason": "VERSION_OR_POLICY_CHANGED"}
+        if first["plan"] != second["plan"]:
+            return {"status": "NOT_COMPARABLE", "reason": "PLAN_CHANGED"}
+        def checks(report):
+            return {row["id"]: {"verdict": row["state"], "coverage": row.get("coverage")}
+                    for row in report["checks"] if row["id"] in report["plan"]}
+        prior, current = checks(first), checks(second)
+        return {"status": "COMPARABLE", "first_verdict": first["verdict"], "second_verdict": second["verdict"],
+                "snapshot_changed": first.get("snapshot_sha256") != second.get("snapshot_sha256"),
+                "changes": [{"check_id": key, "before": prior.get(key), "after": current.get(key)}
+                            for key in sorted(prior.keys() | current.keys()) if prior.get(key) != current.get(key)]}
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
     def verify_cancel(run_id: str) -> dict[str, Any]:

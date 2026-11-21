@@ -11,11 +11,13 @@ from run_evidence import plan_digest, set_gate_fields
 VERDICTS = {"PASS", "FAIL", "UNKNOWN"}
 REASONS = {"JAVASCRIPT_SYNTAX_UNAVAILABLE", "ISOLATION_UNAVAILABLE",
            "ISOLATED_TEST_ORACLE_UNVERIFIED", "ISOLATED_PROCESS_NONZERO",
-           "UNSUPPORTED_ISOLATED_ADAPTER", "CUSTOM_RULE_BUDGET_EXCEEDED",
+           "UNSUPPORTED_ISOLATED_ADAPTER", "CUSTOM_RULE_BUDGET_EXCEEDED", "EXECUTION_NOT_RUN", "NO_TEST_ENTRY",
+           "TEST_RUNTIME_UNAVAILABLE", "TEST_TIMEOUT_OR_CANCELLED", "TEST_COVERAGE_MISSING",
            "BEHAVIOR_CONTRACT_UNAVAILABLE", "BEHAVIOR_CONTRACT_MATCHED", "BEHAVIOR_CONTRACT_MISMATCH",
            "BEHAVIOR_CONTRACT_INCOMPLETE", "GIT_MERGE_CONFLICT", "GIT_SNAPSHOT_UNAVAILABLE"}
 PUBLIC_CHECKS = frozenset(check_specs.ordered_ids()) | {
     "execution-isolation", "scan-coverage", "configuration", "behavior-contract", "git-snapshot",
+    "tests-python", "tests-javascript", "typescript", "build-native", "runtime-native", "tests-native",
 }
 
 
@@ -57,20 +59,15 @@ def project_receipts(report: dict, *, locations: dict | None = None) -> dict:
         if coverage and all(type(coverage.get(key, 0)) is int and 0 <= coverage.get(key, 0) <= 200_000
                             for key in ("planned", "observed", "skipped")):
             public["coverage"] = {key: coverage.get(key, 0) for key in ("planned", "observed", "skipped")}
-        isolation = row.get("isolation_receipt")
-        if isinstance(isolation, dict):
-            version = isolation.get("engine_version")
-            image = isolation.get("image_digest")
-            time_limit = isolation.get("time_limit_seconds")
-            if (isinstance(version, str) and re.fullmatch(r"[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}", version)
-                    and isinstance(image, str) and re.fullmatch(r"sha256:[a-f0-9]{64}", image)
-                    and type(time_limit) is int and 5 <= time_limit <= 180):
-                public["isolation_receipt"] = {
-                    "provider": "docker-local-linux", "engine_version": version, "image_digest": image,
-                    "uid": 65532, "network": "none", "host_bind_mounts": 0, "time_limit_seconds": time_limit,
-                    "root_filesystem_read_only": True, "credential_environment": "minimal",
-                    "verified": False,
-                }
+        if type(row.get("exit_code")) is int and -65536 <= row["exit_code"] <= 65536:
+            public["exit_code"] = row["exit_code"]
+        if type(row.get("unregistered_candidates")) is int and 0 < row["unregistered_candidates"] <= 200000:
+            public["unregistered_candidates"] = row["unregistered_candidates"]
+        seconds = row.get("seconds")
+        if type(seconds) in (int, float) and 0 <= seconds <= 3600:
+            public["duration_ms"] = round(seconds * 1000)
+        elif type(row.get("duration_ms")) is int and 0 <= row["duration_ms"] <= 3600000:
+            public["duration_ms"] = row["duration_ms"]
         public_checks.append(public)
     return {"checks": public_checks, "plan": public_plan, "plan_digest": plan_digest(public_plan),
             "export_policy": "sealed"}
@@ -88,14 +85,19 @@ def mcp_report(report: dict, run_id: str, version: str) -> dict:
     status = report.get("status")
     verdict = report.get("verdict")
     security = report.get("security_status")
-    public.update(schema_version=2, run_id=run_id, version=version,
+    public.update(schema_version=2, run_id=run_id, version=report.get("version", version),
                   status=status if status in {"COMPLETED", "CANCELLED", "ERROR"} else "ERROR",
                   verdict=verdict if verdict in VERDICTS else "UNKNOWN")
     public["security_status"] = security if security in {"ENFORCED", "VIOLATED", "NOT_REQUIRED"} else "UNAVAILABLE"
     public["target_kind"] = "file" if report.get("target_kind") == "file" else "project"
-    if public["security_status"] == "UNAVAILABLE":
-        reason = report.get("reason_code")
-        public["reason_code"] = reason if reason == "GIT_SNAPSHOT_UNAVAILABLE" else "ISOLATION_UNAVAILABLE"
+    if report.get("execution_mode") in {"local-host", "static"}:
+        public["execution_mode"] = report["execution_mode"]
+        public["security_assurance"] = "NOT_PROVIDED"
+        public["isolation_enforced"] = False
+        if re.fullmatch(r"[0-9.]+", report.get("python", "")):
+            public["python_version"] = report["python"]
+    if report.get("reason_code") == "GIT_SNAPSHOT_UNAVAILABLE":
+        public["reason_code"] = "GIT_SNAPSHOT_UNAVAILABLE"
     omitted = report.get("protected_input")
     if isinstance(omitted, dict) and type(omitted.get("excluded_count")) is int:
         public["protected_input"] = {"reason_code": "PROTECTED_INPUT_EXCLUDED",

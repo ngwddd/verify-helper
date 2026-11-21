@@ -20,6 +20,34 @@ SERVER = ROOT / "server.py"
 
 
 class TestMcp(unittest.IsolatedAsyncioTestCase):
+    async def test_native_unittest_and_compare(self):
+        project = self.root / "python-suite"
+        project.mkdir()
+        suite = project / "test_examples.py"
+        suite.write_text("import unittest\nclass Cases(unittest.TestCase):\n" + "".join(
+            f"    def test_{index:02}(self): self.assertEqual(1, 1)\n" for index in range(38)
+        ), encoding="utf-8")
+        for index in range(4):
+            (project / f"smoke_{index}.py").write_text("value = 1\n", encoding="utf-8")
+        async with Client(self.stdio()) as client:
+            first = await client.call_tool("verify_run_full", {"path": "python-suite"})
+            first_id = first.structured_content["run_id"]
+            result = await self.wait_for_report(client, first_id)
+            cases = next(row for row in result["checks"] if row["id"] == "tests")
+            self.assertEqual(result["verdict"], "PASS")
+            self.assertEqual(result["execution_mode"], "local-host")
+            self.assertEqual(cases["coverage"], {"planned": 38, "observed": 38, "skipped": 0})
+            self.assertEqual(cases["unregistered_candidates"], 4)
+            suite.write_text(suite.read_text().replace("assertEqual(1, 1)", "assertEqual(1, 2)", 1),
+                             encoding="utf-8")
+            second = await client.call_tool("verify_run_full", {"path": "python-suite"})
+            second_id = second.structured_content["run_id"]
+            self.assertEqual((await self.wait_for_report(client, second_id))["verdict"], "FAIL")
+            diff = await client.call_tool("verify_compare_runs",
+                                          {"first_run_id": first_id, "second_run_id": second_id})
+            self.assertEqual(diff.structured_content["status"], "COMPARABLE")
+            self.assertTrue(any(row["check_id"] == "tests" for row in diff.structured_content["changes"]))
+
     def setUp(self):
         self.workspace = tempfile.TemporaryDirectory()
         self.addCleanup(self.workspace.cleanup)
@@ -36,7 +64,7 @@ class TestMcp(unittest.IsolatedAsyncioTestCase):
         async with Client(target, mode=mode, read_timeout_seconds=30) as client:
             listed = (await client.list_tools()).tools
             self.assertEqual([tool.name for tool in listed], ["verify_run_full", "verify_get_report",
-                                                               "verify_list_capabilities", "verify_cancel"])
+                                                               "verify_list_capabilities", "verify_compare_runs", "verify_cancel"])
             self.assertEqual(set(listed[0].input_schema["properties"]),
                              {"path", "policy_path", "revision", "source_ref"})
             response = await client.call_tool("verify_run_full", {"path": "broken"})
